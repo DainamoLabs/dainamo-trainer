@@ -351,9 +351,10 @@ def build_audio_items(datasets: list[dict], clip_seconds: float, flip: bool, log
                       min_seconds: float = 5, max_seconds: float = 360) -> list[Item]:
     """Audio datasets -> Items (repeats expanded), in whole seconds. With ``clip_seconds``, each song is cut
     into clips of that length (``song_clips``; a song shorter than one clip but at least ``min_seconds`` long
-    is one shorter clip); 0 trains whole songs, up to ``max_seconds`` of each. A caption's lyrics
-    (``split_lyrics``) are only trained with whole songs, as where a clip's words fall isn't known.
-    ``flip`` adds each item again with its stereo channels swapped."""
+    is one shorter clip); 0 trains whole songs, up to ``max_seconds`` of each. A song's clips share a
+    ``group`` per flip and repeat, so the song counts once per epoch however long it is (``epoch_items``).
+    A caption's lyrics (``split_lyrics``) are only trained with whole songs, as where a clip's words fall
+    isn't known. ``flip`` adds each item again with its stereo channels swapped."""
     items = []
     for ds in datasets:
         files = [f for f in list_media(ds["path"]) if media_kind(f) == "audio"]
@@ -383,18 +384,22 @@ def build_audio_items(datasets: list[dict], clip_seconds: float, flip: bool, log
             used += 1
             for at, length in clips:
                 for fl in variants:
-                    for _ in range(repeats):
+                    for rep in range(repeats):
                         items.append(Item(f, style, (0, 0), fl, caption_dropout=drop, seconds=float(length),
-                                          start=float(at), lyrics=lyrics))
+                                          start=float(at), lyrics=lyrics,
+                                          group=f"{f}|{fl}|{rep}" if clip_seconds else ""))
+        mine = items[start:]
+        per_epoch = sum(1 for it in mine if not it.group) + len({it.group for it in mine if it.group})
         log(f"{ds.get('name') or os.path.basename(os.path.normpath(ds['path']))}: {used} song"
             f"{'' if used == 1 else 's'}" + (f", {repeats} repeats" if repeats > 1 else "")
-            + f" -> {len(items) - start} items")
+            + f" -> {len(mine)} items" + (f", {per_epoch} per epoch (a clip of each song)"
+                                          if per_epoch < len(mine) else ""))
     return items
 
 
 def epoch_items(items: list[Item], rng: random.Random) -> list[int]:
-    """The indices an epoch trains: every item, except that of each ``group`` (clips cut from one video) it
-    trains one, picked at random, so a long video counts no more than a short one."""
+    """The indices an epoch trains: every item, except that of each ``group`` (clips cut from one video, or
+    a song's clips) it trains one, picked at random, so a long video or song counts no more than a short one."""
     out, groups = [], {}
     for i, it in enumerate(items):
         if it.group:

@@ -265,7 +265,7 @@ export default function CreateJob({ families }: { families: Family[] }) {
     if (!d) return [];
     const files = usableFiles(d);
     // each file is an item per resolution (small images can fill fewer sizes, so this is an upper bound);
-    // a song is an item per clip, which depends on its length (so this counts one)
+    // a song trains once per epoch, as one of its clips picked at random
     return [{ ...c, d, files, items: files * c.repeats * (isAudio ? 1 : resList(c.resolution).length) * (c.flip ? 2 : 1) }];
   });
   // a slider without datasets trains on images the base model renders, at the first card's resolutions

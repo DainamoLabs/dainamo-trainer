@@ -79,6 +79,13 @@ def test_audio_items(tmp_path):
     batches = ds.make_batches(items, 4, random.Random(0))
     assert all(len({items[i].seconds for i in b}) == 1 for b in batches)
     assert bucket_summary(items)[0] == "12 training items from 2 songs, 8 of 30 s, 4 of 12 s"
+    # a song trains once per epoch (per flip and repeat), as one of its clips picked at random
+    rng = random.Random(0)
+    epochs = [[items[i] for i in ds.epoch_items(items, rng)] for _ in range(20)]
+    assert all(len(e) == 8 and sum(it.path.endswith("long.wav") for it in e) == 4 for e in epochs)
+    assert {it.start for e in epochs for it in e if it.path.endswith("long.wav")} == {0.0, 35.0}
+    assert logs[-1].endswith("2 songs, 2 repeats -> 12 items, 8 per epoch (a clip of each song)")
+    assert not any(it.group for it in whole)  # whole songs are one item each
 
 
 def test_reading_a_clip(tmp_path):

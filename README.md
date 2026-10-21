@@ -517,9 +517,12 @@ minutes train), files below 44.1 kHz and mono files.
 
 **Clip length.** Songs train as clips of the clip length (30 s by default),
 spread evenly over the song so its end isn't lost: a 3-minute song gives six
-clips. Clips train on the style tags alone, since there's no way to tell which
-of the song's words fall in a clip. Lyrics are used only with a clip length of
-0, which trains whole songs (up to 6 minutes, at about 4.7 GB of VRAM).
+clips. Each epoch trains one of a song's clips, picked at random, so a long
+song counts no more than a short one (as with videos split into clips); to
+give a song more weight, put it in a dataset with more repeats. Clips train
+on the style tags alone, since there's no way to tell which of the song's
+words fall in a clip. Lyrics are used only with a clip length of 0, which
+trains whole songs (up to 6 minutes, at about 4.7 GB of VRAM).
 Training conditions on what the composer computes from the tags and lyrics
 with planning off and no semantic tokens. That is the paper's "direct audio
 generation" task, one of the four the model was trained on, and the regime of
