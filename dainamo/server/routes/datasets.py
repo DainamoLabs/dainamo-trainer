@@ -489,6 +489,7 @@ class DownloadIn(BaseModel):
     start: float | None = None  # seconds: only the part from here...
     end: float | None = None  # ...to here
     playlist: int = 0  # a playlist's first this many items; 0: just the one the URL names
+    format: str = ""  # one of media_download.VIDEO_FORMATS or AUDIO_FORMATS, for the kind; "": its default
 
 
 @router.post("/datasets/{did}/download")
@@ -503,6 +504,9 @@ def download_media(did: str, body: DownloadIn):
         raise HTTPException(400, "Paste a web address starting with http:// or https://")
     if body.kind not in ("video", "audio"):
         raise HTTPException(400, f"Unknown kind {body.kind!r}")
+    formats = media_download.AUDIO_FORMATS if body.kind == "audio" else media_download.VIDEO_FORMATS
+    if body.format and body.format not in formats:
+        raise HTTPException(400, f"Unknown {'sound' if body.kind == 'audio' else 'video'} format {body.format!r}")
     if body.max_height not in media_download.HEIGHTS:
         raise HTTPException(400, f"The largest size must be one of {', '.join(map(str, media_download.HEIGHTS[1:]))} (or 0: any)")
     if not 0 <= body.playlist <= media_download.MAX_ITEMS:
@@ -519,7 +523,7 @@ def download_media(did: str, body: DownloadIn):
     if not tool["current"]:
         raise HTTPException(400, f"yt-dlp {tool['version']} is older than Dainamo needs ({tool['minimum']} or newer): "
                                  "update it in the Add from URL window")
-    opts = body.model_dump(exclude={"url"})
+    opts = {**body.model_dump(exclude={"url", "format"}), "fmt": body.format}
     media_download.download_jobs[did] = media_download.DownloadJob(d, url, opts)
     return media_download.download_jobs[did].to_json()
 

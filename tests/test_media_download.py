@@ -6,6 +6,7 @@ cancelling, the API's checks, updating yt-dlp and the launch warning. A stand-in
 """
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -73,16 +74,35 @@ def test_the_command_asks_for_what_the_form_chose(monkeypatch):
     video = md.command("https://e.com/v", "/out", "video", 720, 20, 24.5)
     assert video[-2:] == ["--", "https://e.com/v"]  # a URL can never be read as an option
     s = " ".join(video)
-    assert "-S res:720,vcodec:h264,ext" in s and "--merge-output-format mp4" in s
+    assert "-S res:720,vcodec:h264,acodec:aac --merge-output-format mp4 --remux-video mp4" in s  # the default
     assert "--download-sections *20-24.5 --force-keyframes-at-cuts" in s
     assert "--no-playlist -I 1:1" in s  # a playlist's own URL gives just its first item
     assert "--ignore-config" in s and "--js-runtimes node" in s and "--js-runtimes bun" not in s
-    assert "-S res,vcodec:h264,ext" in " ".join(md.command("https://e.com/v", "/out", "video", 0))
+    assert "-S res,vcodec:h264,acodec:aac" in " ".join(md.command("https://e.com/v", "/out", "video", 0))
     sound = " ".join(md.command("https://e.com/v", "/out", "audio", 1080, None, 90))
-    assert "-x --audio-format best" in sound and "-S" not in sound
+    assert "-x --audio-format best" in sound and "-S" not in sound  # the default: the site's own, not converted
     assert "--download-sections *0-90" in sound  # sound is cut exactly too
     whole = " ".join(md.command("https://e.com/l", "/out", "audio", playlist=5))
     assert "--yes-playlist --ignore-errors -I 1:5" in whole and "--download-sections" not in whole
+
+
+def test_each_format_prefers_streams_it_takes_as_they_are(monkeypatch):
+    monkeypatch.setattr(md, "ytdlp", lambda: ["yt-dlp"])
+    video = lambda fmt, h=1080: " ".join(md.command("https://e.com/v", "/out", "video", h, fmt=fmt))  # noqa: E731
+    sound = lambda fmt: " ".join(md.command("https://e.com/v", "/out", "audio", fmt=fmt))  # noqa: E731
+    assert "-S res:1080,vcodec:vp9,acodec:opus --merge-output-format webm/mkv --recode-video webm" in video("webm")
+    assert "-S res:1080 --merge-output-format mkv --remux-video mkv" in video("mkv")
+    # MOV can't take VP9, so H.264 comes before the size
+    assert "-S vcodec:h264,res,acodec:aac --merge-output-format mov --remux-video mov" in video("mov", 0)
+    assert "-S acodec:opus -x --audio-format opus" in sound("opus") and "-S acodec:aac -x --audio-format m4a" in sound("m4a")
+    for fmt in ("mp3", "wav", "flac", "vorbis"):
+        assert f"-f ba/b -x --audio-format {fmt} --audio-quality 0" in sound(fmt)
+    # the window offers the same formats, the default first
+    with open("web/src/pages/Datasets.tsx", encoding="utf-8") as fh:
+        page = fh.read()
+    for name, formats in (("VIDEO_FORMATS", md.VIDEO_FORMATS), ("AUDIO_FORMATS", md.AUDIO_FORMATS)):
+        listed = page.split(f"const {name}: [string, string][] = ", 1)[1].split(";", 1)[0]
+        assert re.findall(r'\["(\w+)", "', listed) == list(formats), name
 
 
 def test_new_files_never_share_a_stem_and_so_a_caption(tmp_path):
@@ -150,6 +170,8 @@ def test_the_api_checks_the_request(fake, tmp_path, monkeypatch):
         url = f"/api/datasets/{did}/download"
         for body, words in (({"url": "file:///etc/passwd"}, "http"), ({"url": "-o x"}, "http"),
                             ({"url": "https://e.com/ok", "kind": "pdf"}, "Unknown kind"),
+                            ({"url": "https://e.com/ok", "format": "mp3"}, "Unknown video format"),
+                            ({"url": "https://e.com/ok", "kind": "audio", "format": "mkv"}, "Unknown sound format"),
                             ({"url": "https://e.com/ok", "max_height": 999}, "largest size"),
                             ({"url": "https://e.com/ok", "start": 30, "end": 10}, "end after"),
                             ({"url": "https://e.com/ok", "playlist": 3, "end": 10}, "whole playlist"),

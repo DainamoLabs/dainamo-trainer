@@ -21,6 +21,17 @@ HEIGHTS = (0, 360, 480, 720, 1080, 1440, 2160)  # the largest a video may be; 0:
 MAX_ITEMS = 200  # the most items one playlist download may add
 JS_RUNTIMES = ("node", "bun")  # YouTube needs one; yt-dlp looks for deno itself, these only when told
 MIN_VERSION = "2026.08.19"  # the oldest yt-dlp Dainamo runs, as in requirements.txt
+# the formats a download can come as (the first of each is the default), each preferring streams it takes as they
+# are. Video: {container: yt-dlp's format sort, "{res}" the size}
+VIDEO_FORMATS = {
+    "mp4": "{res},vcodec:h264,acodec:aac",  # MP4 also takes VP9 and AV1, YouTube's only codecs above 1080p
+    "webm": "{res},vcodec:vp9,acodec:opus",  # WebM takes only VP8, VP9 and AV1, with Opus or Vorbis
+    "mkv": "{res}",  # MKV takes anything, so it gets the best there is
+    "mov": "vcodec:h264,{res},acodec:aac",  # MOV can't take VP9: H.264 first, even at a smaller size
+}
+# sound only: {yt-dlp's --audio-format: the codec to prefer, so it's copied rather than converted}; "best" is the
+# site's own, never converted
+AUDIO_FORMATS = {"best": "", "opus": "acodec:opus", "m4a": "acodec:aac", "mp3": "", "wav": "", "flac": "", "vorbis": ""}
 # a line on stdout as each item starts downloading, for each progress report (a part cut by ffmpeg has none), each
 # post-processing step and each finished file (``_line``)
 TEMPLATES = [
@@ -31,7 +42,8 @@ TEMPLATES = [
     "--print", "after_move:FILE|%(filepath)s",
 ]
 STEPS = {"Merger": "Joining video and sound", "ExtractAudio": "Extracting the sound",
-         "VideoRemuxer": "Converting to mp4"}  # post-processors worth naming (yt-dlp adds an "FFmpeg" prefix)
+         "VideoRemuxer": "Changing the container", "VideoConvertor": "Converting the video"}  # post-processors
+# worth naming (yt-dlp adds an "FFmpeg" prefix)
 
 
 def on_network() -> bool:
@@ -101,21 +113,28 @@ def update() -> dict:
 
 
 def command(url: str, out_dir: str, kind: str = "video", max_height: int = 1080, start: float | None = None,
-            end: float | None = None, playlist: int = 0) -> list[str]:
-    """The yt-dlp command that downloads ``url`` into ``out_dir``: a video of at most ``max_height`` (0: any), H.264
-    in an mp4 where there's a choice, or with ``kind`` "audio" only the sound, as the site has it; with ``start``
-    and/or ``end`` (seconds) only that part; ``playlist`` (0: just the one the URL names) a playlist's first that
-    many items. Needs yt-dlp ``MIN_VERSION`` or newer."""
+            end: float | None = None, playlist: int = 0, fmt: str = "") -> list[str]:
+    """The yt-dlp command that downloads ``url`` into ``out_dir``: a video of at most ``max_height`` (0: any), or
+    with ``kind`` "audio" only the sound, as ``fmt`` (``VIDEO_FORMATS``/``AUDIO_FORMATS``; "": the first); with
+    ``start`` and/or ``end`` (seconds) only that part; ``playlist`` (0: just the one the URL names) a playlist's
+    first that many items. Needs yt-dlp ``MIN_VERSION`` or newer."""
     cmd = [*ytdlp(), "--ignore-config", "--newline", "--no-colors", "--progress", "--no-mtime", "--windows-filenames",
            "-P", out_dir, "-o", "%(title).100B [%(id)s].%(ext)s", *TEMPLATES]
     cmd += [arg for rt in JS_RUNTIMES if shutil.which(rt) for arg in ("--js-runtimes", rt)]
     # a playlist's URL downloads the whole playlist even with --no-playlist; -I keeps it to its first item
     cmd += ["--yes-playlist", "--ignore-errors", "-I", f"1:{playlist}"] if playlist else ["--no-playlist", "-I", "1:1"]
     if kind == "audio":
-        cmd += ["-f", "ba/b", "-x", "--audio-format", "best"]
+        fmt = fmt or next(iter(AUDIO_FORMATS))
+        prefer = AUDIO_FORMATS[fmt]
+        # a stream already in the format is copied; the quality applies only to converting (best VBR; lossless ignores it)
+        cmd += ["-f", "ba/b", *(["-S", prefer] if prefer else []), "-x", "--audio-format", fmt, "--audio-quality", "0"]
     else:
-        cmd += ["-S", f"res{f':{max_height}' if max_height else ''},vcodec:h264,ext", "--merge-output-format", "mp4",
-                "--remux-video", "webm>webm/mov>mov/mp4"]
+        fmt = fmt or next(iter(VIDEO_FORMATS))
+        sort = VIDEO_FORMATS[fmt].format(res=f"res:{max_height}" if max_height else "res")
+        if fmt == "webm":  # streams WebM can't take (a site without VP9) are joined into an MKV, then converted: slow
+            cmd += ["-S", sort, "--merge-output-format", "webm/mkv", "--recode-video", "webm"]
+        else:  # the streams these prefer go in as they are (yt-dlp's own table is stricter than ffmpeg)
+            cmd += ["-S", sort, "--merge-output-format", fmt, "--remux-video", fmt]
     if start is not None or end is not None:
         # cut where asked: without it a video starts at the keyframe before, and sound can run on 10 s past the end
         cmd += ["--download-sections", f"*{start or 0:g}-{'inf' if end is None else f'{end:g}'}",

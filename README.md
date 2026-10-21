@@ -642,13 +642,28 @@ songs for YuE2.
 > **Download only what you have the right to use.** Copyright and each site's
 > terms are your responsibility.
 
-- **Video** comes as an mp4 no taller than **Largest size** (1080p by default;
-  training scales every file down to its resolution anyway), as H.264 with AAC
-  sound where the site offers it. **Sound only** keeps the audio as the site
-  has it, often Opus or AAC.
+- **Video** comes no taller than **Largest size** (1080p by default; training
+  scales every file down to its resolution anyway), in the chosen **Format**:
+
+  | Format | |
+  | --- | --- |
+  | MP4 (default) | H.264 with AAC where the site has it; plays everywhere. Above 1080p, YouTube has only VP9 or AV1, which MP4 also takes |
+  | WebM | VP9 with Opus |
+  | MKV | the best the site has (on YouTube, AV1 with Opus); the browser may not preview it |
+  | MOV | H.264 with AAC, for video editors; MOV can't take VP9, so at most the site's best H.264 (1080p on YouTube) |
+
+  The streams are picked so they go into the container as they are; a site
+  without them is converted, which takes a while.
+- **Sound only** comes in the chosen **Format**: **As the site has it**
+  (default; the site's own stream, often Opus or AAC, never converted), Opus,
+  M4A (AAC), MP3, WAV, FLAC or OGG (Vorbis). Opus and M4A are copied when the
+  site has them; the rest are converted (MP3 and OGG at their best quality).
+  WAV and FLAC lose nothing more, but can't bring back what the site's
+  compression removed.
 - **From** and **To** (`1:30` or `90`) download just that part, cut where you
   asked rather than at the nearest keyframe, so a long video doesn't have to
-  come down whole.
+  come down whole. Cutting exactly re-encodes the part, in the format's usual
+  codecs.
 - **Playlists.** By default a link downloads one item, even a playlist's link.
   Tick **It's a playlist** to download its first N items (up to 200); an item
   that fails is listed and the others still download.

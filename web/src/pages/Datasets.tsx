@@ -394,6 +394,19 @@ const fmtClock = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toFixed(1).pad
 const mb = (bytes: number) => `${(bytes / 1024 ** 2).toFixed(1)} MB`;
 
 const HEIGHTS: [number, string][] = [[360, "360p"], [480, "480p"], [720, "720p"], [1080, "1080p"], [1440, "1440p"], [2160, "2160p (4K)"], [0, "The best there is"]];
+// the formats a download can come as (media_download.VIDEO_FORMATS and AUDIO_FORMATS); the first is the default
+const VIDEO_FORMATS: [string, string][] = [["mp4", "MP4 · H.264 where offered"], ["webm", "WebM · VP9"], ["mkv", "MKV · the best the site has"],
+  ["mov", "MOV · H.264, for video editors"]];
+const AUDIO_FORMATS: [string, string][] = [["best", "As the site has it"], ["opus", "Opus (.opus)"], ["m4a", "M4A · AAC (.m4a)"], ["mp3", "MP3 (.mp3)"],
+  ["wav", "WAV · uncompressed (.wav)"], ["flac", "FLAC · lossless (.flac)"], ["vorbis", "OGG · Vorbis (.ogg)"]];
+const FORMAT_INFO = {
+  video: "MP4 plays everywhere and is the safe choice. WebM and MKV keep the site's newer codecs (VP9, AV1), smaller for the same quality, "
+    + "though the browser may not preview an MKV. MOV is H.264 for video editors, so at most the site's best H.264 (1080p on YouTube). "
+    + "A part chosen with From and To is re-encoded to cut it exactly.",
+  audio: "As the site has it keeps the site's own stream (often Opus or AAC), so nothing more is lost; Opus and M4A are copied too when "
+    + "the site has them. MP3 and OGG are converted and lose a little more. WAV and FLAC lose nothing more but are several times bigger, "
+    + "and can't bring back what the site's compression removed.",
+};
 
 /** "1:02:03.5", "1:30" or "75" -> seconds; "" -> null; NaN when it isn't a time. */
 const parseClock = (s: string): number | null => {
@@ -411,6 +424,8 @@ function DownloadModal({ dataset, onClose, onStarted }: { dataset: Dataset; onCl
   const [url, setUrl] = useState("");
   const [kind, setKind] = useState<"video" | "audio">("video");
   const [height, setHeight] = useState(1080);
+  const [videoFormat, setVideoFormat] = useState(VIDEO_FORMATS[0][0]);
+  const [audioFormat, setAudioFormat] = useState(AUDIO_FORMATS[0][0]);
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   const [playlist, setPlaylist] = useState(false);
@@ -434,7 +449,7 @@ function DownloadModal({ dataset, onClose, onStarted }: { dataset: Dataset; onCl
   const begin = async () => {
     try {
       await api.post(`/api/datasets/${dataset.id}/download`, {
-        url: url.trim(), kind, max_height: height, start: playlist ? null : start, end: playlist ? null : end, playlist: playlist ? items : 0,
+        url: url.trim(), kind, max_height: height, format: kind === "audio" ? audioFormat : videoFormat, start: playlist ? null : start, end: playlist ? null : end, playlist: playlist ? items : 0,
       });
       toast("Download started");
       onStarted();
@@ -456,17 +471,23 @@ function DownloadModal({ dataset, onClose, onStarted }: { dataset: Dataset; onCl
           <input autoFocus value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://…"
             onKeyDown={(e) => e.key === "Enter" && ok && begin()} />
         </label>
-        <div className="grid cols-2">
-          <div className="field">
-            <span>Download<Info text="Sound only keeps just the audio, as the site has it (often Opus or AAC), for music datasets." /></span>
-            <div className="seg" style={{ alignSelf: "flex-start" }}>
-              <button type="button" className={kind === "video" ? "on" : ""} onClick={() => setKind("video")}>Video</button>
-              <button type="button" className={kind === "audio" ? "on" : ""} onClick={() => setKind("audio")}>Sound only</button>
-            </div>
+        <div className="field">
+          <span>Download<Info text="Sound only keeps just the audio, for music datasets." /></span>
+          <div className="seg" style={{ alignSelf: "flex-start" }}>
+            <button type="button" className={kind === "video" ? "on" : ""} onClick={() => setKind("video")}>Video</button>
+            <button type="button" className={kind === "audio" ? "on" : ""} onClick={() => setKind("audio")}>Sound only</button>
           </div>
+        </div>
+        <div className="grid cols-2">
+          <label className="field">
+            <span>Format<Info text={FORMAT_INFO[kind]} /></span>
+            {kind === "audio"
+              ? <select value={audioFormat} onChange={(e) => setAudioFormat(e.target.value)}>{AUDIO_FORMATS.map(([f, label]) => <option key={f} value={f}>{label}</option>)}</select>
+              : <select value={videoFormat} onChange={(e) => setVideoFormat(e.target.value)}>{VIDEO_FORMATS.map(([f, label]) => <option key={f} value={f}>{label}</option>)}</select>}
+          </label>
           {kind === "video" && (
             <label className="field">
-              <span>Largest size<Info text="Training scales every file down to its resolution, so more than 1080p mostly costs disk space and download time. Where there's a choice, the video comes as H.264 in an mp4, which plays everywhere." /></span>
+              <span>Largest size<Info text="Training scales every file down to its resolution, so more than 1080p mostly costs disk space and download time." /></span>
               <select value={height} onChange={(e) => setHeight(Number(e.target.value))}>
                 {HEIGHTS.map(([h, label]) => <option key={h} value={h}>{label}</option>)}
               </select>
