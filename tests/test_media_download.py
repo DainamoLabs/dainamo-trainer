@@ -116,6 +116,17 @@ def test_a_playlist_keeps_what_worked_and_reports_what_didnt(fake, tmp_path):
     assert j.errors == ["Unsupported URL: https://e.com/nothing"]
 
 
+def test_only_a_current_yt_dlp_counts(fake, monkeypatch):
+    assert md.release("2026.08.19.232857") == (2026, 8, 19) and md.release("dev") == () and md.release(None) == ()
+    for version, current in (("2024.04.09", False), (md.MIN_VERSION, True), (md.MIN_VERSION + ".232857", True),
+                             ("2099.01.01", True), ("dev", False)):
+        monkeypatch.setattr(md.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout=version + "\n"))
+        md._version.clear()
+        assert md.tool()["current"] == current, version
+    with open("requirements.txt") as fh:  # the launcher installs at least the version Dainamo needs
+        assert "yt-dlp[default]>=" + ".".join(str(int(p)) for p in md.MIN_VERSION.split(".")) + "\n" in fh.read()
+
+
 def test_cancelling_stops_yt_dlp_and_cleans_up(fake, tmp_path):
     j = md.DownloadJob({"id": "d", "path": str(tmp_path)}, "https://e.com/slow", {})
     end = time.time() + 15
@@ -153,8 +164,13 @@ def test_the_api_checks_the_request(fake, tmp_path, monkeypatch):
         names = [i["name"] for i in client.get(f"/api/datasets/{did}/items").json()]
         assert names == ["Clip [abc].mp4"]
         info = client.get("/api/ytdlp").json()
-        assert info == {"installed": True, "version": "2099.01.01", "bundled": False, "network": False}
-        monkeypatch.setattr(md, "ytdlp", lambda: None)
+        assert info == {"installed": True, "version": "2099.01.01", "current": True, "minimum": md.MIN_VERSION,
+                        "bundled": False, "network": False}
+        monkeypatch.setattr(md, "tool", lambda: {"installed": True, "version": "2024.04.09", "current": False,
+                                                 "minimum": md.MIN_VERSION})
+        r = client.post(url, json={"url": "https://e.com/ok"})
+        assert r.status_code == 400 and f"older than Dainamo needs ({md.MIN_VERSION} or newer)" in r.json()["detail"]
+        monkeypatch.setattr(md, "tool", lambda: {"installed": False, "version": None, "current": False})
         r = client.post(url, json={"url": "https://e.com/ok"})
         assert r.status_code == 400 and "isn't installed" in r.json()["detail"]
 

@@ -513,8 +513,12 @@ def download_media(did: str, body: DownloadIn):
         raise HTTPException(400, "A part of a video can't be chosen for a whole playlist")
     if not os.path.isdir(d["path"]):
         raise HTTPException(400, f"The dataset's folder is missing: {d['path']}")
-    if not media_download.ytdlp():
+    tool = media_download.tool()
+    if not tool["installed"]:
         raise HTTPException(400, "yt-dlp isn't installed: install it in the Add from URL window, or run the launcher again")
+    if not tool["current"]:
+        raise HTTPException(400, f"yt-dlp {tool['version']} is older than Dainamo needs ({tool['minimum']} or newer): "
+                                 "update it in the Add from URL window")
     opts = body.model_dump(exclude={"url"})
     media_download.download_jobs[did] = media_download.DownloadJob(d, url, opts)
     return media_download.download_jobs[did].to_json()
@@ -536,7 +540,7 @@ def download_cancel(did: str):
 
 @router.get("/ytdlp")
 def ytdlp_info():
-    """The yt-dlp Add from URL runs: {installed, version, bundled, network}."""
+    """The yt-dlp Add from URL runs: {installed, version, current, minimum, bundled, network}."""
     return media_download.tool()
 
 

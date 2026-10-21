@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,7 @@ DOWNLOADS = os.path.join(db.DATA_DIR, "downloads")  # a folder per download unti
 HEIGHTS = (0, 360, 480, 720, 1080, 1440, 2160)  # the largest a video may be; 0: the best there is
 MAX_ITEMS = 200  # the most items one playlist download may add
 JS_RUNTIMES = ("node", "bun")  # YouTube needs one; yt-dlp looks for deno itself, these only when told
+MIN_VERSION = "2026.08.19"  # the oldest yt-dlp Dainamo runs, as in requirements.txt
 # a line on stdout as each item starts downloading, for each progress report (a part cut by ffmpeg has none), each
 # post-processing step and each finished file (``_line``)
 TEMPLATES = [
@@ -55,8 +57,15 @@ def _env() -> dict:
 _version: dict = {}  # the last ``tool`` answer, until an update
 
 
+def release(version: str | None) -> tuple[int, ...]:
+    """A yt-dlp version ("2026.08.19", or a nightly's "2026.08.19.232857") as (year, month, day); () if it isn't one."""
+    parts = re.findall(r"\d+", version or "")[:3]
+    return tuple(map(int, parts)) if len(parts) == 3 else ()
+
+
 def tool() -> dict:
-    """{installed, version, bundled (in Dainamo's environment, which ``update`` can update), network}."""
+    """{installed, version, current (``MIN_VERSION`` or newer), minimum, bundled (in Dainamo's environment, which
+    ``update`` can update), network}."""
     if not _version:
         cmd = ytdlp()
         version = None
@@ -67,7 +76,8 @@ def tool() -> dict:
                 version = r.stdout.strip() or None
             except (OSError, subprocess.TimeoutExpired):
                 pass
-        _version.update(installed=bool(version), version=version, bundled=cmd == [sys.executable, "-m", "yt_dlp"])
+        _version.update(installed=bool(version), version=version, current=release(version) >= release(MIN_VERSION),
+                        minimum=MIN_VERSION, bundled=cmd == [sys.executable, "-m", "yt_dlp"])
     return {**_version, "network": on_network()}
 
 
@@ -95,12 +105,10 @@ def command(url: str, out_dir: str, kind: str = "video", max_height: int = 1080,
     """The yt-dlp command that downloads ``url`` into ``out_dir``: a video of at most ``max_height`` (0: any), H.264
     in an mp4 where there's a choice, or with ``kind`` "audio" only the sound, as the site has it; with ``start``
     and/or ``end`` (seconds) only that part; ``playlist`` (0: just the one the URL names) a playlist's first that
-    many items."""
+    many items. Needs yt-dlp ``MIN_VERSION`` or newer."""
     cmd = [*ytdlp(), "--ignore-config", "--newline", "--no-colors", "--progress", "--no-mtime", "--windows-filenames",
            "-P", out_dir, "-o", "%(title).100B [%(id)s].%(ext)s", *TEMPLATES]
-    for rt in JS_RUNTIMES:
-        if shutil.which(rt):
-            cmd += ["--js-runtimes", rt]
+    cmd += [arg for rt in JS_RUNTIMES if shutil.which(rt) for arg in ("--js-runtimes", rt)]
     # a playlist's URL downloads the whole playlist even with --no-playlist; -I keeps it to its first item
     cmd += ["--yes-playlist", "--ignore-errors", "-I", f"1:{playlist}"] if playlist else ["--no-playlist", "-I", "1:1"]
     if kind == "audio":

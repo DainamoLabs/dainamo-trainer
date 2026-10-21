@@ -15,7 +15,7 @@ type DownloadStatus = {
   running: boolean; phase?: "starting" | "downloading" | "processing" | ""; title?: string; step?: string; item?: number; items?: number;
   done_bytes?: number; total_bytes?: number; saved: string[]; count: number; errors: string[]; cancelled: boolean;
 };
-type YtdlpInfo = { installed: boolean; version: string | null; bundled: boolean; network: boolean };
+type YtdlpInfo = { installed: boolean; version: string | null; current: boolean; minimum: string; bundled: boolean; network: boolean };
 
 type CapStatus = {
   running: boolean; total: number; done: number; errors: string[]; current?: string;
@@ -418,7 +418,7 @@ function DownloadModal({ dataset, onClose, onStarted }: { dataset: Dataset; onCl
   useEffect(() => { api.get<YtdlpInfo>("/api/ytdlp").then(setInfo, (e) => toast(e.message, true)); }, []);
   const start = parseClock(from), end = parseClock(to);
   const partOk = playlist || (!Number.isNaN(start) && !Number.isNaN(end) && (end == null || end > (start ?? 0)));
-  const ok = /^https?:\/\/\S+$/i.test(url.trim()) && partOk && (!playlist || (items >= 1 && items <= 200)) && !!info?.installed && !updating;
+  const ok = /^https?:\/\/\S+$/i.test(url.trim()) && partOk && (!playlist || (items >= 1 && items <= 200)) && !!info?.current && !updating;
   const update = async () => {
     setUpdating(true);
     try {
@@ -500,6 +500,10 @@ function DownloadModal({ dataset, onClose, onStarted }: { dataset: Dataset; onCl
           {info && !info.installed ? (
             <p className="warn">yt-dlp, which does the downloading, isn't installed.{" "}
               <button className="btn sm" disabled={updating} onClick={update}>{updating ? "Installing…" : "Install yt-dlp"}</button></p>
+          ) : info && !info.current ? (
+            <p className="warn">This yt-dlp ({info.version}{info.bundled ? "" : ", the one on your PATH"}) is older than Dainamo needs
+              ({info.minimum} or newer).{" "}
+              <button className="btn sm" disabled={updating} onClick={update}>{updating ? "Updating…" : info.bundled ? "Update yt-dlp" : "Install it in Dainamo"}</button></p>
           ) : (
             <p>Experimental. Downloads use yt-dlp{info?.version ? ` ${info.version}` : ""}{info && !info.bundled ? " (the one on your PATH)" : ""}.
               Websites change often, and a change can break downloads until yt-dlp is updated.{" "}
