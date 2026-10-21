@@ -3,6 +3,7 @@ import { go } from "../App";
 import { api, fmtDuration, fmtTime, type DiskUse, type Job, type JobDetail } from "../api";
 import { EvalPanel } from "../components/EvalPanel";
 import { EvaluateDialog } from "../components/EvalSettings";
+import { HardwareCards } from "../components/Hardware";
 import { LossChart } from "../components/LossChart";
 import { IconCamera, IconCopy, IconDown, IconDownload, IconImages, IconPlay, IconRefresh, IconSave, IconStop, IconTarget, IconTrash, IconUp } from "../components/icons";
 import { ConfirmDialog, Lightbox, Modal, StatusPill, fmtSize, usePoll, useToast } from "../components/ui";
@@ -368,6 +369,7 @@ function QueueList({ jobs, reload }: { jobs: Job[] | null; reload: () => void })
         </div>
         <button className="btn primary" onClick={() => go("create")}>New job</button>
       </div>
+      <HardwareCards />
       {disk && disk.total.total > 0 && (
         <div className="row wrap small queue-disk">
           <span className="muted">Jobs use {fmtSize(disk.total.total)} on disk: {fmtSize(disk.total.output)} of LoRAs, {fmtSize(disk.total.cache)} of cached captions and latents, {fmtSize(disk.total.state)} of training state.</span>

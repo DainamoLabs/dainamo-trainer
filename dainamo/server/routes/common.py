@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from fastapi import HTTPException
 
+from ...engine.families import get_family
 from .. import db
 
 
@@ -17,6 +18,14 @@ def profile_or_404(pid: str) -> dict:
 
 def dataset_or_404(did: str) -> dict:
     return db.query_one("SELECT * FROM datasets WHERE id=?", (did,)) or not_found("Dataset not found")
+
+
+def family_or_400(family_id: str):
+    """The model family's driver, or a 400 for one Dainamo doesn't know."""
+    try:
+        return get_family(family_id)
+    except KeyError:
+        raise HTTPException(400, f"Unknown model family {family_id!r}")
 
 
 def job_or_404(jid: str) -> dict:

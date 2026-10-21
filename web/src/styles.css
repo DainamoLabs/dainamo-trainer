@@ -228,6 +228,14 @@ img.audio-thumb { aspect-ratio: 2; object-fit: fill; }
 @media (max-width: 560px) { .ds-card-head { grid-template-columns: minmax(0, 1fr); } }
 .summary { position: sticky; top: 28px; }
 .queue-disk { gap: 6px 14px; margin: -8px 0 18px; }
+.hw-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; margin: -6px 0 26px; }
+.hw-card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; font-size: 12.5px; min-width: 0; font-variant-numeric: tabular-nums; }
+.hw-row { display: flex; justify-content: space-between; gap: 8px; }
+.hw-head { font-weight: 600; }
+.hw-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.hw-card .bar { margin-top: 4px; }
+.hw-warm { color: var(--warn); }
+.hw-hot { color: var(--danger); }
 .kv { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 13px; gap: 10px; }
 .kv:last-child { border-bottom: 0; }
 .kv span:first-child { color: var(--muted); }

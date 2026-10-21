@@ -151,6 +151,24 @@ def _header_only(path, tensors: dict) -> str:
     return str(path)
 
 
+def test_an_unknown_model_family_is_refused(client, tmp_path):
+    said = "Unknown model family 'ltx2'"
+    for r in (client.post("/api/profiles", json={"name": "bad", "family": "ltx2", "data": {}}),
+              client.post("/api/profiles/validate", json={"name": "bad", "family": "ltx2", "data": {}})):
+        assert r.status_code == 400 and r.json()["detail"] == said
+    assert not any(p["name"] == "bad" for p in client.get("/api/profiles").json())
+    pid = client.post("/api/profiles", json={"name": "fam", "family": "ltx2_5", "data": {}}).json()["id"]
+    try:
+        r = client.put(f"/api/profiles/{pid}", json={"name": "fam", "family": "ltx2", "data": {}})
+        assert r.status_code == 400 and r.json()["detail"] == said
+        assert next(p for p in client.get("/api/profiles").json() if p["id"] == pid)["family"] == "ltx2_5"  # unchanged
+    finally:
+        client.delete(f"/api/profiles/{pid}")
+    did = client.post("/api/datasets", json={"name": "fam", "path": str(tmp_path)}).json()["id"]
+    r = client.get(f"/api/datasets/{did}/check", params={"family": "ltx2"})
+    assert r.status_code == 400 and r.json()["detail"] == said
+
+
 def test_profile_check_tells_text_encoders_and_vaes_apart(tmp_path):
     from dainamo.engine.families import get_family
 
@@ -294,20 +312,19 @@ def test_slider_jobs_need_their_prompts_and_no_dataset(client):
     assert "can't train sliders" in bad(prompts, ltx)
 
 
-def test_lokr_settings_are_checked(client):
+def test_lokr_settings_are_checked(client, tmp_path):
     from dainamo.server.validation import LOKR_FACTOR
 
     client.put("/api/settings", json={"queue": {"gpus": [99]}})
     pid = client.post("/api/profiles", json={"name": "lk", "family": "krea2", "data": {}}).json()["id"]
-    # a slider, so the job needs no dataset
-    base = {"slider_enabled": True, "slider_target": "a person", "slider_positive": "a person, smiling",
-            "slider_negative": "a person, frowning"}
+    did = client.post("/api/datasets", json={"name": "lk", "path": str(tmp_path)}).json()["id"]
 
-    def post(settings):
-        return client.post("/api/jobs", json={"name": "lk", "profile_id": pid, "datasets": [], "settings": settings})
+    def post(settings, datasets=({"id": did},)):
+        return client.post("/api/jobs", json={"name": "lk", "profile_id": pid, "datasets": list(datasets),
+                                              "settings": settings})
 
     for extra, factor in (({}, LOKR_FACTOR), ({"lokr_factor": "-1"}, -1), ({"lokr_factor": 8}, 8)):
-        r = post({**base, "network_type": "lokr", **extra})
+        r = post({"network_type": "lokr", **extra})
         assert r.status_code == 200, r.text
         s = r.json()["config"]["settings"]
         assert (s["network_type"], s["lokr_factor"]) == ("lokr", factor)
@@ -315,8 +332,13 @@ def test_lokr_settings_are_checked(client):
     for settings, why in (({"network_type": "loha"}, "network type"),
                           ({"network_type": "lokr", "lokr_factor": 1}, "lokr_factor"),
                           ({"network_type": "lokr", "lokr_factor": "big"}, "lokr_factor")):
-        r = post({**base, **settings})
+        r = post(settings)
         assert r.status_code == 400 and why in r.json()["detail"], settings
+    # a slider is always a LoRA
+    slider = {"slider_enabled": True, "slider_target": "a person", "slider_positive": "a person, smiling",
+              "slider_negative": "a person, frowning"}
+    r = post({**slider, "network_type": "lokr"}, datasets=())
+    assert r.status_code == 400 and r.json()["detail"] == "A slider trains as a LoRA, not a LoKr"
 
 
 def test_sign_in_guards_the_api():

@@ -34,6 +34,13 @@ const BASE_SETTINGS: S = {
 const SLIDER_DEFAULTS: S = { steps: 500, rank: 16, alpha: 16, picker_enabled: false };
 // a LoKr learns more slowly than a LoRA at the same rate, so it starts at this multiple of the family's rate
 const LOKR_LR_SCALE = 2;
+// what a job trains: a LoRA or a LoKr of its datasets, or a slider (always a LoRA; families with info.sliders)
+type Kind = "lora" | "lokr" | "slider";
+const KINDS: [Kind, string, string][] = [
+  ["lora", "LoRA", "Learns the subject or style of your datasets."],
+  ["lokr", "LoKr", "Learns the subject or style of your datasets in a Kronecker-product adapter (LyCORIS): a smaller file, which ComfyUI loads like a LoRA. It learns more slowly, so it starts at twice a LoRA's learning rate."],
+  ["slider", "Slider", "A LoRA whose strength moves one attribute either way: plus toward one prompt, minus toward another."],
+];
 
 // A sample prompt card. Blank fields fall back to the Sampling defaults (kept as strings so they can be blank).
 // Music cards have a length (seconds) and lyrics instead of a size.
@@ -203,23 +210,23 @@ export default function CreateJob({ families }: { families: Family[] }) {
 
   const isVideo = !!family?.media.includes("video");
   const isAudio = !!family?.media.includes("audio");
-  const lokr = s.network_type === "lokr";
   const slider = !!family?.sliders && !!s.slider_enabled;
+  const lokr = !slider && s.network_type === "lokr";
+  const kind: Kind = slider ? "slider" : lokr ? "lokr" : "lora";
   const preserve: string[] = Array.isArray(s.slider_preserve) ? s.slider_preserve : [];
   // a slider keeps either its layout or the attributes listed (the attributes stay put while the layout is chosen)
   const keepLayout = !!s.slider_keep_layout;
-  const setKind = (on: boolean) => {
-    if (on === slider) return;
-    const d = family?.training_defaults || {};
-    setS((x) => ({ ...x, slider_enabled: on, ...(on ? SLIDER_DEFAULTS
-      : { steps: d.steps ?? BASE_SETTINGS.steps, rank: d.rank ?? BASE_SETTINGS.rank, alpha: d.alpha ?? BASE_SETTINGS.alpha }) }));
-  };
   // the learning rate follows the network while it's still the other network's default
-  const setNetwork = (v: string) => {
-    if (v === s.network_type) return;
-    const lr = Number(family?.training_defaults?.learning_rate ?? BASE_SETTINGS.learning_rate);
-    const [from, to] = v === "lokr" ? [lr, lr * LOKR_LR_SCALE] : [lr * LOKR_LR_SCALE, lr];
-    setS((x) => ({ ...x, network_type: v, ...(x.learning_rate === from ? { learning_rate: to } : {}) }));
+  const setKind = (to: Kind) => {
+    if (to === kind) return;
+    const d = family?.training_defaults || {};
+    const network = to === "lokr" ? "lokr" : "lora";
+    const lr = Number(d.learning_rate ?? BASE_SETTINGS.learning_rate);
+    const [from, rate] = network === "lokr" ? [lr, lr * LOKR_LR_SCALE] : [lr * LOKR_LR_SCALE, lr];
+    setS((x) => ({ ...x, network_type: network, ...(x.network_type !== network && x.learning_rate === from ? { learning_rate: rate } : {}),
+      ...(to === "slider" ? { slider_enabled: true, ...SLIDER_DEFAULTS }
+        : slider ? { slider_enabled: false, steps: d.steps ?? BASE_SETTINGS.steps, rank: d.rank ?? BASE_SETTINGS.rank, alpha: d.alpha ?? BASE_SETTINGS.alpha }
+        : {}) }));
   };
   // what a dataset has that the model trains on (image models skip clips, music models everything but audio)
   // clips split from one video train once per epoch between them
@@ -249,7 +256,8 @@ export default function CreateJob({ families }: { families: Family[] }) {
     // the first dataset's resolution, flip and dropout are remembered as the starting point for new ones
     const first = chosen[0];
     const settings = {
-      ...s, sample_prompts: fromCards(cards), slider_enabled: slider, ...(isAudio ? { bleed_enabled: false } : {}),
+      ...s, sample_prompts: fromCards(cards), slider_enabled: slider, network_type: kind === "lokr" ? "lokr" : "lora",
+      ...(isAudio ? { bleed_enabled: false } : {}),
       ...(slider ? { picker_enabled: false, ...(keepLayout ? { slider_preserve: [] } : {}) } : {}),
       ...(first ? { resolution: first.resolution, flip: first.flip, caption_dropout: first.caption_dropout }
         : rendered ? { resolution: dsCards[0].resolution } : {}),
@@ -288,7 +296,7 @@ export default function CreateJob({ families }: { families: Family[] }) {
   const vram = useVramProjection(profileId || undefined, {
     resolution: resolutions.length ? resolutions : s.resolution,
     datasets: chosen.map((c) => ({ resolution: c.resolution, video: c.d.videos > 0 })), batch_size: s.batch_size, rank: s.rank, optimizer: s.optimizer,
-    network_type: s.network_type, lokr_factor: s.lokr_factor,
+    network_type: kind === "lokr" ? "lokr" : "lora", lokr_factor: s.lokr_factor,
     gradient_checkpointing: s.gradient_checkpointing, sample_width: s.sample_width, sample_height: s.sample_height,
     low_vram: lowVram,
     // low VRAM samples without the VAE, unless a card's images (a first frame, references) need it
@@ -314,7 +322,7 @@ export default function CreateJob({ families }: { families: Family[] }) {
             <div className="section-head"><span className="num">01</span><h3>Basics</h3></div>
             <div className="grid cols-2">
               <label className="field"><span>Job name</span><input value={name} onChange={(e) => setName(e.target.value)} placeholder="my_character_v1" /></label>
-              <label className="field"><span>LoRA file name <span className="faint">· optional</span></span><input value={outName} onChange={(e) => setOutName(e.target.value)} placeholder="defaults to job name" /></label>
+              <label className="field"><span>File name <span className="faint">· optional</span></span><input value={outName} onChange={(e) => setOutName(e.target.value)} placeholder="defaults to job name" /></label>
               <label className="field">
                 <span>Profile</span>
                 {profiles && profiles.length === 0 ? (
@@ -326,15 +334,15 @@ export default function CreateJob({ families }: { families: Family[] }) {
                 )}
               </label>
               <Sel label="GPU" v={gpu} on={setGpu} opts={[["auto", "Auto (queue decides)"], ...(sys?.gpus || []).map((g) => [String(g.index), `GPU ${g.index} · ${g.name.replace("NVIDIA GeForce ", "")}`] as [string, string])]} />
-              {family?.sliders && (
+              {family && (
                 <div className="field">
                   <span>Train</span>
                   <div className="seg" role="group" aria-label="What to train">
-                    <button type="button" className={slider ? "" : "on"} aria-pressed={!slider} onClick={() => setKind(false)}>LoRA</button>
-                    <button type="button" className={slider ? "on" : ""} aria-pressed={slider} onClick={() => setKind(true)}>Slider</button>
+                    {KINDS.filter(([k]) => k !== "slider" || family.sliders).map(([k, label]) => (
+                      <button key={k} type="button" className={kind === k ? "on" : ""} aria-pressed={kind === k} onClick={() => setKind(k)}>{label}</button>
+                    ))}
                   </div>
-                  <span className="help">{slider ? "A LoRA whose strength moves one attribute either way: plus toward one prompt, minus toward another."
-                    : "A LoRA that learns the subject or style of your datasets."}</span>
+                  <span className="help">{KINDS.find(([k]) => k === kind)?.[2]}</span>
                 </div>
               )}
             </div>
@@ -519,8 +527,6 @@ export default function CreateJob({ families }: { families: Family[] }) {
               <Num label="Steps" v={s.steps} on={set("steps")} min={1} />
               <Num label="Learning rate" v={s.learning_rate} on={set("learning_rate")} step={0.00001} />
               <Sel label="Optimizer" v={s.optimizer} on={set("optimizer")} opts={[["adamw8bit", "AdamW 8-bit"], ["adamw", "AdamW"], ["adafactor", "Adafactor"], ["prodigy", "Prodigy (set LR to 1)"]]} />
-              <Sel label="Network" v={s.network_type} on={setNetwork} opts={[["lora", "LoRA"], ["lokr", "LoKr"]]}
-                help={lokr ? "A Kronecker-product adapter (LyCORIS): smaller files; ComfyUI loads it like a LoRA. It learns more slowly, so it starts at twice a LoRA's learning rate." : undefined} />
               {lokr ? (
                 <Sel label="LoKr factor" v={String(s.lokr_factor)} on={(v) => set("lokr_factor")(Number(v))}
                   opts={[["4", "4 · most weights"], ["8", "8"], ["16", "16"], ["-1", "Auto · fewest weights"]]}

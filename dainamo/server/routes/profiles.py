@@ -7,9 +7,8 @@ import json
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from ...engine.families import get_family
 from .. import db
-from .common import profile_or_404
+from .common import family_or_400, profile_or_404
 
 router = APIRouter(prefix="/api/profiles")
 
@@ -27,7 +26,7 @@ def list_profiles():
 
 @router.post("")
 def create_profile(p: ProfileIn):
-    get_family(p.family)
+    family_or_400(p.family)
     pid = db.new_id()
     db.execute("INSERT INTO profiles (id, name, family, data, created, updated) VALUES (?,?,?,?,?,?)",
                (pid, p.name.strip(), p.family, json.dumps(p.data), db.now(), db.now()))
@@ -36,6 +35,7 @@ def create_profile(p: ProfileIn):
 
 @router.put("/{pid}")
 def update_profile(pid: str, p: ProfileIn):
+    family_or_400(p.family)
     db.execute("UPDATE profiles SET name=?, family=?, data=?, updated=? WHERE id=?",
                (p.name.strip(), p.family, json.dumps(p.data), db.now(), pid))
     return profile_or_404(pid)
@@ -49,4 +49,4 @@ def delete_profile(pid: str):
 
 @router.post("/validate")
 def validate_profile(p: ProfileIn):
-    return get_family(p.family).validate_profile(p.data)
+    return family_or_400(p.family).validate_profile(p.data)

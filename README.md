@@ -77,7 +77,12 @@ as Tailscale).
   models can also train a **slider** instead of a LoRA of the datasets (see
   Sliders below). **Network** under Training trains a LoRA or a LoKr (see LoKr
   below).
-- **Queue**: running, queued and finished jobs. Each job page shows its
+- **Queue**: running, queued and finished jobs, under live cards for each
+  GPU (use, VRAM and temperature), the CPU (use and temperature) and system
+  RAM, updated every 2 seconds. GPUs are read with `nvidia-smi` on Linux and
+  Windows. Linux reports the CPU's temperature through its sensor drivers;
+  Windows doesn't give programs the CPU's temperature, so it shows as "—"
+  there. Each job page shows its
   samples first, as a grid with a row per sample prompt and a column per step
   (or grouped by step). Click a sample to view it full size, and use the arrow
   keys to step through training (left/right) and prompts (up/down). Below that
@@ -782,6 +787,7 @@ dainamo/
     procs.py              starting, finding and stopping worker processes (Linux and Windows)
     sandbox.py            the Sandbox worker process
     notify.py             webhooks when a job ends
+    hardware.py           the GPUs, CPU and RAM now, for the Queue's hardware cards and the sidebar
     auth.py               sign-in for remote access
     captioner.py          the local LLM: auto-captions (images, clip frames, contact sheets) and prompt enhancement
     llama_server.py       the caption server Dainamo runs (llama-server or textgen): start, readiness, idle
@@ -1019,6 +1025,12 @@ finished job more steps, disk use and clearing caches and training state,
 bulk caption edits (preview, whole words, regular expressions, undo), turning
 a training sample into Sandbox settings, and finding and killing worker
 processes with their children.
+
+`tests/test_hardware.py` checks the hardware cards' readings: GPUs parsed
+from `nvidia-smi` and read once a second however many pages ask, none without
+it, CPU names without trademarks or speeds, the CPU package's temperature from
+Intel's and AMD's Linux sensor drivers (not the motherboard's), and Windows,
+where the CPU is named from the registry and has no temperature.
 
 `tests/test_db.py` checks the schema migrations: a fresh database, one from
 before versioning, new steps running once after a backup, a failed step

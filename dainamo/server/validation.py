@@ -98,6 +98,8 @@ def check_slider(s: dict) -> None:
     s["slider_enabled"] = bool(s.get("slider_enabled", False))
     if not s["slider_enabled"]:
         return
+    if s.get("network_type") == "lokr":
+        raise HTTPException(400, "A slider trains as a LoRA, not a LoKr")
     for key, label in (("slider_target", "target"), ("slider_positive", "positive"), ("slider_negative", "negative")):
         s[key] = str(s.get(key) or "").strip()
         if not s[key]:

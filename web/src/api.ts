@@ -30,7 +30,10 @@ export type Workflow = { id: string; label: string; output: MediaKind };
 export type FamilyWorkflow = Workflow & { images: WorkflowImages | null; variants: string[] | null };
 
 export type Gpu = { index: number; name: string; mem_used: number; mem_total: number; util: number; temp: number };
-export type SystemRam = { total_gb: number; available_gb: number };
+export type SystemRam = { total_gb: number; available_gb: number; used_gb: number };
+// the CPU's temperature is null where it isn't reported (Windows, or a Linux machine without the sensor driver)
+export type Cpu = { name: string; percent: number; temp: number | null; cores: number; threads: number };
+export type Hardware = { gpus: Gpu[]; cpu: Cpu; ram: SystemRam };
 
 export type Profile = { id: string; name: string; family: string; data: Record<string, unknown>; updated: number };
 

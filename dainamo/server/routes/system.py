@@ -5,13 +5,12 @@ from __future__ import annotations
 import os
 import re
 import string
-import subprocess
 
 from fastapi import APIRouter, HTTPException
 
 from ...engine.families import FAMILIES
 from ...engine.transcribe import MODELS as WHISPER_MODELS
-from .. import db, notify
+from .. import db, hardware, notify
 from .common import not_found
 
 router = APIRouter(prefix="/api")
@@ -19,25 +18,18 @@ router = APIRouter(prefix="/api")
 
 @router.get("/system")
 def system():
-    gpus = []
-    try:
-        out = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.used,memory.total,utilization.gpu,"
-                              "temperature.gpu", "--format=csv,noheader,nounits"],
-                             capture_output=True, text=True, timeout=5).stdout
-        for line in out.strip().splitlines():
-            i, name, used, total, util, temp = [x.strip() for x in line.split(",")]
-            gpus.append({"index": int(i), "name": name, "mem_used": int(used), "mem_total": int(total),
-                         "util": int(util), "temp": int(temp)})
-    except (OSError, subprocess.SubprocessError, ValueError):
-        pass
-    import psutil
-
     from ...engine.families.base import WORKFLOWS
-    vm = psutil.virtual_memory()
-    return {"gpus": gpus, "ram": {"total_gb": vm.total / 1024**3, "available_gb": vm.available / 1024**3},
+
+    return {"gpus": hardware.gpus(), "ram": hardware.ram(),
             "families": [F.info.to_json() for F in FAMILIES.values()],
             "workflows": [{"id": k, **v} for k, v in WORKFLOWS.items()],
             "whisper_models": [{"id": k, "size": size} for k, (_, size) in WHISPER_MODELS.items()]}
+
+
+@router.get("/hardware")
+def hardware_status():
+    """The GPUs, the CPU and system RAM now, for the Queue's hardware cards."""
+    return {"gpus": hardware.gpus(), "cpu": hardware.cpu(), "ram": hardware.ram()}
 
 
 @router.get("/settings")

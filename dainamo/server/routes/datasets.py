@@ -22,7 +22,7 @@ from ...engine.transcribe import MODELS as WHISPER_MODELS
 from .. import captioner, clip_split, dataset_check, db
 from ..llama_server import describe, provider
 from ..validation import MAX_FRAMES, check_resolution
-from .common import dataset_or_404, not_found, profile_or_404
+from .common import dataset_or_404, family_or_400, not_found, profile_or_404
 
 router = APIRouter(prefix="/api")
 
@@ -195,12 +195,7 @@ def check_dataset(did: str, resolution: str = "", family: str = "", frames: int 
     model ``family``; ``frames`` is the clip length for video models (blank: the family's default), and
     ``seconds`` a music model's (0: whole songs; -1: the family's default)."""
     d = dataset_or_404(did)
-    F = None
-    if family:
-        try:
-            F = get_family(family)
-        except KeyError:
-            raise HTTPException(400, f"Unknown model family {family!r}")
+    F = family_or_400(family) if family else None
     if F and "audio" in F.info.media:
         clip = seconds if seconds >= 0 else int(F.info.training_defaults.get("clip_seconds", 30))
         return dataset_check.check(d["path"], d["trigger"], token_limit=F.caption_tokens, clip_seconds=clip)
@@ -448,10 +443,7 @@ def split_dataset(did: str, body: SplitIn):
     cur = clip_split.split_jobs.get(did)
     if cur and cur.running:
         raise HTTPException(409, "Already splitting this dataset")
-    try:
-        F = get_family(body.family)
-    except KeyError:
-        raise HTTPException(400, f"Unknown model family {body.family!r}")
+    F = family_or_400(body.family)
     if "video" not in F.info.media:
         raise HTTPException(400, f"{F.info.label} doesn't train on clips")
     if body.frames not in clip_split.clip_lengths(F):
