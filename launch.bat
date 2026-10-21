@@ -27,7 +27,9 @@ if errorlevel 1 (
   echo Installing Python packages, PyTorch with CUDA among them. This takes a while the first time...
   where uv >nul 2>nul
   if not errorlevel 1 (
-    uv pip install --python "%PY%" -r requirements.txt || goto :fail
+    rem uv otherwise takes a package only from the first index that has it: the PyTorch index's old copies
+    rem of packages such as requests would hide PyPI's newer ones; pip already looks at every index
+    uv pip install --python "%PY%" --index-strategy unsafe-first-match -r requirements.txt || goto :fail
   ) else (
     "%PY%" -m pip install -r requirements.txt || goto :fail
   )

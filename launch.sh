@@ -18,7 +18,9 @@ fi
 if ! cmp -s requirements.txt .venv/requirements.installed; then
   echo "Installing Python packages, PyTorch with CUDA among them. This takes a while the first time…"
   if command -v uv >/dev/null; then
-    uv pip install --python .venv/bin/python -r requirements.txt
+    # uv otherwise takes a package only from the first index that has it: the PyTorch index's old copies of
+    # packages such as requests would hide PyPI's newer ones (pip already looks at every index)
+    uv pip install --python .venv/bin/python --index-strategy unsafe-first-match -r requirements.txt
   else
     .venv/bin/pip install -r requirements.txt
   fi
