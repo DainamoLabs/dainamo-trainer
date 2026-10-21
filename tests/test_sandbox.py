@@ -1,0 +1,353 @@
+"""Sandbox: request validation per family/workflow, the GPU rules shared with the training queue, and
+the inference LoRA stack.
+
+    .venv/bin/python -m pytest tests/test_sandbox.py -v
+"""
+
+import io
+import os
+import sys
+import tempfile
+
+if "dainamo.server.db" not in sys.modules:
+    os.environ["DAINAMO_DATA"] = tempfile.mkdtemp(prefix="dainamo-test-")
+    os.environ["DAINAMO_ALLOWED_HOSTS"] = "127.0.0.1,localhost,testserver"
+
+import pytest  # noqa: E402
+import torch  # noqa: E402
+import torch.nn as nn  # noqa: E402
+from fastapi import HTTPException  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+from dainamo.engine.lora import AdapterStack  # noqa: E402
+from dainamo.server import db  # noqa: E402
+from dainamo.server import queue as qmod  # noqa: E402
+from dainamo.server import sandbox as sbx  # noqa: E402
+from dainamo.server.app import app  # noqa: E402
+from dainamo.server.routes.sandbox import SandboxIn, check_sandbox  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def client():
+    with TestClient(app) as c:
+        c.put("/api/settings", json={"queue": {"gpus": [99]}})  # keep the scheduler from launching anything
+        yield c
+
+
+@pytest.fixture
+def profiles(client):
+    make = lambda name, fam, data: client.post("/api/profiles", json={"name": name, "family": fam, "data": data}).json()["id"]  # noqa: E731
+    return {"qwen": make("q", "qwen_image_2", {}), "krea": make("k", "krea2", {}),
+            "fl2va": make("m1", "minimax_h3", {"variant": "fl2va"}), "ref2va": make("m2", "minimax_h3", {"variant": "ref2va"})}
+
+
+def check(**kw):
+    return check_sandbox(SandboxIn(**{"prompt": "a cat", **kw}))
+
+
+def test_workflows_follow_the_model(profiles, tmp_path, monkeypatch):
+    monkeypatch.setattr(sbx, "gpu_count", lambda: 2)
+    img = tmp_path / "ref.png"
+    img.write_bytes(b"x")
+    for pid, wf in ((profiles["krea"], "t2v"), (profiles["krea"], "edit"), (profiles["qwen"], "i2v"),
+                    (profiles["fl2va"], "t2i"), (profiles["fl2va"], "r2v"), (profiles["ref2va"], "i2v")):
+        with pytest.raises(HTTPException, match="isn't available"):
+            check(profile_id=pid, workflow=wf, images=[str(img)])
+    with pytest.raises(HTTPException, match="needs 1"):
+        check(profile_id=profiles["qwen"], workflow="edit")
+    with pytest.raises(HTTPException, match="takes no images"):
+        check(profile_id=profiles["qwen"], workflow="t2i", images=[str(img)])
+    with pytest.raises(HTTPException, match="needs 1 first frame"):
+        check(profile_id=profiles["fl2va"], workflow="i2v", images=[str(img), str(img)])
+    _, p, gpu = check(profile_id=profiles["qwen"], workflow="edit", images=[str(img)], width=1000, height=700)
+    assert (p["width"], p["height"], p["frames"], gpu) == (992, 672, 1, 1)  # /32, the last GPU by default
+    _, p, _ = check(profile_id=profiles["fl2va"], workflow="i2v", images=[str(img)], frames=39, sampler="heun",
+                    scheduler="beta", cfg=4)
+    assert (p["frames"], p["sampler"], p["scheduler"]) == (39, "euler", "default")  # MiniMax: released sampler
+    _, p, _ = check(profile_id=profiles["krea"], workflow="t2i", seed=-1, frames=40)
+    assert p["seed"] >= 0 and p["frames"] == 1 and p["low_vram"] is False  # off unless asked for
+    assert check(profile_id=profiles["fl2va"], workflow="t2v", low_vram=True)[1]["low_vram"] is True
+    for bad in ({"steps": 0}, {"cfg": 99}, {"sampler": "ddim"}, {"scheduler": "karras"}, {"shift": 0},
+                {"count": 9}, {"width": 64}, {"prompt": "  "}, {"loras": [{"path": "/nope.safetensors"}]},
+                {"loras": [{"path": str(img)}]}):
+        with pytest.raises(HTTPException):
+            check(**{"profile_id": profiles["krea"], "workflow": "t2i", **bad})
+
+
+class FakeProc:
+    stdin = io.StringIO()
+
+    def poll(self):
+        return None
+
+
+def _queue_job(gpu="auto"):
+    jid = db.new_id()
+    db.execute("INSERT INTO jobs (id, name, status, family, gpu, position, created, config) VALUES "
+               "(?,?,?,?,?,?,?,?)", (jid, "j", "queued", "krea2", gpu, db.now(), db.now(), "{}"))
+    return jid
+
+
+@pytest.fixture
+def clean_jobs():
+    yield
+    db.execute("UPDATE jobs SET status='stopped' WHERE status IN ('queued','running')")
+
+
+def test_two_gpus_the_queue_skips_the_reserved_gpu(client, monkeypatch, clean_jobs):
+    monkeypatch.setattr(sbx, "gpu_count", lambda: 2)
+    monkeypatch.setattr(sbx.sandbox, "proc", FakeProc())
+    monkeypatch.setattr(sbx.sandbox, "gpu", 0)
+    spawned = []
+    monkeypatch.setattr(qmod.scheduler, "_spawn", lambda job, gpu: spawned.append(gpu))
+    monkeypatch.setattr(db, "get_settings", lambda: {"queue": {"mode": "sequential", "gpus": [0, 1], "max_per_gpu": 1}})
+    _queue_job()
+    pinned = _queue_job(gpu="0")
+    qmod.scheduler._launch()
+    assert spawned == [1]  # sequential would use GPU 0; the Sandbox holds it, so GPU 1
+    db.execute("UPDATE jobs SET status='stopped' WHERE id<>?", (pinned,))
+    spawned.clear()
+    qmod.scheduler._launch()
+    assert spawned == []  # a job pinned to the reserved GPU waits for the release
+
+
+def test_one_gpu_training_comes_first(client, monkeypatch, clean_jobs):
+    monkeypatch.setattr(sbx, "gpu_count", lambda: 1)
+    monkeypatch.setattr(sbx.sandbox, "proc", FakeProc())
+    monkeypatch.setattr(sbx.sandbox, "gpu", 0)
+    yielded, spawned = [], []
+    monkeypatch.setattr(sbx.sandbox, "yield_gpu", lambda: yielded.append(True))
+    monkeypatch.setattr(qmod.scheduler, "_spawn", lambda job, gpu: spawned.append(gpu))
+    monkeypatch.setattr(db, "get_settings", lambda: {"queue": {"mode": "sequential", "gpus": [0], "max_per_gpu": 1}})
+    assert sbx.sandbox.check_gpu(0) is None
+    _queue_job()
+    assert "busy with training" in sbx.sandbox.check_gpu(0)  # no new generations while a job waits
+    qmod.scheduler._launch()
+    assert yielded and not spawned  # the Sandbox unloads first; the job starts on a later tick
+
+
+def test_reserve_refuses_a_training_gpu(client, monkeypatch, clean_jobs):
+    monkeypatch.setattr(sbx, "gpu_count", lambda: 2)
+    jid = _queue_job()
+    db.execute("UPDATE jobs SET status='running', assigned_gpu=1 WHERE id=?", (jid,))
+    assert "GPU 1 is training" in sbx.sandbox.check_gpu(1)
+    assert sbx.sandbox.check_gpu(0) is None
+
+
+def test_status_endpoint(client):
+    st = client.get("/api/sandbox").json()
+    assert {"mode", "session", "samplers", "schedulers", "runs"} <= set(st)
+    assert st["samplers"]["dpmpp_2m"] == "DPM++ 2M"
+
+
+# ---- LoRA stack -----------------------------------------------------------
+class Tiny(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.blocks = nn.ModuleList([nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 8)) for _ in range(2)])
+
+    def forward(self, x):
+        for b in self.blocks:
+            x = b(x)
+        return x
+
+
+def lora_sd(prefix="diffusion_model.", rank=2, alpha=1.0, seed=0, kohya=False):
+    g = torch.Generator().manual_seed(seed)
+    sd = {}
+    for name in ("blocks.0.0", "blocks.1.1"):
+        a, b = torch.randn(rank, 8, generator=g), torch.randn(8, rank, generator=g)
+        if kohya:
+            k = "lora_unet_" + name.replace(".", "_")
+            sd |= {f"{k}.lora_down.weight": a, f"{k}.lora_up.weight": b, f"{k}.alpha": torch.tensor(alpha)}
+        else:
+            sd |= {f"{prefix}{name}.lora_A.weight": a, f"{prefix}{name}.lora_B.weight": b,
+                   f"{prefix}{name}.alpha": torch.tensor(alpha)}
+    return sd
+
+
+def reference(model, x, loras):
+    """Base model with each LoRA's delta W += strength * alpha/rank * B @ A folded in."""
+    import copy
+
+    m = copy.deepcopy(model)
+    with torch.no_grad():
+        for sd, strength in loras:
+            for name in ("blocks.0.0", "blocks.1.1"):
+                a, b = sd[f"diffusion_model.{name}.lora_A.weight"], sd[f"diffusion_model.{name}.lora_B.weight"]
+                scale = float(sd[f"diffusion_model.{name}.alpha"]) / a.shape[0]
+                m.get_submodule(name).weight += strength * scale * (b @ a)
+    return m(x)
+
+
+def test_adapter_stack_strengths_stacking_and_base_toggle():
+    torch.manual_seed(0)
+    model = Tiny().double()
+    x = torch.randn(3, 8, dtype=torch.float64)
+    base = model(x)
+    stack = AdapterStack(model, torch.device("cpu"), torch.float64)
+    one, two = lora_sd(seed=1), lora_sd(seed=2, alpha=4.0)
+    report = stack.set([("one", one, 0.7), ("two", two, -0.4)])
+    assert [r["matched"] for r in report] == [2, 2]
+    assert torch.allclose(model(x), reference(_clone(model), x, [(one, 0.7), (two, -0.4)]))
+    stack.set_enabled(False)
+    assert torch.allclose(model(x), base)
+    stack.set([("one", one, 1.0)])
+    assert torch.allclose(model(x), reference(_clone(model), x, [(one, 1.0)]))
+    stack.set([])
+    assert torch.allclose(model(x), base)
+
+
+def _clone(model):
+    """A plain Tiny with the wrapped model's base weights."""
+    t = Tiny().double()
+    sd = {k.replace(".base.", "."): v for k, v in model.state_dict().items()}
+    t.load_state_dict(sd)
+    return t
+
+
+def test_adapter_stack_reads_kohya_and_rejects_wrong_files():
+    model = Tiny().double()
+    x = torch.randn(3, 8, dtype=torch.float64)
+    stack = AdapterStack(model, torch.device("cpu"), torch.float64)
+    stack.set([("peft", lora_sd(seed=3), 1.0)])
+    peft = model(x)
+    stack.set([("kohya", lora_sd(seed=3, kohya=True), 1.0)])
+    assert torch.allclose(model(x), peft)
+    with pytest.raises(ValueError, match="no LoRA weights"):
+        stack.set([("model", {"blocks.0.0.weight": torch.zeros(8, 8)}, 1.0)])
+    with pytest.raises(ValueError, match="matches no layers"):
+        stack.set([("other", lora_sd(prefix="diffusion_model.other_model."), 1.0)])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_park_and_unpark_round_trip_with_block_swapping():
+    from dainamo.engine.offload import BlockSwapper, park, unpark
+
+    dev = torch.device("cuda", torch.cuda.device_count() - 1)
+    model = Tiny()
+    model.blocks.extend([nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 8)) for _ in range(2)])
+    model.requires_grad_(False)
+    swapper = BlockSwapper(model.blocks, 2, dev, log=lambda *_: None)
+    x = torch.randn(3, 8, device=dev)
+    before = model(x)
+    resident = sum(p.numel() * 4 for p in model.parameters() if p.is_cuda)
+    allocated = torch.cuda.memory_allocated(dev)
+    moved = park([model], swapper)
+    assert moved and all(not p.is_cuda for p in model.parameters())
+    assert allocated - torch.cuda.memory_allocated(dev) >= resident  # the GPU copies are freed
+    unpark(moved)
+    assert model.blocks[0][0].weight.is_cuda and not model.blocks[3][0].weight.is_cuda  # streamed blocks stay in RAM
+    assert torch.equal(model(x), before)
+    swapper.remove()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_low_vram_keeps_the_vae_in_ram_until_a_render_decodes(monkeypatch):
+    from dainamo.engine import offload, sandbox
+
+    dev = torch.device("cuda", torch.cuda.device_count() - 1)
+    session = sandbox.Session()
+    session.model = nn.Linear(8, 8).to(dev)  # the diffusion model
+    seen = []
+
+    class Driver:
+        swapper, memory, bundled, profile = None, None, {}, {}
+        vae = None
+
+        def load_vae(self):
+            self.vae = nn.Linear(8, 8).to(dev)
+
+        def to_media(self, lat):
+            seen.append((self.vae.weight.is_cuda, session.model.weight.is_cuda))
+            return [self.vae(lat)]
+
+    session.driver = d = Driver()
+    session.ensure_models(vae=False)
+    assert d.vae is None  # not loaded until a render decodes
+    lat = torch.randn(1, 8, device=dev)
+    media = session.decode(lat, True, 8, 8)
+    assert seen[-1] == (True, True)  # room for both: the diffusion model stays
+    assert torch.allclose(media, nn.functional.linear(lat, d.vae.weight.to(dev), d.vae.bias.to(dev)))
+    assert not d.vae.weight.is_cuda and session.vae_parked  # back in system RAM
+    monkeypatch.setattr(offload, "ROOM_MARGIN", 2**50)  # no room for both
+    session.decode(lat, True, 8, 8)
+    assert seen[-1] == (True, False) and session.model.weight.is_cuda and not d.vae.weight.is_cuda
+    session.decode(lat, True, 8, 8, keep_vae=True)  # input images: the next render samples with the VAE
+    assert seen[-1] == (True, False) and session.model.weight.is_cuda and d.vae.weight.is_cuda
+    assert session.vae_parked is None
+    session.ensure_models(vae=True)  # without low VRAM (or with input images) it's on the GPU throughout
+    assert d.vae.weight.is_cuda and session.vae_parked is None
+    session.decode(lat, False, 8, 8)
+    assert seen[-1] == (True, True) and d.vae.weight.is_cuda
+    session.ensure_models(vae=False)
+    assert not d.vae.weight.is_cuda and session.vae_parked
+
+
+def test_an_enhanced_run_keeps_what_was_typed(profiles, monkeypatch):
+    monkeypatch.setattr(sbx, "gpu_count", lambda: 2)
+    _, p, _ = check(profile_id=profiles["krea"], workflow="t2i", prompt="a long enhanced prompt", source_prompt="a cat")
+    assert p["prompt"] == "a long enhanced prompt" and p["source_prompt"] == "a cat"
+    _, p, _ = check(profile_id=profiles["krea"], workflow="t2i", source_prompt="a cat")
+    assert "source_prompt" not in p  # not enhanced: the prompt is what was typed
+
+
+def test_progress_carries_the_step_counter_and_brings_times_up_to_now(monkeypatch):
+    from dainamo.server import sandbox as sbx
+
+    m = sbx.SandboxManager()
+    clock = [1000.0]
+    monkeypatch.setattr(sbx.time, "time", lambda: clock[0])
+    m._on_event({"event": "progress", "id": "r", "done": 25, "total": 40, "message": "Sampling · seed 43",
+                 "image": 2, "images": 2, "step": 5, "steps": 20, "sec_per_step": 2.0, "eta": 31.0, "started": 960.0})
+    clock[0] = 1004.0  # polled 4 s after the event
+    p = m.snapshot()["progress"]
+    assert p == {"done": 25, "total": 40, "image": 2, "images": 2, "step": 5, "steps": 20, "sec_per_step": 2.0,
+                 "elapsed": 44.0, "eta": 27.0}
+    assert m.message == "Sampling · seed 43"
+    clock[0] = 1100.0  # running late: the time left doesn't go below zero
+    assert m.snapshot()["progress"]["eta"] == 0.0
+    m._on_event({"event": "progress", "id": "r", "done": 0, "total": 40, "eta": None, "started": 1100.0,
+                 "step": 0, "steps": 20})
+    assert m.snapshot()["progress"]["eta"] is None  # nothing timed yet
+
+
+def test_checkpoint_grids_are_checked_and_labelled(profiles, monkeypatch, tmp_path):
+    import json
+
+    monkeypatch.setattr(sbx, "gpu_count", lambda: 2)
+    jid = db.new_id()
+    db.execute("INSERT INTO jobs (id, name, status, family, gpu, position, created, config) VALUES (?,?,?,?,?,?,?,?)",
+               (jid, "fox", "completed", "krea2", "99", 0.0, db.now(), "{}"))
+    out = os.path.join(qmod.job_dir(jid), "output")
+    os.makedirs(out)
+    files = ["fox_000250.safetensors", "fox_000500.safetensors", "fox.safetensors"]
+    for f in files:
+        open(os.path.join(out, f), "wb").close()
+    with open(os.path.join(qmod.job_dir(jid), "status.json"), "w") as fh:
+        json.dump({"checkpoints": [{"step": 250, "file": files[0], "final": False},
+                                   {"step": 500, "file": files[1], "final": False},
+                                   {"step": 750, "file": files[2], "final": True}]}, fh)
+    paths = [os.path.join(out, f) for f in files]
+    other = tmp_path / "style.safetensors"
+    other.write_bytes(b"")
+
+    def grid(**g):
+        return check(profile_id=profiles["krea"], workflow="t2i", loras=[{"path": str(other), "strength": 0.5}],
+                     compare_base=True, grid={"job_id": jid, "checkpoints": paths, "strengths": "0.8, 1", **g})
+
+    _, p, _ = grid(base=True)
+    assert p["grid"] == {"job_id": jid, "job_name": "fox", "base": True, "strengths": [0.8, 1.0],
+                         "checkpoints": [{"path": paths[0], "label": "step 250", "step": 250},
+                                         {"path": paths[1], "label": "step 500", "step": 500},
+                                         {"path": paths[2], "label": "final", "step": 750}]}
+    assert not p["compare_base"] and p["loras"] == [{"path": str(other), "strength": 0.5}]  # the grid has its own base
+    for bad, words in (({"checkpoints": []}, "1–12"), ({"checkpoints": [paths[0], "/nope.safetensors"]}, "not found"),
+                       ({"strengths": "a, b"}, "numbers"), ({"strengths": "1 2 3 4 5 6 7"}, "1–6"),
+                       ({"checkpoints": paths * 4, "strengths": "0.5 0.6 0.7 0.8 0.9 1.0"}, "keep a grid")):
+        with pytest.raises(HTTPException) as e:
+            grid(**bad)
+        assert words in e.value.detail
+    _, p, _ = check(profile_id=profiles["krea"], workflow="t2i", grid=None)
+    assert p["grid"] is None
+    db.execute("DELETE FROM jobs WHERE id=?", (jid,))

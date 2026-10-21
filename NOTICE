@@ -1,0 +1,28 @@
+Dainamo Trainer
+
+MiniMax H3 is licensed under the MiniMax H3 Community License Agreement, Copyright © 2026 MiniMax. All Rights Reserved.
+
+The MiniMax H3 support in dainamo/engine/families/minimax_h3/ implements the MiniMax H3 architecture
+(ported from ai-toolkit, MIT) and is modified from that source; each modified file says so in its
+header. A copy of the MiniMax H3 Community License Agreement is in
+dainamo/engine/families/minimax_h3/MINIMAX_H3_LICENSE.txt. Model weights are not included.
+
+Qwen is licensed under the Qwen RESEARCH LICENSE AGREEMENT, Copyright (c) 2026 Hangzhou Tongyi Laboratory Technology Co., Ltd. All Rights Reserved.
+
+The Qwen-Image 2.1 support in dainamo/engine/families/qwen_image_2/ ports the release's diffusers code
+(Apache License 2.0) via ai-toolkit (MIT); the modified files say so in their headers. A copy of the
+Qwen Research License Agreement is in dainamo/engine/families/qwen_image_2/QWEN_RESEARCH_LICENSE.txt.
+Model weights are not included.
+
+LTX-2.x is licensed under the LTX-2.x Community License Agreement; the Licensor is Lightricks Ltd.
+
+The LTX 2.5 support in dainamo/engine/families/ltx2/ uses diffusers' LTX-2 classes (Apache License 2.0,
+by the Lightricks team and Hugging Face) as a library, without vendoring them, and maps the original
+checkpoint layout onto them as diffusers' converter does. A copy of the LTX-2.x Community License Agreement
+is in dainamo/engine/families/ltx2/LTX_2_COMMUNITY_LICENSE.txt. Model weights are not included.
+
+The YuE2 support in dainamo/engine/families/yue2/ ports M-A-P's yue2 inference code (Apache License 2.0,
+https://github.com/multimodal-art-projection/YuE) and is modified from that source; model.py says so in its
+header. The YuE2 weights are licensed under CC BY-NC 4.0 and are not included.
+
+See THIRD_PARTY_NOTICES.md for the other components and their licenses.

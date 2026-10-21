@@ -1,0 +1,9 @@
+.venv/
+/data/
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
