@@ -49,6 +49,12 @@ The key is kept in `data/auth.json`. The connection is plain HTTP, so on
 networks you don't trust, put it behind HTTPS (a reverse proxy, or a tunnel such
 as Tailscale).
 
+Anyone who can use Dainamo from another device can also use
+[Add from URL](#add-from-url-experimental) to make this machine download from
+any web address, including addresses on your local network. The server warns
+about this when it starts on the network, and the Add from URL window repeats
+the warning.
+
 ## Tabs
 
 | Create Job | Queue |
@@ -176,6 +182,9 @@ as Tailscale).
   **Split into clips** makes a copy of a dataset with its videos cut into clips
   a video model trains on whole, each video counting once per epoch (see
   [Split into clips](#split-into-clips-video-models)).
+  **Add from URL** (experimental) downloads a video, or only its sound, from a
+  web page into the dataset with yt-dlp (see
+  [Add from URL](#add-from-url-experimental)).
   **Health check** looks for problems for a chosen model and resolution:
   - files that can't be read;
   - images and clips with fewer pixels than the resolution, which train
@@ -618,6 +627,47 @@ that a job trains on whole. The original dataset is left as it is.
 The split runs in the background, with its progress on the source dataset's
 page. Cancelling it removes the partial copy.
 
+## Add from URL (experimental)
+
+**Add from URL**, on a dataset's page, downloads a video, or only its sound,
+from a web page into the dataset, using [yt-dlp](https://github.com/yt-dlp/yt-dlp),
+which supports YouTube and many other sites. It's a quick way to gather source
+footage for a video model (then **Split into clips** and **Auto-Caption**) or
+songs for YuE2.
+
+> **Experimental.** Websites change often, and a change can break yt-dlp until
+> it's updated. If downloads from a site start failing, click **Update yt-dlp**
+> in the window first.
+>
+> **Download only what you have the right to use.** Copyright and each site's
+> terms are your responsibility.
+
+- **Video** comes as an mp4 no taller than **Largest size** (1080p by default;
+  training scales every file down to its resolution anyway), as H.264 with AAC
+  sound where the site offers it. **Sound only** keeps the audio as the site
+  has it, often Opus or AAC.
+- **From** and **To** (`1:30` or `90`) download just that part, cut where you
+  asked rather than at the nearest keyframe, so a long video doesn't have to
+  come down whole.
+- **Playlists.** By default a link downloads one item, even a playlist's link.
+  Tick **It's a playlist** to download its first N items (up to 200); an item
+  that fails is listed and the others still download.
+- **Files** are named after the title and the site's id, such as
+  `Big Buck Bunny [aqz-KE-bpKQ].mp4`, with a number added if a file in the
+  dataset already has that name (files that share a name share a caption).
+  They're downloaded into `data/downloads/` first and moved in when finished,
+  so the dataset never has half-downloaded files. Captions are left to you or
+  Auto-Caption.
+- **yt-dlp** is installed in Dainamo's environment from `requirements.txt`,
+  with its recommended extras (YouTube's challenge solver among them).
+  **Update yt-dlp** updates it, and only it, with uv or pip. YouTube also needs
+  a JavaScript runtime: yt-dlp finds [Deno](https://deno.com) itself, and
+  Dainamo also passes it Node.js or Bun when they're installed. Without one,
+  some formats may be missing.
+
+The download runs in the background, with its progress on the dataset's page.
+Cancelling it keeps the files already added.
+
 ## Layer offloading and VRAM projection
 
 The **Layer offloading** slider (0–100%) keeps that share of the diffusion
@@ -794,6 +844,7 @@ dainamo/
                           stop, handing over its GPU
     dataset_check.py      the dataset health check
     clip_split.py         Split into clips: shot detection, clip planning and cutting, the clip-length fit
+    media_download.py     Add from URL: yt-dlp downloads into a dataset, and updating yt-dlp
   webui.py                whether web/dist is up to date with its source (for the launchers)
 scripts/measure_memory.py measures a family's activation memory for the projection
 web/                      React + Vite UI (built into web/dist)
@@ -1031,6 +1082,14 @@ from `nvidia-smi` and read once a second however many pages ask, none without
 it, CPU names without trademarks or speeds, the CPU package's temperature from
 Intel's and AMD's Linux sensor drivers (not the motherboard's), and Windows,
 where the CPU is named from the registry and has no temperature.
+
+`tests/test_media_download.py` checks Add from URL with a stand-in yt-dlp, so
+nothing goes to the network: the command for each choice (size, H.264, a
+part cut exactly, sound only, playlists, a URL that can't be read as an
+option), files moved into the dataset under names no other file has and
+without half-downloaded leftovers, a playlist keeping the items that worked,
+cancelling, the API's checks, updating only yt-dlp, and the warning when the
+server listens on the network.
 
 `tests/test_db.py` checks the schema migrations: a fresh database, one from
 before versioning, new steps running once after a backup, a failed step

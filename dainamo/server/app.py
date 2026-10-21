@@ -5,6 +5,7 @@ The API routes are in ``routes/``, one module per area of the UI."""
 from __future__ import annotations
 
 import os
+import shutil
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -12,7 +13,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import auth, db
+from . import auth, db, media_download
 from .llama_server import llama
 from .queue import scheduler
 from .routes import datasets, jobs, llm, profiles, sandbox, system
@@ -26,6 +27,7 @@ async def lifespan(_app: FastAPI):
     db.db()
     os.makedirs(datasets.THUMBS, exist_ok=True)
     os.makedirs(datasets.MANAGED_DATASETS, exist_ok=True)
+    shutil.rmtree(media_download.DOWNLOADS, ignore_errors=True)  # what downloads cut short by a restart left
     scheduler.start()
     from .sandbox import sandbox as sandbox_manager
     sandbox_manager.startup()

@@ -38,6 +38,7 @@ def main():
         auth.generated_key(new=True)
         print("Made a new access key; devices signed in with the old one must sign in again.")
     loopback = args.host in ("127.0.0.1", "localhost", "::1")
+    os.environ["DAINAMO_LISTEN"] = args.host  # media_download.on_network
     if "DAINAMO_ALLOWED_HOSTS" not in os.environ:
         os.environ["DAINAMO_ALLOWED_HOSTS"] = "127.0.0.1,localhost" if loopback else "*"
     local = f"http://127.0.0.1:{args.port}" if args.host in ("0.0.0.0", "::") else f"http://{args.host}:{args.port}"
@@ -55,6 +56,9 @@ def main():
     elif not loopback:
         print("Warning: listening on the network without sign-in. Anyone who can reach this port can browse files "
               "and start jobs on this machine.")
+    if not loopback:
+        print("Warning: Add from URL (experimental) works from other machines too: anyone who can use Dainamo can "
+              "make this machine download from any web address, including ones on your local network.", flush=True)
     print(f"Dainamo Trainer → {local}", flush=True)
     if not args.no_browser:
         threading.Timer(1.5, lambda: webbrowser.open(open_url)).start()

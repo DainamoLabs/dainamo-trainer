@@ -137,6 +137,8 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 .pill.failed { color: var(--danger); border-color: rgba(240, 82, 82, 0.35); background: var(--danger-dim); }
 .pill.queued { color: var(--text); }
 .pill.stopping { color: var(--warn); border-color: rgba(245, 184, 61, 0.35); }
+.pill.warn { color: var(--warn); border-color: rgba(245, 184, 61, 0.35); background: rgba(245, 184, 61, 0.08); }
+h3 > .pill { margin-left: 8px; vertical-align: 2px; }
 @keyframes pulse { 50% { opacity: 0.25; } }
 
 .seg { display: inline-flex; background: var(--panel-2); border: 1px solid var(--border); border-radius: 9px; padding: 3px; gap: 2px; }
@@ -148,6 +150,11 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 
 .progress { height: 6px; background: var(--panel-3); border-radius: 6px; overflow: hidden; }
 .progress > div { height: 100%; background: linear-gradient(90deg, #ff6a00, var(--accent)); border-radius: 6px; transition: width 0.6s; }
+.progress.busy > div { width: 30%; transition: none; animation: busy 1.4s ease-in-out infinite; }
+@keyframes busy { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+.dl-notes { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2); font-size: 12.5px; line-height: 1.45; color: var(--muted); }
+.dl-notes p { margin: 0; }
+.dl-notes .warn { color: var(--warn); }
 
 .empty { border: 1px dashed var(--border-strong); border-radius: var(--radius); padding: 40px 20px; text-align: center; color: var(--muted); }
 .empty strong { color: var(--text); display: block; margin-bottom: 4px; font-size: 15px; }

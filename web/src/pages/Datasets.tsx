@@ -2,14 +2,20 @@ import { useEffect, useRef, useState } from "react";
 import { go } from "../App";
 import { api, fmtTime, q, type Dataset, type Family, type Gpu, type MediaItem, type Profile, type Settings, type WhisperModel } from "../api";
 import { CheckIssues, useDatasetCheck } from "../components/DatasetCheck";
-import { IconEdit, IconImages, IconPlus, IconScissors, IconSparkle, IconTrash, IconUpload, IconX } from "../components/icons";
-import { ConfirmDialog, Lightbox, Modal, PathInput, usePoll, useToast } from "../components/ui";
+import { IconDownload, IconEdit, IconImages, IconPlus, IconScissors, IconSparkle, IconTrash, IconUpload, IconX } from "../components/icons";
+import { ConfirmDialog, Info, Lightbox, Modal, PathInput, usePoll, useToast } from "../components/ui";
 
 type SplitStatus = {
   running: boolean; total: number; done: number; clips: number; current?: string; message?: string; errors: string[];
   cancelled?: boolean; target: { id: string; name: string } | null;
 };
 type ClipFit = { frames: number | null; fps: number; lengths: { frames: number; seconds: number; peak_gb: number }[]; error?: string };
+
+type DownloadStatus = {
+  running: boolean; phase?: "starting" | "downloading" | "processing" | ""; title?: string; step?: string; item?: number; items?: number;
+  done_bytes?: number; total_bytes?: number; saved: string[]; count: number; errors: string[]; cancelled: boolean;
+};
+type YtdlpInfo = { installed: boolean; version: string | null; bundled: boolean; network: boolean };
 
 type CapStatus = {
   running: boolean; total: number; done: number; errors: string[]; current?: string;
@@ -168,6 +174,14 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
     if (split?.running) wasSplitting.current = true;
     else if (wasSplitting.current) { wasSplitting.current = false; reloadDs(); }
   }, [split?.running]);
+  const [dlOpen, setDlOpen] = useState(false);
+  const [dl, reloadDl] = usePoll<DownloadStatus>(`/api/datasets/${id}/download`, 1500);
+  const wasDownloading = useRef(false);
+  useEffect(() => {
+    if (dl?.running) wasDownloading.current = true;
+    else if (wasDownloading.current) { wasDownloading.current = false; reloadDs(); }
+    if (dl?.count) loadItems(); // a playlist's files show as they arrive
+  }, [dl?.running, dl?.count]);
 
   const loadItems = () => api.get<MediaItem[]>(`/api/datasets/${id}/items`).then(setItems);
   useEffect(() => { loadItems(); }, [id]);
@@ -240,6 +254,8 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
         <div className="row">
           <button className="btn danger" onClick={() => setConfirmRemove(true)}><IconTrash /> Remove</button>
           <button className="btn" onClick={() => fileRef.current?.click()}><IconUpload /> Upload</button>
+          <button className="btn" onClick={() => setDlOpen(true)} disabled={dl?.running}
+            title="Download a video, or only its sound, from a web page into this dataset (experimental)"><IconDownload /> Add from URL</button>
           <button className="btn" onClick={() => setEditOpen(true)} disabled={!items?.length} title="Find and replace, add or remove words in every caption"><IconEdit /> Edit captions</button>
           {items?.some((i) => i.kind === "video") && (
             <button className="btn" onClick={() => setSplitOpen(true)} disabled={split?.running}
@@ -298,6 +314,27 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
             {split.errors.length > 0 && <div className="error-box" style={{ marginTop: 8 }}>{split.errors.slice(-5).map((e) => <div key={e}>{e}</div>)}</div>}
           </div>
         )}
+        {dl && (dl.running || dl.count > 0 || dl.errors.length > 0 || dl.cancelled) && (
+          <div style={{ marginTop: 14 }}>
+            <div className="row small" style={{ marginBottom: 6 }}>
+              <IconDownload width={14} style={{ color: "var(--accent)" }} />
+              {dl.running ? (
+                <span>{dl.phase === "processing" ? dl.step : dl.phase === "downloading" ? "Downloading" : "Starting the download"}
+                  {(dl.items || 0) > 1 ? ` ${dl.item} / ${dl.items}` : ""}{" "}
+                  <span className="faint">{dl.title}{dl.phase === "downloading" && dl.done_bytes
+                    ? ` · ${mb(dl.done_bytes)}${dl.total_bytes ? ` / ${mb(dl.total_bytes)}` : ""}` : ""}</span></span>
+              ) : dl.cancelled ? <span>Download cancelled{dl.count ? `; the ${dl.count} file${dl.count === 1 ? "" : "s"} already added stay` : ""}</span>
+                : <span>{dl.count ? `Added ${dl.count} file${dl.count === 1 ? "" : "s"} from the web` : "Nothing was downloaded"}
+                  {dl.count === 1 && <span className="faint"> · {dl.saved[0]}</span>}</span>}
+              <span className="spacer" />
+              {dl.running && <button className="btn sm" onClick={() => api.del(`/api/datasets/${id}/download`).then(reloadDl)}><IconX /> Cancel</button>}
+            </div>
+            {dl.running && (dl.total_bytes
+              ? <div className="progress"><div style={{ width: `${(100 * ((dl.item || 1) - 1 + (dl.done_bytes || 0) / dl.total_bytes)) / Math.max(1, dl.items || 1)}%` }} /></div>
+              : <div className="progress busy"><div /></div>)}
+            {dl.errors.length > 0 && <div className="error-box" style={{ marginTop: 8 }}>{dl.errors.slice(-5).map((e) => <div key={e}>{e}</div>)}</div>}
+          </div>
+        )}
       </div>
 
       <HealthCheck id={id} families={families} onOpen={(path) => {
@@ -348,11 +385,136 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
         onClose={() => { setCapOpen(false); reloadDs(); }} />}
       {editOpen && d && <EditCaptionsModal dataset={d} onClose={() => setEditOpen(false)} onChanged={() => { loadItems(); reloadDs(); }} />}
       {splitOpen && d && <SplitModal dataset={d} families={families} onClose={() => setSplitOpen(false)} onStarted={reloadSplit} />}
+      {dlOpen && d && <DownloadModal dataset={d} onClose={() => setDlOpen(false)} onStarted={reloadDl} />}
     </div>
   );
 }
 
 const fmtClock = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, "0")}`;
+const mb = (bytes: number) => `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+
+const HEIGHTS: [number, string][] = [[360, "360p"], [480, "480p"], [720, "720p"], [1080, "1080p"], [1440, "1440p"], [2160, "2160p (4K)"], [0, "The best there is"]];
+
+/** "1:02:03.5", "1:30" or "75" -> seconds; "" -> null; NaN when it isn't a time. */
+const parseClock = (s: string): number | null => {
+  const t = s.trim();
+  if (!t) return null;
+  if (!/^\d+(:\d{1,2}){0,2}(\.\d+)?$/.test(t)) return NaN;
+  return t.split(":").reduce((a, p) => a * 60 + Number(p), 0);
+};
+
+/** Add from URL (experimental): yt-dlp downloads a video, or only its sound, into the dataset. */
+function DownloadModal({ dataset, onClose, onStarted }: { dataset: Dataset; onClose: () => void; onStarted: () => void }) {
+  const toast = useToast();
+  const [info, setInfo] = useState<YtdlpInfo | null>(null);
+  const [updating, setUpdating] = useState(false);
+  const [url, setUrl] = useState("");
+  const [kind, setKind] = useState<"video" | "audio">("video");
+  const [height, setHeight] = useState(1080);
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [playlist, setPlaylist] = useState(false);
+  const [items, setItems] = useState(10);
+  useEffect(() => { api.get<YtdlpInfo>("/api/ytdlp").then(setInfo, (e) => toast(e.message, true)); }, []);
+  const start = parseClock(from), end = parseClock(to);
+  const partOk = playlist || (!Number.isNaN(start) && !Number.isNaN(end) && (end == null || end > (start ?? 0)));
+  const ok = /^https?:\/\/\S+$/i.test(url.trim()) && partOk && (!playlist || (items >= 1 && items <= 200)) && !!info?.installed && !updating;
+  const update = async () => {
+    setUpdating(true);
+    try {
+      const i = await api.post<YtdlpInfo>("/api/ytdlp/update");
+      setInfo(i);
+      toast(`yt-dlp ${i.version} is installed`);
+    } catch (e: any) {
+      toast(e.message, true);
+    } finally {
+      setUpdating(false);
+    }
+  };
+  const begin = async () => {
+    try {
+      await api.post(`/api/datasets/${dataset.id}/download`, {
+        url: url.trim(), kind, max_height: height, start: playlist ? null : start, end: playlist ? null : end, playlist: playlist ? items : 0,
+      });
+      toast("Download started");
+      onStarted();
+      onClose();
+    } catch (e: any) {
+      toast(e.message, true);
+    }
+  };
+  return (
+    <Modal title={<>Add from URL<span className="pill warn">Experimental</span></>} onClose={onClose} footer={
+      <>
+        <button className="btn ghost" onClick={onClose}>Cancel</button>
+        <button className="btn primary" onClick={begin} disabled={!ok}><IconDownload /> Download</button>
+      </>
+    }>
+      <div className="stack">
+        <label className="field">
+          <span>Web address</span>
+          <input autoFocus value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://…"
+            onKeyDown={(e) => e.key === "Enter" && ok && begin()} />
+        </label>
+        <div className="grid cols-2">
+          <div className="field">
+            <span>Download<Info text="Sound only keeps just the audio, as the site has it (often Opus or AAC), for music datasets." /></span>
+            <div className="seg" style={{ alignSelf: "flex-start" }}>
+              <button type="button" className={kind === "video" ? "on" : ""} onClick={() => setKind("video")}>Video</button>
+              <button type="button" className={kind === "audio" ? "on" : ""} onClick={() => setKind("audio")}>Sound only</button>
+            </div>
+          </div>
+          {kind === "video" && (
+            <label className="field">
+              <span>Largest size<Info text="Training scales every file down to its resolution, so more than 1080p mostly costs disk space and download time. Where there's a choice, the video comes as H.264 in an mp4, which plays everywhere." /></span>
+              <select value={height} onChange={(e) => setHeight(Number(e.target.value))}>
+                {HEIGHTS.map(([h, label]) => <option key={h} value={h}>{label}</option>)}
+              </select>
+            </label>
+          )}
+        </div>
+        {!playlist && (
+          <div>
+            <div className="grid cols-2">
+              <label className="field"><span>From</span><input value={from} onChange={(e) => setFrom(e.target.value)} placeholder="the start" /></label>
+              <label className="field"><span>To</span><input value={to} onChange={(e) => setTo(e.target.value)} placeholder="the end" /></label>
+            </div>
+            <div className={partOk ? "help" : "validation warning"} style={{ marginTop: 6 }}>
+              {partOk ? "Only that part, as m:ss or seconds (1:30 or 90). Leave both empty for all of it."
+                : "Times look like 1:30 or 90, and the end comes after the start."}
+            </div>
+          </div>
+        )}
+        <div>
+          <label className="check">
+            <input type="checkbox" checked={playlist} onChange={(e) => setPlaylist(e.target.checked)} /> It's a playlist: download several items
+          </label>
+          {playlist && (
+            <label className="field" style={{ marginTop: 10, maxWidth: 220 }}>
+              <span>Items, from the start</span>
+              <input type="number" min={1} max={200} value={Number.isFinite(items) ? items : ""} onChange={(e) => setItems(e.target.value === "" ? NaN : Number(e.target.value))} />
+            </label>
+          )}
+        </div>
+        <div className="dl-notes">
+          {info && !info.installed ? (
+            <p className="warn">yt-dlp, which does the downloading, isn't installed.{" "}
+              <button className="btn sm" disabled={updating} onClick={update}>{updating ? "Installing…" : "Install yt-dlp"}</button></p>
+          ) : (
+            <p>Experimental. Downloads use yt-dlp{info?.version ? ` ${info.version}` : ""}{info && !info.bundled ? " (the one on your PATH)" : ""}.
+              Websites change often, and a change can break downloads until yt-dlp is updated.{" "}
+              {info && <button className="btn sm" disabled={updating} onClick={update}>{updating ? "Updating…" : info.bundled ? "Update yt-dlp" : "Install it in Dainamo"}</button>}</p>
+          )}
+          <p>Download only what you have the right to use: copyright and each site's terms are your responsibility.</p>
+          {info?.network && (
+            <p className="warn">This Dainamo is reachable from other machines, so anyone who can use it can make this machine download
+              from any web address, including ones on your local network.</p>
+          )}
+        </div>
+      </div>
+    </Modal>
+  );
+}
 const SPLIT_SIZES = [256, 320, 384, 448, 512, 576, 640, 768, 1024];
 
 /** Split into clips: a copy of the dataset with each video cut into clips of a length that fits the GPU,

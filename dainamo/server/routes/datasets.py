@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import time
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
@@ -19,7 +20,7 @@ from ...engine.dataset import caption_path, list_media, media_kind, read_caption
 from ...engine.families import get_family
 from ...engine.media import spectrogram
 from ...engine.transcribe import MODELS as WHISPER_MODELS
-from .. import captioner, clip_split, dataset_check, db
+from .. import captioner, clip_split, dataset_check, db, media_download
 from ..llama_server import describe, provider
 from ..validation import MAX_FRAMES, check_resolution
 from .common import dataset_or_404, family_or_400, not_found, profile_or_404
@@ -478,6 +479,75 @@ def split_cancel(did: str):
     if j:
         j.cancel()
     return {"ok": True}
+
+
+class DownloadIn(BaseModel):
+    """Add from URL (``media_download.DownloadJob``), experimental."""
+    url: str
+    kind: str = "video"  # "video", or "audio": only the sound
+    max_height: int = 1080  # one of media_download.HEIGHTS; 0: the best there is
+    start: float | None = None  # seconds: only the part from here...
+    end: float | None = None  # ...to here
+    playlist: int = 0  # a playlist's first this many items; 0: just the one the URL names
+
+
+@router.post("/datasets/{did}/download")
+def download_media(did: str, body: DownloadIn):
+    d = dataset_or_404(did)
+    cur = media_download.download_jobs.get(did)
+    if cur and cur.running:
+        raise HTTPException(409, "Already downloading into this dataset")
+    url = body.url.strip()
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise HTTPException(400, "Paste a web address starting with http:// or https://")
+    if body.kind not in ("video", "audio"):
+        raise HTTPException(400, f"Unknown kind {body.kind!r}")
+    if body.max_height not in media_download.HEIGHTS:
+        raise HTTPException(400, f"The largest size must be one of {', '.join(map(str, media_download.HEIGHTS[1:]))} (or 0: any)")
+    if not 0 <= body.playlist <= media_download.MAX_ITEMS:
+        raise HTTPException(400, f"A playlist download takes 1–{media_download.MAX_ITEMS} items")
+    if (body.start is not None and body.start < 0) or (body.end is not None and body.end <= (body.start or 0)):
+        raise HTTPException(400, "The part to download must end after it starts")
+    if body.playlist and (body.start is not None or body.end is not None):
+        raise HTTPException(400, "A part of a video can't be chosen for a whole playlist")
+    if not os.path.isdir(d["path"]):
+        raise HTTPException(400, f"The dataset's folder is missing: {d['path']}")
+    if not media_download.ytdlp():
+        raise HTTPException(400, "yt-dlp isn't installed: install it in the Add from URL window, or run the launcher again")
+    opts = body.model_dump(exclude={"url"})
+    media_download.download_jobs[did] = media_download.DownloadJob(d, url, opts)
+    return media_download.download_jobs[did].to_json()
+
+
+@router.get("/datasets/{did}/download")
+def download_status(did: str):
+    j = media_download.download_jobs.get(did)
+    return j.to_json() if j else {"running": False, "count": 0, "saved": [], "errors": [], "cancelled": False}
+
+
+@router.delete("/datasets/{did}/download")
+def download_cancel(did: str):
+    j = media_download.download_jobs.get(did)
+    if j:
+        j.cancel()
+    return {"ok": True}
+
+
+@router.get("/ytdlp")
+def ytdlp_info():
+    """The yt-dlp Add from URL runs: {installed, version, bundled, network}."""
+    return media_download.tool()
+
+
+@router.post("/ytdlp/update")
+def ytdlp_update():
+    if any(j.running for j in media_download.download_jobs.values()):
+        raise HTTPException(409, "Wait for the download to finish first")
+    try:
+        return media_download.update()
+    except Exception as e:
+        raise HTTPException(500, f"Couldn't update yt-dlp: {e}")
 
 
 class ClipFitIn(BaseModel):

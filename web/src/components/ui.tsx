@@ -4,7 +4,7 @@ import { api, q } from "../api";
 import { IconCheck, IconFile, IconFolder, IconAlert, IconUp, IconX } from "./icons";
 
 // ---- modal ---------------------------------------------------------------
-export function Modal(props: { title: string; onClose: () => void; children: React.ReactNode; footer?: React.ReactNode; wide?: boolean }) {
+export function Modal(props: { title: React.ReactNode; onClose: () => void; children: React.ReactNode; footer?: React.ReactNode; wide?: boolean }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && props.onClose();
     window.addEventListener("keydown", onKey);
