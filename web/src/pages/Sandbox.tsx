@@ -71,8 +71,8 @@ const MP = 1024 * 1024;
 const RATIOS: Record<string, number> = { "1:1": 1, "4:3": 4 / 3, "3:4": 3 / 4, "16:9": 16 / 9, "9:16": 9 / 16, "5:3": 5 / 3, "3:5": 3 / 5 };
 const IMAGE_SHAPES = ["1:1", "4:3", "3:4", "16:9", "9:16"];
 const VIDEO_SHAPES = ["1:1", "5:3", "3:5", "16:9", "9:16"];
-const IMAGE_MP = [0.5, 1, 1.5, 2];
-const VIDEO_MP = [0.25, 0.35, 0.5];
+const ROUND_MP = [0.25, 0.35, 0.5, 1, 1.5, 2]; // what a size is described as, when one of these gives it exactly
+const MAX_SIDE = 4096; // the server's limit
 
 export function sizeFor(ratio: number, mp: number): [number, number] {
   const snap = (v: number) => Math.max(128, Math.round(v / 64) * 64);
@@ -84,9 +84,9 @@ const nearest = <T,>(xs: T[], cost: (x: T) => number) => xs.reduce((a, b) => (co
 /** The size fields for a width × height: the shape and megapixels that give exactly it, else "custom". */
 function sizeState(w: number, h: number, video: boolean): Pick<Form, "size_mode" | "shape" | "mp" | "width" | "height"> {
   const shape = nearest(video ? VIDEO_SHAPES : IMAGE_SHAPES, (s) => Math.abs(Math.log(w / h / RATIOS[s])));
-  const mp = nearest(video ? VIDEO_MP : IMAGE_MP, (m) => Math.abs(Math.log((w * h) / MP / m)));
-  const [sw, sh] = sizeFor(RATIOS[shape], mp);
-  return { size_mode: sw === w && sh === h ? "shape" : "custom", shape, mp, width: w, height: h };
+  const fits = (m: number) => sizeFor(RATIOS[shape], m).join() === `${w},${h}`;
+  const mp = ROUND_MP.find(fits) ?? Math.round((w * h) / MP * 100) / 100;
+  return { size_mode: fits(mp) ? "shape" : "custom", shape, mp, width: w, height: h };
 }
 
 const imageList = (s: string) => s.split(",").map((t) => t.trim()).filter(Boolean);
@@ -120,6 +120,7 @@ const INFO = {
   workflow: "What to make: from a prompt alone, an edit of an input image, a video from a first frame, and so on. Only the ones this profile's model supports can be chosen.",
   enhance: "Before generating, the caption provider set in Settings rewrites your prompt into a more detailed one, with an instruction for this workflow. The rewrite is kept and used again while the prompt, seed and inputs stay the same.",
   loras: "LoRAs applied while generating, each at its own strength: 1 is full strength, 0 is off, and a negative strength pushes the other way (as with a slider). Pick a job's checkpoint (★ is the one the checkpoint picker recommended) or any LoRA file.",
+  megapixels: "How big to make it, at the shape chosen above. A megapixel is 1024×1024 pixels, and each side is rounded to a multiple of 64. Bigger takes more VRAM and time.",
   compareBase: "Also renders each seed without the LoRAs, beside the images with them, to show what the LoRAs change.",
   strengths: "Each checkpoint renders at each of these LoRA strengths, comma-separated: one row of the grid per strength.",
   cfg: "How strongly the image follows the prompt and steers away from the negative prompt. Above 1 runs the model twice a step, so it's about twice as slow; distilled (turbo) models are made for 1.",
@@ -310,7 +311,6 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
 
   // size: a shape (or the input image's) at some megapixels, or typed in
   const shapes = video ? VIDEO_SHAPES : IMAGE_SHAPES;
-  const mps = video ? VIDEO_MP : IMAGE_MP;
   const images = wf?.images ? imageList(form.images) : [];
   const mode: SizeMode = form.size_mode === "match" && !wf?.images ? "shape" : form.size_mode;
   useEffect(() => {
@@ -325,6 +325,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
   const matched = mode === "match" && imgSize && imgSize.path === images[0] ? imgSize : null;
   const ratio = matched ? matched.width / matched.height : RATIOS[form.shape] ?? 1;
   const [width, height] = mode === "custom" ? [form.width, form.height] : sizeFor(ratio, form.mp);
+  const mpOk = mode === "custom" || (form.mp > 0 && Math.max(width, height) <= MAX_SIDE);
 
   const grid = { ...BLANK.grid, ...form.grid };
   const gridStrengths = parseStrengths(grid.strengths);
@@ -428,7 +429,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
   const setGrid = (patch: Partial<GridForm>) => setForm({ grid: { ...grid, ...patch } });
   const pickGridJob = (id: string) => setGrid({ job_id: id, checkpoints: (gridJobs.get(id)?.opts || []).slice(-12).map((o) => o.path) });
   const gridOk = !grid.on || (grid.checkpoints.length > 0 && gridStrengths.length > 0 && gridImages <= 64);
-  const canGo = !!profile && !!wf && form.prompt.trim() !== "" && !blocked && !busy && gridOk;
+  const canGo = !!profile && !!wf && form.prompt.trim() !== "" && !blocked && !busy && gridOk && mpOk;
 
   return (
     <div className="page">
@@ -611,7 +612,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
             <div className="seg sbx-shapes" role="group" aria-label="Shape">
               {shapes.map((label) => (
                 <button key={label} type="button" className={mode === "shape" && form.shape === label ? "on" : ""}
-                  title={sizeFor(RATIOS[label], form.mp).join("×")} onClick={() => setForm({ size_mode: "shape", shape: label })}>{label}</button>
+                  title={form.mp > 0 ? sizeFor(RATIOS[label], form.mp).join("×") : undefined} onClick={() => setForm({ size_mode: "shape", shape: label })}>{label}</button>
               ))}
               {wf?.images && (
                 <button type="button" className={mode === "match" ? "on" : ""} title="The shape of the (first) input image"
@@ -630,28 +631,24 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
                 <button type="button" className="btn icon" title="Swap width and height" aria-label="Swap width and height"
                   onClick={() => setForm({ width: form.height, height: form.width })}>⇄</button>
               </div>
-            ) : (
-              <div className="sbx-mp">
-                <span className="faint small">Megapixels</span>
-                <div className="seg" role="group" aria-label="Megapixels">
-                  {mps.map((m) => (
-                    <button key={m} type="button" className={form.mp === m ? "on" : ""} title={sizeFor(ratio, m).join("×")}
-                      onClick={() => setForm({ mp: m })}>{m}</button>
-                  ))}
-                </div>
-                <span className="sbx-dims">{width} × {height} <span className="faint">· {((width * height) / MP).toFixed(2)} MP</span></span>
-              </div>
+            ) : null}
+            {mode !== "shape" && (
+              <span className="help">
+                {mode === "custom" ? `Sizes are rounded down to multiples of ${defaults?.divisibility || 16}.`
+                  : matched ? `Same shape as ${base(matched.path)} (${matched.width}×${matched.height}).`
+                    : `Choose an input image above to match its shape; until then this is ${form.shape}.`}
+              </span>
             )}
-            <span className="help">
-              {mode === "custom" ? `Sizes are rounded down to multiples of ${defaults?.divisibility || 16}.`
-                : mode === "match" ? (matched ? `Same shape as ${base(matched.path)} (${matched.width}×${matched.height}).`
-                  : `Choose an input image above to match its shape; until then this is ${form.shape}.`)
-                : "A megapixel is 1024×1024 pixels; sizes snap to multiples of 64."}
-            </span>
           </div>}
-          {video && (
+          {!music && (mode !== "custom" || video) && (
             <div className="grid cols-2">
-              <Num label="Frames" v={form.frames} on={(n) => setForm({ frames: n })} min={1} max={241} help="24 fps" />
+              {mode !== "custom" && (
+                <Num label="Megapixels" info={INFO.megapixels} v={form.mp} on={(n) => setForm({ mp: n })} step={0.05} min={0.05}
+                  help={!(form.mp > 0) ? "Above 0, such as 1 or 0.75"
+                    : Math.max(width, height) > MAX_SIDE ? `Too big: a side can be at most ${MAX_SIDE} pixels`
+                      : `${width} × ${height} · ${((width * height) / MP).toFixed(2)} MP`} />
+              )}
+              {video && <Num label="Frames" v={form.frames} on={(n) => setForm({ frames: n })} min={1} max={241} help="24 fps" />}
             </div>
           )}
 
