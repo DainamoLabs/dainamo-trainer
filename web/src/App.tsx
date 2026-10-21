@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { Component, useEffect, useState, type ReactNode } from "react";
 import { api, SIGNED_OUT, type AuthStatus, type Family, type Gpu, type Job, type SystemRam, type Workflow } from "./api";
 import { useJobAlerts } from "./components/alerts";
 import { IconImages, IconLayers, IconPlus, IconQueue, IconSettings, IconSparkle } from "./components/icons";
@@ -29,6 +29,25 @@ function readHash(): { tab: Tab; arg: string } {
 
 export function go(tab: Tab, arg = "") {
   window.location.hash = `/${tab}${arg ? "/" + encodeURIComponent(arg) : ""}`;
+}
+
+/** A page that throws while rendering shows what went wrong instead of a blank screen. */
+class PageError extends Component<{ children: ReactNode }, { error: Error | null }> {
+  state = { error: null as Error | null };
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <div className="page stack">
+        <div className="error-box">This page hit an error: {this.state.error.message}</div>
+        <p className="help">If Dainamo was just updated, restart its server (stop it and run the launcher again): a server started
+          before the update doesn't have what the new pages ask for.</p>
+        <div><button className="btn" onClick={() => window.location.reload()}>Reload</button></div>
+      </div>
+    );
+  }
 }
 
 export default function App() {
@@ -89,12 +108,14 @@ export default function App() {
         </div>
       </aside>
       <main className="main">
-        {route.tab === "create" && <CreateJob families={families} />}
-        {route.tab === "queue" && <Queue jobId={route.arg} />}
-        {route.tab === "sandbox" && <Sandbox families={families} workflows={system?.workflows || []} gpus={system?.gpus || []} ram={system?.ram} />}
-        {route.tab === "datasets" && <Datasets datasetId={route.arg} families={families} />}
-        {route.tab === "profiles" && <Profiles families={families} />}
-        {route.tab === "settings" && <SettingsPage gpus={system?.gpus || []} auth={auth} onSignOut={() => setAuth({ required: true, signed_in: false })} />}
+        <PageError key={route.tab}>
+          {route.tab === "create" && <CreateJob families={families} />}
+          {route.tab === "queue" && <Queue jobId={route.arg} />}
+          {route.tab === "sandbox" && <Sandbox families={families} workflows={system?.workflows || []} gpus={system?.gpus || []} ram={system?.ram} />}
+          {route.tab === "datasets" && <Datasets datasetId={route.arg} families={families} />}
+          {route.tab === "profiles" && <Profiles families={families} />}
+          {route.tab === "settings" && <SettingsPage gpus={system?.gpus || []} auth={auth} onSignOut={() => setAuth({ required: true, signed_in: false })} />}
+        </PageError>
       </main>
     </div>
   );

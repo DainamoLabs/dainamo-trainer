@@ -84,7 +84,7 @@ function ProfileEditor(props: { families: Family[]; initial: Partial<Profile> | 
         <div className="grid cols-2">
           <label className="field">
             <span>Profile name</span>
-            <input autoFocus value={name} placeholder="Krea 2 Turbo" onChange={(e) => setName(e.target.value)} />
+            <input autoFocus value={name} placeholder="My model" onChange={(e) => setName(e.target.value)} />
           </label>
           <label className="field">
             <span>Model family</span>
@@ -146,7 +146,7 @@ export default function Profiles({ families }: { families: Family[] }) {
       {profiles && profiles.length === 0 && (
         <div className="empty">
           <strong>No profiles yet</strong>
-          Create one to point Dainamo at your model files, e.g. a "Krea 2" profile using your ComfyUI models folder.
+          Create one to point Dainamo at your model files, e.g. the ones in your ComfyUI models folder.
           <div style={{ marginTop: 14 }}><button className="btn primary" onClick={() => setEditing(null)}><IconPlus /> New profile</button></div>
         </div>
       )}

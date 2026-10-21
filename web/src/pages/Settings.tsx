@@ -5,7 +5,7 @@ import { PathInput, usePoll, useToast } from "../components/ui";
 
 const MODES: { id: Settings["queue"]["mode"]; label: string; desc: string }[] = [
   { id: "sequential", label: "Sequential", desc: "One job at a time, in queue order, on the first selected GPU." },
-  { id: "parallel_single", label: "Parallel · single GPU", desc: "Several jobs share one GPU. Only for small jobs — two Krea 2 jobs won't fit in 24 GB." },
+  { id: "parallel_single", label: "Parallel · single GPU", desc: "Several jobs share one GPU. Only for jobs small enough to fit in its memory together." },
   { id: "parallel_multi", label: "Parallel · multi-GPU", desc: "Jobs spread across all selected GPUs, up to N per GPU." },
 ];
 
@@ -115,7 +115,7 @@ function CaptionStyles({ value, onChange }: { value: Settings["caption_styles"];
         </div>
         <label className="field"><span>Prompt</span><textarea rows={4} value={cur.prompt} onChange={(e) => edit({ prompt: e.target.value })} /></label>
       </div>
-      <span className="help">You pick a style when you start Auto-Caption, and each dataset remembers the one it used, so a Krea 2 dataset and a MiniMax H3 dataset can each keep their own. The captioner sees images, or a few frames of a clip; it can't hear sound.</span>
+      <span className="help">You pick a style when you start Auto-Caption, and each dataset remembers the one it used, so datasets for different models can each keep their own. The captioner sees images, or a few frames of a clip; it can't hear sound.</span>
     </div>
   );
 }
@@ -128,7 +128,9 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
   const [delivery, setDelivery] = useState<Delivery>({});
   const [browser, setBrowser] = useState(browserAlertsOn());
   const [whisper, setWhisper] = useState<WhisperModel[]>([]);
-  const provider = s?.captioner.provider || "server";
+  // a Dainamo server started before this page was built has no caption provider settings: it needs a restart
+  const stale = !!s && (!s.llama || !s.text_encoder);
+  const provider = (!stale && s?.captioner.provider) || "server";
   const [llm, reloadLlm] = usePoll<LlmStatus>(provider !== "server" ? "/api/llm" : null, 2000);
   const encPath = provider === "encoder" ? s?.text_encoder.path.trim() : "";
   const [encoder] = usePoll<EncoderInfo>(encPath ? `/api/llm/encoder?path=${encodeURIComponent(encPath)}` : null, 0);
@@ -317,10 +319,14 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
         <h2>Caption provider</h2>
         <p className="help" style={{ marginTop: -6, marginBottom: 12 }}>Writes captions for datasets (Auto-Caption) and enhances prompts in the Sandbox.</p>
         <div className="stack">
+          {stale && (
+            <div className="validation warning">The Dainamo server is older than this page, so it can't run llama.cpp or a text encoder yet.
+              Restart it (stop it and run the launcher again), then reload this page.</div>
+          )}
           <div className="grid cols-3">
             {PROVIDERS.map((m) => (
-              <label key={m.id} className={"ds-pick" + (provider === m.id ? " on" : "")} style={{ gridTemplateColumns: "auto 1fr", alignItems: "start" }}>
-                <input type="radio" name="caption-provider" checked={provider === m.id} onChange={() => setC({ provider: m.id })} style={{ accentColor: "var(--accent)" }} />
+              <label key={m.id} className={"ds-pick" + (provider === m.id ? " on" : "")} style={{ gridTemplateColumns: "auto 1fr", alignItems: "start", opacity: stale && m.id !== "server" ? 0.5 : 1 }}>
+                <input type="radio" name="caption-provider" checked={provider === m.id} disabled={stale && m.id !== "server"} onChange={() => setC({ provider: m.id })} style={{ accentColor: "var(--accent)" }} />
                 <div><div style={{ fontWeight: 600 }}>{m.label}</div><div className="muted small">{m.desc}</div></div>
               </label>
             ))}
@@ -329,11 +335,11 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
             <>
               <div className="grid cols-2">
                 <div className="field"><span>Model (.gguf)</span>
-                  <PathInput value={s.llama.model} exts=".gguf" placeholder="Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf" onChange={(v) => setL({ model: v })} />
-                  <span className="help">A vision model (Qwen2.5-VL, Qwen3-VL, Gemma 3…), so it can see images and frames.</span>
+                  <PathInput value={s.llama.model} exts=".gguf" placeholder="vision-model.gguf" onChange={(v) => setL({ model: v })} />
+                  <span className="help">A vision model (e.g. Qwen2.5-VL or Gemma 3), so it can see images and frames.</span>
                 </div>
                 <div className="field"><span>Vision projector (mmproj)</span>
-                  <PathInput value={s.llama.mmproj} exts=".gguf,.mmproj" placeholder="mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf" onChange={(v) => setL({ mmproj: v })} />
+                  <PathInput value={s.llama.mmproj} exts=".gguf,.mmproj" placeholder="mmproj.gguf" onChange={(v) => setL({ mmproj: v })} />
                   <span className="help">The mmproj file made for that model, usually next to it. Without one the model can't see.</span>
                 </div>
                 <div className="field"><span>llama-server program <span className="faint">· blank: the one on the PATH</span></span>
@@ -374,11 +380,11 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
           {provider === "encoder" && (
             <>
               <div className="field"><span>Text encoder (.safetensors)</span>
-                <PathInput value={s.text_encoder.path} exts=".safetensors" placeholder="qwen3vl_8b_int8_convrot.safetensors" onChange={(v) => setT({ path: v })}
+                <PathInput value={s.text_encoder.path} exts=".safetensors" placeholder="text_encoder.safetensors" onChange={(v) => setT({ path: v })}
                   validation={s.text_encoder.path && encoder ? (encoder.ok
                     ? { level: "ok", message: `${encoder.name}, ${encoder.whose}'s text encoder${encoder.vision ? "" : ". This file has no vision part, so it can't see images"}` }
                     : { level: "error", message: encoder.error || "" }) : undefined} />
-                <span className="help">The text encoder file one of your profiles uses. Qwen-Image 2.1's (Qwen3-VL-8B) and MOSS Image's (Qwen3.5-9B) write the best captions; Krea 2's (Qwen3-VL-4B) needs the least memory. MiniMax H3's and LTX 2.5's can't write text.</span>
+                <span className="help">The text encoder file one of your profiles uses. Choosing one shows which model it is, or why it can't write text.</span>
               </div>
               {encoders && encoders.length > 0 && (
                 <div className="field"><span>In your profiles</span>
@@ -403,7 +409,7 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
                     <option value="auto">A free GPU</option>
                     {gpus.map((g) => <option key={g.index} value={String(g.index)}>GPU {g.index} · {g.name.replace("NVIDIA GeForce ", "")}</option>)}
                   </select>
-                  <span className="help">One no training job or Sandbox is on, with room for it: about 9 GB for Krea 2's, 17 GB for Qwen-Image 2.1's or MOSS Image's. Training and the Sandbox come first: they make it stop when they need its GPU.</span>
+                  <span className="help">One no training job or Sandbox is on. Training and the Sandbox come first: they make it stop when they need its GPU.</span>
                 </label>
                 <div className="stack" style={{ gap: 12 }}>
                   <label className="field"><span>Stop after (min idle)</span>
