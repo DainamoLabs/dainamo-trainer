@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api, fmtTime, type AuthStatus, type CaptionProvider, type CaptionStyle, type EncoderInfo, type Gpu, type LlmStatus, type NotifyKind, type Settings, type WhisperModel } from "../api";
 import { browserAlertsBlocked, browserAlertsOn, setBrowserAlerts } from "../components/alerts";
-import { PathInput, usePoll, useToast } from "../components/ui";
+import { Info, PathInput, usePoll, useToast } from "../components/ui";
 
 const MODES: { id: Settings["queue"]["mode"]; label: string; desc: string }[] = [
   { id: "sequential", label: "Sequential", desc: "One job at a time, in queue order, on the first selected GPU." },
@@ -28,6 +28,17 @@ const PROVIDERS: { id: CaptionProvider; label: string; desc: string }[] = [
   { id: "encoder", label: "Text encoder", desc: "A model's own text encoder writes the text: Qwen-Image 2.1's, Krea 2's or MOSS Image's. Nothing else to download; it needs a free GPU." },
   { id: "server", label: "Your own server", desc: "Any OpenAI-compatible endpoint you run: llama-server, Ollama, LM Studio, vLLM…" },
 ];
+// what the "i" beside a setting says, for the ones whose name doesn't
+const INFO = {
+  maxPerGpu: "How many jobs may train on one GPU at the same time, in the parallel modes. Each needs its own VRAM, so raise it only for small jobs.",
+  ctxSize: "How many tokens llama-server keeps room for: the prompt, the images and the reply together. More uses more memory.",
+  maxTokens: "The longest caption, in tokens (a token is about three quarters of a word). A reply cut off at this is asked for again with four times the room.",
+  temperature: "How varied the wording is. Low keeps captions steady and literal; higher adds variety but more mistakes. About 0.2 suits captions.",
+  framesPerClip: "How many frames of each clip the model sees, spread across it. More shows more of what happens, but each caption takes longer.",
+  whisper: "The speech-to-text model for clips with sound. Bigger ones are more accurate but slower; large-v3-turbo is nearly as accurate as the largest and much faster.",
+  enhancerTokens: "The longest rewritten prompt, in tokens. A reasoning model's thinking counts too, so it needs more.",
+  enhancerTemperature: "How inventive the rewrite is: higher adds more varied detail, lower stays closer to your prompt.",
+};
 const SERVER_STATE: Record<LlmStatus["state"], [string, string]> = {
   off: ["", "Off"], starting: ["running", "Loading"], ready: ["completed", "Ready"], stopping: ["stopping", "Stopping"], failed: ["failed", "Failed"],
 };
@@ -219,7 +230,7 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
               {s.queue.mode !== "parallel_multi" && <span className="help">Uses the first selected GPU. Jobs pinned to a GPU run on that GPU.</span>}
             </div>
             <label className="field">
-              <span>Max jobs per GPU</span>
+              <span>Max jobs per GPU<Info text={INFO.maxPerGpu} /></span>
               <input type="number" min={1} max={8} value={s.queue.max_per_gpu} disabled={s.queue.mode === "sequential"} onChange={(e) => setQ({ max_per_gpu: Math.max(1, Number(e.target.value)) })} />
             </label>
           </div>
@@ -357,7 +368,7 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
                   <span className="help">A free GPU is one no training job or Sandbox is on. Training and the Sandbox come first: they make it stop when they need its GPU, and it runs on the CPU while its GPU is theirs.</span>
                 </label>
                 <div className="grid cols-2">
-                  <label className="field"><span>Context size</span>
+                  <label className="field"><span>Context size<Info text={INFO.ctxSize} /></span>
                     <input type="number" min={0} step={1024} value={s.llama.ctx_size} onChange={(e) => setL({ ctx_size: Math.max(0, Number(e.target.value)) })} />
                     <span className="help">0 sizes it for the requests{llm ? ` (${llm.auto_ctx} tokens)` : ""}.</span>
                   </label>
@@ -367,8 +378,8 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
                   </label>
                 </div>
                 <div className="grid cols-2">
-                  <label className="field"><span>Max tokens</span><input type="number" value={s.captioner.max_tokens} onChange={(e) => setC({ max_tokens: Number(e.target.value) })} /></label>
-                  <label className="field"><span>Temperature</span><input type="number" step={0.1} value={s.captioner.temperature} onChange={(e) => setC({ temperature: Number(e.target.value) })} /></label>
+                  <label className="field"><span>Max tokens<Info text={INFO.maxTokens} /></span><input type="number" value={s.captioner.max_tokens} onChange={(e) => setC({ max_tokens: Number(e.target.value) })} /></label>
+                  <label className="field"><span>Temperature<Info text={INFO.temperature} /></span><input type="number" step={0.1} value={s.captioner.temperature} onChange={(e) => setC({ temperature: Number(e.target.value) })} /></label>
                 </div>
               </div>
               <label className="field"><span>Extra arguments <span className="faint">· optional</span></span>
@@ -417,8 +428,8 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
                     <span className="help">0 keeps it loaded until you stop it.</span>
                   </label>
                   <div className="grid cols-2">
-                    <label className="field"><span>Max tokens</span><input type="number" value={s.captioner.max_tokens} onChange={(e) => setC({ max_tokens: Number(e.target.value) })} /></label>
-                    <label className="field"><span>Temperature</span><input type="number" step={0.1} value={s.captioner.temperature} onChange={(e) => setC({ temperature: Number(e.target.value) })} /></label>
+                    <label className="field"><span>Max tokens<Info text={INFO.maxTokens} /></span><input type="number" value={s.captioner.max_tokens} onChange={(e) => setC({ max_tokens: Number(e.target.value) })} /></label>
+                    <label className="field"><span>Temperature<Info text={INFO.temperature} /></span><input type="number" step={0.1} value={s.captioner.temperature} onChange={(e) => setC({ temperature: Number(e.target.value) })} /></label>
                   </div>
                 </div>
               </div>
@@ -432,8 +443,8 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
                 <label className="field"><span>Model name <span className="faint">· optional</span></span><input value={s.captioner.model} onChange={(e) => setC({ model: e.target.value })} /></label>
                 <label className="field"><span>API key <span className="faint">· optional</span></span><input type="password" value={s.captioner.api_key} onChange={(e) => setC({ api_key: e.target.value })} /></label>
                 <div className="grid cols-2">
-                  <label className="field"><span>Max tokens</span><input type="number" value={s.captioner.max_tokens} onChange={(e) => setC({ max_tokens: Number(e.target.value) })} /></label>
-                  <label className="field"><span>Temperature</span><input type="number" step={0.1} value={s.captioner.temperature} onChange={(e) => setC({ temperature: Number(e.target.value) })} /></label>
+                  <label className="field"><span>Max tokens<Info text={INFO.maxTokens} /></span><input type="number" value={s.captioner.max_tokens} onChange={(e) => setC({ max_tokens: Number(e.target.value) })} /></label>
+                  <label className="field"><span>Temperature<Info text={INFO.temperature} /></span><input type="number" step={0.1} value={s.captioner.temperature} onChange={(e) => setC({ temperature: Number(e.target.value) })} /></label>
                 </div>
               </div>
               <div className="row"><button className="btn" onClick={runTest}>Test connection</button>{test && <span className="small muted">{test}</span>}</div>
@@ -443,7 +454,7 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
           <div className="field">
             <span>Video clips</span>
             <div className="grid cols-2">
-              <label className="field"><span>Frames per clip</span>
+              <label className="field"><span>Frames per clip<Info text={INFO.framesPerClip} /></span>
                 <input type="number" min={1} max={12} value={s.captioner.video_frames} onChange={(e) => setC({ video_frames: Number(e.target.value) })} />
               </label>
               <label className="field"><span>Send frames as</span>
@@ -452,7 +463,7 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
                   <option value="sheet">One contact sheet</option>
                 </select>
               </label>
-              <label className="field"><span>Whisper model <span className="faint">· default</span></span>
+              <label className="field"><span>Whisper model <span className="faint">· default</span><Info text={INFO.whisper} /></span>
                 <select value={s.speech.model} onChange={(e) => setS({ ...s, speech: { ...s.speech, model: e.target.value } })}>
                   {(whisper.length ? whisper : [{ id: s.speech.model, size: "" }]).map((m) => (
                     <option key={m.id} value={m.id}>{m.id}{m.size ? ` · ${m.size}` : ""}{m.id === "large-v3-turbo" ? " · recommended" : ""}</option>
@@ -476,8 +487,8 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
           <div className="field">
             <span>Prompt enhancer (Sandbox)</span>
             <div className="grid cols-2">
-              <label className="field"><span>Max tokens</span><input type="number" min={16} value={s.enhancer.max_tokens} onChange={(e) => setE({ max_tokens: Number(e.target.value) })} /></label>
-              <label className="field"><span>Temperature</span><input type="number" step={0.1} min={0} max={2} value={s.enhancer.temperature} onChange={(e) => setE({ temperature: Number(e.target.value) })} /></label>
+              <label className="field"><span>Max tokens<Info text={INFO.enhancerTokens} /></span><input type="number" min={16} value={s.enhancer.max_tokens} onChange={(e) => setE({ max_tokens: Number(e.target.value) })} /></label>
+              <label className="field"><span>Temperature<Info text={INFO.enhancerTemperature} /></span><input type="number" step={0.1} min={0} max={2} value={s.enhancer.temperature} onChange={(e) => setE({ temperature: Number(e.target.value) })} /></label>
             </div>
             <span className="help">The model gets an instruction for the kind of workflow and the user's prompt (plus the input images, if the model can see). The same prompt and seed get the same rewrite where the server supports seeds. A reasoning model may need more tokens.</span>
             <details>

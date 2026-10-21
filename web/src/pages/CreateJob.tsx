@@ -4,7 +4,7 @@ import { api, type Dataset, type Family, type Gpu, type Profile, type SystemRam 
 import { CheckIssues, useDatasetCheck } from "../components/DatasetCheck";
 import { EVAL_DEFAULTS, EvalSettings, evalCost } from "../components/EvalSettings";
 import { IconPlay, IconPlus, IconX } from "../components/icons";
-import { ImagesInput, Num, usePoll, useToast } from "../components/ui";
+import { ImagesInput, Info, Num, usePoll, useToast } from "../components/ui";
 import { OffloadControl, gpuTarget, peakOf, streamedFor, useVramProjection } from "../components/Vram";
 
 type S = Record<string, any>;
@@ -41,6 +41,34 @@ const KINDS: [Kind, string, string][] = [
   ["lokr", "LoKr", "Learns the subject or style of your datasets in a Kronecker-product adapter (LyCORIS): a smaller file, which ComfyUI loads like a LoRA. It learns more slowly, so it starts at twice a LoRA's learning rate."],
   ["slider", "Slider", "A LoRA whose strength moves one attribute either way: plus toward one prompt, minus toward another."],
 ];
+
+// what the "i" beside a setting says, for the ones whose name doesn't
+const INFO = {
+  profile: "The model files to train with (the model, its text encoder and VAE), set up on the Profiles page.",
+  gpu: "Auto starts the job on whichever of the GPUs chosen in Settings is least busy. Picking one makes the job wait for that GPU.",
+  repeats: "How many times each of this dataset's files is used per epoch. Raise it to give a small dataset as much weight as a bigger one.",
+  resolution: "The size files train at: each is scaled to about this many pixels squared, keeping its shape, and never enlarged. Select several to train every file at each size, so the LoRA works across sizes.",
+  captionDropout: "The chance a step trains on a file from this dataset with an empty caption, which keeps the LoRA working without its trigger words. 0 turns it off.",
+  flip: "Also trains on a mirrored copy of each file, doubling the items. Leave it off for text, logos or subjects that aren't symmetrical.",
+  swap: "Also trains on each song with its left and right channels swapped, doubling the items.",
+  learningRate: "How big each update to the LoRA is. Too high and it overcooks (harsh, distorted samples) or falls apart; too low and it barely learns. The model's default is a good start.",
+  optimizer: "How each update is worked out. AdamW 8-bit is the usual choice; AdamW keeps its state in full precision and uses more memory; Adafactor uses less; Prodigy finds its own learning rate, so set Learning rate to 1.",
+  rank: "How many weights the LoRA has in each layer. Higher can learn finer detail, but makes a bigger file, uses a little more VRAM and overfits small datasets sooner. 16–32 suits most characters and styles.",
+  alpha: "Scales the LoRA's effect by alpha ÷ rank: alpha equal to rank is a scale of 1, half of it halves the effective learning rate. If you change rank, change alpha with it to keep the same behaviour.",
+  schedule: "How the learning rate changes over the steps. Constant keeps it the same; Cosine and Linear decay lower it to 0 by the last step, which settles the final checkpoints.",
+  warmup: "Steps at the start over which the learning rate rises from 0 to its full value, so the first updates aren't too big. 0 starts at the full rate.",
+  batch: "Files per step. A larger batch gives steadier updates but uses more VRAM and makes each step slower; an epoch takes fewer steps.",
+  audioWeight: "How much the sound's error counts next to the picture's, for clips with sound. 1 weighs them equally; 0 learns nothing from the sound.",
+  trainAudio: "Trains the audio part on clips that have sound. Off, only the picture is trained.",
+  gradAccum: "Adds up this many batches before each update, for the steadiness of a bigger batch (batch size × this) without its VRAM. Each step takes this many times as long.",
+  timesteps: "Which noise levels training spends its steps on. Each model starts on the option that suits it; Uniform spreads the steps evenly over all noise levels.",
+  dropout: "Randomly zeroes this share of the LoRA's input in each layer during training, which can stop it memorising a small dataset. 0 turns it off; 0.05–0.1 is typical.",
+  maxGradNorm: "Caps the size of each update, so one unusual batch can't knock training off course. 0 turns the cap off; 1 is the usual value.",
+  weightDecay: "Pulls the LoRA's weights slightly toward zero at every update, which can curb overfitting. 0 turns it off.",
+  checkpointing: "Recomputes parts of the model during the backward pass instead of keeping them in VRAM: much less VRAM for somewhat slower steps. Leave it on unless the VRAM projection shows room to spare.",
+  keepAlpha: "Images with an alpha channel train as RGBA, so the LoRA keeps their transparency. Off, they're composited over white.",
+  sampleAtStart: "Renders the sample prompts before the first update, so they show the base model: a baseline to compare the later samples with.",
+};
 
 // A sample prompt card. Blank fields fall back to the Sampling defaults (kept as strings so they can be blank).
 // Music cards have a length (seconds) and lyrics instead of a size.
@@ -99,7 +127,7 @@ function Resolutions(props: { v: unknown; on: (v: number | number[]) => void; vi
   };
   return (
     <div className="field">
-      <span>Resolution{cur.length > 1 ? "s" : ""}</span>
+      <span>Resolution{cur.length > 1 ? "s" : ""}<Info text={INFO.resolution} /></span>
       <div className="seg res-seg" role="group" aria-label="Training resolutions">
         {opts.map((r) => (
           <button key={r} type="button" className={cur.includes(r) ? "on" : ""} aria-pressed={cur.includes(r)} onClick={() => toggle(r)}>{r}</button>
@@ -124,10 +152,10 @@ function CardCheck({ id, resolution, family, frames, seconds }: {
   return <div style={{ opacity: loading ? 0.5 : 1 }}><CheckIssues result={result} compact /></div>;
 }
 
-function Sel(props: { label: string; v: string; on: (s: string) => void; opts: [string, string][]; help?: string }) {
+function Sel(props: { label: string; v: string; on: (s: string) => void; opts: [string, string][]; help?: string; info?: string }) {
   return (
     <label className="field">
-      <span>{props.label}</span>
+      <span>{props.label}{props.info && <Info text={props.info} />}</span>
       <select value={props.v} onChange={(e) => props.on(e.target.value)}>
         {props.opts.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
       </select>
@@ -324,7 +352,7 @@ export default function CreateJob({ families }: { families: Family[] }) {
               <label className="field"><span>Job name</span><input value={name} onChange={(e) => setName(e.target.value)} placeholder="my_character_v1" /></label>
               <label className="field"><span>File name <span className="faint">· optional</span></span><input value={outName} onChange={(e) => setOutName(e.target.value)} placeholder="defaults to job name" /></label>
               <label className="field">
-                <span>Profile</span>
+                <span>Profile<Info text={INFO.profile} /></span>
                 {profiles && profiles.length === 0 ? (
                   <button className="btn" onClick={() => go("profiles")}>Create a profile first →</button>
                 ) : (
@@ -333,7 +361,7 @@ export default function CreateJob({ families }: { families: Family[] }) {
                   </select>
                 )}
               </label>
-              <Sel label="GPU" v={gpu} on={setGpu} opts={[["auto", "Auto (queue decides)"], ...(sys?.gpus || []).map((g) => [String(g.index), `GPU ${g.index} · ${g.name.replace("NVIDIA GeForce ", "")}`] as [string, string])]} />
+              <Sel label="GPU" info={INFO.gpu} v={gpu} on={setGpu} opts={[["auto", "Auto (queue decides)"], ...(sys?.gpus || []).map((g) => [String(g.index), `GPU ${g.index} · ${g.name.replace("NVIDIA GeForce ", "")}`] as [string, string])]} />
               {family && (
                 <div className="field">
                   <span>Train</span>
@@ -442,7 +470,7 @@ export default function CreateJob({ families }: { families: Family[] }) {
                             </select>
                           </label>
                           <label className="field">
-                            <span>Repeats</span>
+                            <span>Repeats<Info text={INFO.repeats} /></span>
                             <input type="number" min={1} value={c.repeats} onChange={(e) => setDsCard(i, { repeats: Math.max(1, Number(e.target.value) || 1) })} />
                           </label>
                         </div>
@@ -474,18 +502,18 @@ export default function CreateJob({ families }: { families: Family[] }) {
                         <div className="ds-card-opts">
                           {!slider && (
                             <label className="field">
-                              <span>Caption dropout</span>
-                              <input type="number" min={0} max={1} step={0.01} value={c.caption_dropout} title="Chance a step trains on this dataset's file with an empty caption"
+                              <span>Caption dropout<Info text={INFO.captionDropout} /></span>
+                              <input type="number" min={0} max={1} step={0.01} value={c.caption_dropout}
                                 onChange={(e) => setDsCard(i, { caption_dropout: Math.min(1, Math.max(0, Number(e.target.value) || 0)) })} />
                             </label>
                           )}
                           {isAudio ? (
-                            <label className="check" title="Also train on each clip with its left and right channels swapped (doubles the items)">
-                              <input type="checkbox" checked={c.flip} onChange={(e) => setDsCard(i, { flip: e.target.checked })} /> Swap stereo channels
+                            <label className="check">
+                              <input type="checkbox" checked={c.flip} onChange={(e) => setDsCard(i, { flip: e.target.checked })} /> Swap stereo channels<Info text={INFO.swap} />
                             </label>
                           ) : (
-                            <label className="check" title="Also train on mirror images (doubles the items); leave off for text, logos or asymmetric subjects">
-                              <input type="checkbox" checked={c.flip} onChange={(e) => setDsCard(i, { flip: e.target.checked })} /> Flip horizontally
+                            <label className="check">
+                              <input type="checkbox" checked={c.flip} onChange={(e) => setDsCard(i, { flip: e.target.checked })} /> Flip horizontally<Info text={INFO.flip} />
                             </label>
                           )}
                         </div>
@@ -525,21 +553,21 @@ export default function CreateJob({ families }: { families: Family[] }) {
             <div className="section-head"><span className="num">{num(3)}</span><h3>Training</h3></div>
             <div className="grid cols-3">
               <Num label="Steps" v={s.steps} on={set("steps")} min={1} />
-              <Num label="Learning rate" v={s.learning_rate} on={set("learning_rate")} step={0.00001} />
-              <Sel label="Optimizer" v={s.optimizer} on={set("optimizer")} opts={[["adamw8bit", "AdamW 8-bit"], ["adamw", "AdamW"], ["adafactor", "Adafactor"], ["prodigy", "Prodigy (set LR to 1)"]]} />
+              <Num label="Learning rate" info={INFO.learningRate} v={s.learning_rate} on={set("learning_rate")} step={0.00001} />
+              <Sel label="Optimizer" info={INFO.optimizer} v={s.optimizer} on={set("optimizer")} opts={[["adamw8bit", "AdamW 8-bit"], ["adamw", "AdamW"], ["adafactor", "Adafactor"], ["prodigy", "Prodigy (set LR to 1)"]]} />
               {lokr ? (
                 <Sel label="LoKr factor" v={String(s.lokr_factor)} on={(v) => set("lokr_factor")(Number(v))}
                   opts={[["4", "4 · most weights"], ["8", "8"], ["16", "16"], ["-1", "Auto · fewest weights"]]}
                   help="How each layer is split: the lower the factor, the more weights the LoKr trains." />
               ) : (
                 <>
-                  <Num label="LoRA rank" v={s.rank} on={set("rank")} min={1} />
-                  <Num label="LoRA alpha" v={s.alpha} on={set("alpha")} min={1} />
+                  <Num label="LoRA rank" info={INFO.rank} v={s.rank} on={set("rank")} min={1} />
+                  <Num label="LoRA alpha" info={INFO.alpha} v={s.alpha} on={set("alpha")} min={1} />
                 </>
               )}
-              <Sel label="LR schedule" v={s.lr_scheduler} on={set("lr_scheduler")} opts={[["constant", "Constant"], ["cosine", "Cosine"], ["linear", "Linear decay"]]} />
-              <Num label="Warmup steps" v={s.warmup_steps} on={set("warmup_steps")} min={0} />
-              <Num label="Batch size" v={s.batch_size} on={set("batch_size")} min={1} />
+              <Sel label="LR schedule" info={INFO.schedule} v={s.lr_scheduler} on={set("lr_scheduler")} opts={[["constant", "Constant"], ["cosine", "Cosine"], ["linear", "Linear decay"]]} />
+              <Num label="Warmup steps" info={INFO.warmup} v={s.warmup_steps} on={set("warmup_steps")} min={0} />
+              <Num label="Batch size" info={INFO.batch} v={s.batch_size} on={set("batch_size")} min={1} />
             </div>
             {isVideo && (
               <div className="grid cols-4" style={{ marginTop: 16 }}>
@@ -549,9 +577,9 @@ export default function CreateJob({ families }: { families: Family[] }) {
                   <Num label="First-frame share" v={s.i2v_probability} on={set("i2v_probability")} step={0.05} min={0}
                     help="Share of steps trained with the clip's first frame as a keyframe (image-to-video)." />
                 )}
-                <Num label="Audio loss weight" v={s.audio_loss_weight} on={set("audio_loss_weight")} step={0.1} min={0} />
+                <Num label="Audio loss weight" info={INFO.audioWeight} v={s.audio_loss_weight} on={set("audio_loss_weight")} step={0.1} min={0} />
                 <label className="check" style={{ alignSelf: "end", paddingBottom: 8 }}>
-                  <input type="checkbox" checked={s.train_audio} onChange={(e) => set("train_audio")(e.target.checked)} /> Train audio (clips with sound)
+                  <input type="checkbox" checked={s.train_audio} onChange={(e) => set("train_audio")(e.target.checked)} /> Train audio (clips with sound)<Info text={INFO.trainAudio} />
                 </label>
               </div>
             )}
@@ -569,16 +597,16 @@ export default function CreateJob({ families }: { families: Family[] }) {
             <details style={{ marginTop: 16 }}>
               <summary className="muted" style={{ cursor: "pointer" }}>Advanced</summary>
               <div className="grid cols-3" style={{ marginTop: 14 }}>
-                <Num label="Gradient accumulation" v={s.grad_accum} on={set("grad_accum")} min={1} />
-                <Sel label="Timestep sampling" v={s.timestep_sampling} on={set("timestep_sampling")} opts={family?.timestep_modes || [["shift", "Resolution shift"]]} />
-                <Num label="LoRA dropout" v={s.dropout} on={set("dropout")} step={0.01} min={0} />
-                <Num label="Max grad norm" v={s.max_grad_norm} on={set("max_grad_norm")} step={0.1} min={0} />
-                <Num label="Weight decay" v={s.weight_decay} on={set("weight_decay")} step={0.001} min={0} />
+                <Num label="Gradient accumulation" info={INFO.gradAccum} v={s.grad_accum} on={set("grad_accum")} min={1} />
+                <Sel label="Timestep sampling" info={INFO.timesteps} v={s.timestep_sampling} on={set("timestep_sampling")} opts={family?.timestep_modes || [["shift", "Resolution shift"]]} />
+                <Num label="LoRA dropout" info={INFO.dropout} v={s.dropout} on={set("dropout")} step={0.01} min={0} />
+                <Num label="Max grad norm" info={INFO.maxGradNorm} v={s.max_grad_norm} on={set("max_grad_norm")} step={0.1} min={0} />
+                <Num label="Weight decay" info={INFO.weightDecay} v={s.weight_decay} on={set("weight_decay")} step={0.001} min={0} />
                 <Num label="Seed" v={s.seed} on={set("seed")} />
-                <label className="check" style={{ alignSelf: "end", paddingBottom: 8 }}><input type="checkbox" checked={s.gradient_checkpointing} onChange={(e) => set("gradient_checkpointing")(e.target.checked)} /> Gradient checkpointing</label>
+                <label className="check" style={{ alignSelf: "end", paddingBottom: 8 }}><input type="checkbox" checked={s.gradient_checkpointing} onChange={(e) => set("gradient_checkpointing")(e.target.checked)} /> Gradient checkpointing<Info text={INFO.checkpointing} /></label>
                 {family?.id === "qwen_image_2" && (
-                  <label className="check" style={{ alignSelf: "end", paddingBottom: 8 }} title="Images with an alpha channel train as RGBA; off composites them over white">
-                    <input type="checkbox" checked={s.keep_alpha} onChange={(e) => set("keep_alpha")(e.target.checked)} /> Keep transparency (RGBA)
+                  <label className="check" style={{ alignSelf: "end", paddingBottom: 8 }}>
+                    <input type="checkbox" checked={s.keep_alpha} onChange={(e) => set("keep_alpha")(e.target.checked)} /> Keep transparency (RGBA)<Info text={INFO.keepAlpha} />
                   </label>
                 )}
               </div>
@@ -607,7 +635,7 @@ export default function CreateJob({ families }: { families: Family[] }) {
               {isVideo && <Num label="Frames" v={s.sample_frames} on={set("sample_frames")} min={1} help="1 renders a still image." />}
             </div>
             <div className="row wrap" style={{ gap: 22, marginTop: 12 }}>
-              <label className="check"><input type="checkbox" checked={s.sample_at_start} onChange={(e) => set("sample_at_start")(e.target.checked)} /> Sample before training (step 0)</label>
+              <label className="check"><input type="checkbox" checked={s.sample_at_start} onChange={(e) => set("sample_at_start")(e.target.checked)} /> Sample before training (step 0)<Info text={INFO.sampleAtStart} /></label>
               <label className="check"><input type="checkbox" checked={s.sample_at_end} onChange={(e) => set("sample_at_end")(e.target.checked)} /> Sample at the end</label>
             </div>
             {profile && (

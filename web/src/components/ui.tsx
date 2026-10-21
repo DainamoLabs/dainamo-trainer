@@ -1,4 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { api, q } from "../api";
 import { IconCheck, IconFile, IconFolder, IconAlert, IconUp, IconX } from "./icons";
 
@@ -190,10 +191,53 @@ export function ImagesInput(props: { value: string; onChange: (v: string) => voi
   );
 }
 
-export function Num(props: { label: string; v: number; on: (n: number) => void; step?: number; min?: number; help?: string }) {
+const TIP_WIDTH = 280;
+
+/** An "i" beside a setting's name that explains it, on hover, keyboard focus or a tap (phones can't hover). The
+ * explanation is placed on the page itself, above the "i" (below it near the top), so no card or scroll area
+ * cuts it off, and it follows the "i" when the page scrolls (focusing an "i" off screen scrolls to it). A click
+ * on it doesn't reach the label it's in. */
+export function Info({ text }: { text: string }) {
+  const ref = useRef<HTMLSpanElement>(null);
+  const [open, setOpen] = useState(false);
+  const [at, setAt] = useState<{ left: number; top: number; width: number; below: boolean } | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    const place = () => {
+      const r = ref.current?.getBoundingClientRect();
+      if (!r) return;
+      const width = Math.min(TIP_WIDTH, window.innerWidth - 16);
+      const left = Math.min(Math.max(8, r.left + r.width / 2 - width / 2), window.innerWidth - width - 8);
+      const below = r.top < 160;
+      setAt({ left, top: below ? r.bottom + 8 : r.top - 8, width, below });
+    };
+    place();
+    window.addEventListener("scroll", place, true);
+    window.addEventListener("resize", place);
+    return () => {
+      window.removeEventListener("scroll", place, true);
+      window.removeEventListener("resize", place);
+    };
+  }, [open]);
+  const show = () => setOpen(true);
+  const hide = () => setOpen(false);
+  return (
+    <span ref={ref} className="info-i" tabIndex={0} role="button" aria-label={text}
+      onMouseEnter={show} onMouseLeave={hide} onFocus={show} onBlur={hide} onKeyDown={(e) => e.key === "Escape" && hide()}
+      onPointerUp={(e) => e.pointerType !== "mouse" && show()} // a tap; tapping elsewhere blurs it
+      onClick={(e) => { e.preventDefault(); e.stopPropagation(); show(); }}>
+      i
+      {open && at && createPortal(
+        <div className={"info-tip" + (at.below ? " below" : "")} role="tooltip" style={{ left: at.left, top: at.top, width: at.width }}>{text}</div>,
+        document.body)}
+    </span>
+  );
+}
+
+export function Num(props: { label: string; v: number; on: (n: number) => void; step?: number; min?: number; help?: string; info?: string }) {
   return (
     <label className="field">
-      <span>{props.label}</span>
+      <span>{props.label}{props.info && <Info text={props.info} />}</span>
       <input type="number" value={props.v} step={props.step ?? 1} min={props.min} onChange={(e) => props.on(e.target.value === "" ? 0 : Number(e.target.value))} />
       {props.help && <span className="help">{props.help}</span>}
     </label>

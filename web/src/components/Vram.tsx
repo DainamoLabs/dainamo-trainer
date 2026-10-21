@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, type Gpu, type SystemRam, type VramProjection } from "../api";
+import { Info } from "./ui";
 
 // Mirrors dainamo/engine/memory.py: blocks streamed at an offload %, and the GB of each phase.
 export const streamedFor = (p: VramProjection, pct: number) =>
@@ -113,7 +114,7 @@ export function OffloadControl(props: {
   return (
     <div className={"vram" + (props.compact ? " compact" : "")}>
       <div className="vram-head">
-        <span className="vram-title">Layer offloading</span>
+        <span className="vram-title">Layer offloading<Info text="Keeps this share of the diffusion model's blocks in system RAM and moves each to the GPU only while it runs: less VRAM, slower steps. Fit to GPU picks the lowest share that fits." /></span>
         <span className="vram-value">
           {value}%{valid && <span className="muted"> · {streamed} of {proj.blocks} blocks in system RAM</span>}
         </span>

@@ -5,7 +5,7 @@ import {
   type Workflow,
 } from "../api";
 import { IconPlay, IconPlus, IconRefresh, IconStop, IconTrash, IconX } from "../components/icons";
-import { AudioCard, ImagesInput, Lightbox, PathInput, StatusPill, usePoll, useToast } from "../components/ui";
+import { AudioCard, ImagesInput, Info, Lightbox, PathInput, StatusPill, usePoll, useToast } from "../components/ui";
 import { OffloadControl, gpuTarget, useVramProjection } from "../components/Vram";
 
 type LoraRow = { path: string; strength: number; custom: boolean };
@@ -114,10 +114,26 @@ function saveForm(f: Form) {
 const fileUrl = (run: SandboxRun, name: string) => `/api/sandbox/file/${run.id}/${encodeURIComponent(name)}`;
 const base = (p: string) => p.split("/").pop() || p;
 
-function Num(props: { label: string; v: number; on: (n: number) => void; step?: number; min?: number; max?: number; disabled?: boolean; help?: string }) {
+// what the "i" beside a setting says, for the ones whose name doesn't
+const INFO = {
+  profile: "The model files to generate with (the model, its text encoder and VAE), set up on the Profiles page.",
+  workflow: "What to make: from a prompt alone, an edit of an input image, a video from a first frame, and so on. Only the ones this profile's model supports can be chosen.",
+  enhance: "Before generating, the caption provider set in Settings rewrites your prompt into a more detailed one, with an instruction for this workflow. The rewrite is kept and used again while the prompt, seed and inputs stay the same.",
+  loras: "LoRAs applied while generating, each at its own strength: 1 is full strength, 0 is off, and a negative strength pushes the other way (as with a slider). Pick a job's checkpoint (★ is the one the checkpoint picker recommended) or any LoRA file.",
+  compareBase: "Also renders each seed without the LoRAs, beside the images with them, to show what the LoRAs change.",
+  strengths: "Each checkpoint renders at each of these LoRA strengths, comma-separated: one row of the grid per strength.",
+  cfg: "How strongly the image follows the prompt and steers away from the negative prompt. Above 1 runs the model twice a step, so it's about twice as slow; distilled (turbo) models are made for 1.",
+  tokenCfg: "How strongly the composer follows the style and lyrics as it writes the song, token by token. 1 turns it off; the model's release uses 1.01.",
+  negative: "What to steer away from. It's only used while CFG is above 1.",
+  sampler: "How each step moves from noise toward the image. Euler is fast and dependable; Heun is more accurate but runs the model twice a step; DPM++ 2M is often cleaner in fewer steps at Euler's speed.",
+  scheduler: "How the noise levels are spaced across the steps. Model default is the model's own schedule; Simple spaces them evenly; Beta puts more steps at the start and the end.",
+  shift: "Moves the steps toward the noisy end, where the composition is decided: higher suits bigger images. Blank uses the model's own shift.",
+};
+
+function Num(props: { label: string; v: number; on: (n: number) => void; step?: number; min?: number; max?: number; disabled?: boolean; help?: string; info?: string }) {
   return (
     <label className="field">
-      <span>{props.label}</span>
+      <span>{props.label}{props.info && <Info text={props.info} />}</span>
       <input type="number" value={Number.isFinite(props.v) ? props.v : ""} step={props.step} min={props.min} max={props.max}
         disabled={props.disabled} onChange={(e) => props.on(e.target.value === "" ? NaN : Number(e.target.value))} />
       {props.help && <span className="help">{props.help}</span>}
@@ -436,13 +452,13 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
           )}
           <div className="grid cols-2">
             <label className="field">
-              <span>Profile</span>
+              <span>Profile<Info text={INFO.profile} /></span>
               <select value={form.profile_id} onChange={(e) => setForm({ profile_id: e.target.value })}>
                 {(profiles || []).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
               </select>
             </label>
             <label className="field">
-              <span>Workflow</span>
+              <span>Workflow<Info text={INFO.workflow} /></span>
               <select value={form.workflow} onChange={(e) => setForm({ workflow: e.target.value, images: "" })}>
                 {workflows.map((w) => {
                   const ok = supported.some((s) => s.id === w.id);
@@ -472,7 +488,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
           {!music && <div className="field sbx-enhance">
             <label className="check">
               <input type="checkbox" checked={form.enhance} onChange={(e) => setForm({ enhance: e.target.checked, enhanced: null })} />
-              Enhance prompt with the local LLM
+              Enhance prompt with the local LLM<Info text={INFO.enhance} />
             </label>
             {form.enhance && (reusable ? (
               <div className="sbx-enhanced">
@@ -496,7 +512,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
           )}
 
           <div className="field">
-            <span>LoRAs</span>
+            <span>LoRAs<Info text={INFO.loras} /></span>
             <div className="stack" style={{ gap: 8 }}>
               {form.loras.map((l, i) => (
                 <div key={i} className="sbx-lora">
@@ -523,8 +539,8 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
                   <IconPlus /> Add LoRA
                 </button>
                 {!grid.on && (
-                  <label className="check" title="Also render each seed without the LoRAs">
-                    <input type="checkbox" checked={form.compare_base} disabled={!form.loras.length} onChange={(e) => setForm({ compare_base: e.target.checked })} /> Compare with base
+                  <label className="check">
+                    <input type="checkbox" checked={form.compare_base} disabled={!form.loras.length} onChange={(e) => setForm({ compare_base: e.target.checked })} /> Compare with base<Info text={INFO.compareBase} />
                   </label>
                 )}
               </div>
@@ -571,7 +587,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
                 </div>
                 <div className="grid cols-2">
                   <label className="field">
-                    <span>Strengths</span>
+                    <span>Strengths<Info text={INFO.strengths} /></span>
                     <input value={grid.strengths} onChange={(e) => setGrid({ strengths: e.target.value })} placeholder="0.6, 0.8, 1.0" />
                   </label>
                   <label className="check" style={{ alignSelf: "end", paddingBottom: 9 }}>
@@ -641,7 +657,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
 
           <div className="grid sbx-steps">
             <Num label="Steps" v={form.steps} on={(n) => setForm({ steps: n })} min={1} max={200} />
-            <Num label={music ? "Token CFG (1 = off)" : "CFG (1 = off)"} v={form.cfg} on={(n) => setForm({ cfg: n })} step={music ? 0.01 : 0.5} min={0}
+            <Num label={music ? "Token CFG (1 = off)" : "CFG (1 = off)"} info={music ? INFO.tokenCfg : INFO.cfg} v={form.cfg} on={(n) => setForm({ cfg: n })} step={music ? 0.01 : 0.5} min={0}
               disabled={defaults ? !defaults.supports_samplers && !music : false} />
             <label className="field">
               <span>Seed</span>
@@ -653,7 +669,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
           </div>
           {form.cfg > 1 && defaults?.supports_samplers && (
             <label className="field">
-              <span>Negative prompt</span>
+              <span>Negative prompt<Info text={INFO.negative} /></span>
               <input value={form.negative} onChange={(e) => setForm({ negative: e.target.value })} />
             </label>
           )}
@@ -665,13 +681,13 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
           ) : (
             <div className="grid cols-2">
               <label className="field">
-                <span>Sampler</span>
+                <span>Sampler<Info text={INFO.sampler} /></span>
                 <select value={form.sampler} onChange={(e) => setForm({ sampler: e.target.value })}>
                   {Object.entries(status?.samplers || {}).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
                 </select>
               </label>
               <label className="field">
-                <span>Scheduler</span>
+                <span>Scheduler<Info text={INFO.scheduler} /></span>
                 <select value={form.scheduler} onChange={(e) => setForm({ scheduler: e.target.value })}>
                   {Object.entries(status?.schedulers || {}).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
                 </select>
@@ -682,7 +698,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
           <div className="grid cols-2">
             {defaults?.supports_samplers !== false && (
               <label className="field">
-                <span>Shift</span>
+                <span>Shift<Info text={INFO.shift} /></span>
                 <input value={form.shift} placeholder="model's own" onChange={(e) => setForm({ shift: e.target.value })} />
               </label>
             )}
