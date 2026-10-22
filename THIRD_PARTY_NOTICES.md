@@ -140,7 +140,7 @@ Upstream: https://github.com/multimodal-art-projection/YuE, https://huggingface.
   release's flow matching and text-only (planning off) conditioning, follows Starnodes'
   ComfyUI-YuE2-Trainer (https://github.com/Starnodes2024/ComfyUI-YuE2-Trainer, MIT; notice below), as do
   the rank 32 / alpha 32 / 1e-4 defaults and the recommended LoRA strength of 2, which Dainamo's own test
-  confirmed (README, Music). No code is taken from it.
+  confirmed (docs/music.md). No code is taken from it.
 
 The YuE2-3B and YuE2-Vae weights are licensed under Creative Commons Attribution-NonCommercial 4.0
 International (https://creativecommons.org/licenses/by-nc/4.0/), with an additional permission (2026-09-16)
