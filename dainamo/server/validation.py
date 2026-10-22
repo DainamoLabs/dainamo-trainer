@@ -49,9 +49,11 @@ def check_settings(s: dict, div: int, audio: bool = False) -> dict:
                     ("offload", 100)):
         if key in s and s[key] > hi:
             raise HTTPException(400, f"Setting {key!r}={s[key]} is out of range (max {hi})")
-    for key in ("train_audio", "keep_alpha", "low_vram"):
+    for key in ("train_audio", "keep_alpha", "low_vram", "auto_frames"):
         if key in s:
             s[key] = bool(s[key])
+    if s.get("auto_frames"):  # each clip at its own length: a clip trains at most the clip length, so the longest
+        s["num_frames"] = MAX_FRAMES
     if s.get("optimizer") not in (None, "adamw8bit", "adamw", "adafactor", "prodigy"):
         raise HTTPException(400, f"Unknown optimizer {s.get('optimizer')!r}")
     check_network(s)

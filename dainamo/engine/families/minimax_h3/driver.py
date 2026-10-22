@@ -197,6 +197,13 @@ class MinimaxH3Driver(FamilyDriver):
         return spec["prompt"], self._sample_images(spec) or None
 
     # --- vae --------------------------------------------------------------
+    def cache_inputs(self, kind: str, settings: dict) -> dict:
+        if kind == "text":
+            return super().cache_inputs(kind, settings)
+        # the variant decides the keyframes (fl2va) or reference images (ref2va) encoded with each item
+        return {"files": [self.profile["vae"], self.profile.get("audio_vae")], "variant": self.variant,
+                "train_audio": bool(settings.get("train_audio", True))}
+
     def load_vae(self):
         path = self.profile["vae"]
         self.log(f"Loading video VAE {path}")

@@ -154,6 +154,8 @@ class FamilyDriver:
     # parts of a single-file checkpoint that load as the text encoder or VAE, for the projection:
     # {"text_encoder" | "vae": (key prefix, bytes per weight once loaded)}
     bundled: dict[str, tuple[str, int]] = {}
+    # raised when how the family encodes items or captions changes, so the shared cache encodes them again
+    cache_version: int = 1
 
     def __init__(self, profile: dict, device: torch.device, log=print):
         self.profile = profile
@@ -345,6 +347,12 @@ class FamilyDriver:
 
     def encode_condition(self, prompt: str, images: list | None):
         return self.encode_prompt(prompt)
+
+    def cache_inputs(self, kind: str, settings: dict) -> dict:
+        """What the cached ``kind`` ("latents": ``encode_item``'s payloads, "text": ``encode_condition``'s) is made
+        from: ``files``, the profile's files whose weights encode it, and any setting or profile value that
+        changes it. Jobs whose inputs match share their encodings (``engine.cache``)."""
+        return {"files": [self.profile.get("vae" if kind == "latents" else "text_encoder")]}
 
     def encode_item(self, item, settings: dict) -> dict:
         """VAE-encode one dataset item (VAE loaded). The payload is cached and passed to training_loss."""

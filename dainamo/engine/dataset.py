@@ -254,8 +254,10 @@ class Item:
         return self.seconds > 0
 
     def key(self) -> str:
+        """Its encoding's name in the cache: the file (path, size, modified time) and how it's prepared, so an
+        edited or replaced file is encoded again."""
         st = os.stat(self.path)
-        raw = f"{self.path}|{st.st_mtime_ns}|{self.size}|{self.flip}|{self.resolution}"
+        raw = f"{self.path}|{st.st_size}|{st.st_mtime_ns}|{self.size}|{self.flip}|{self.resolution}"
         if self.frames > 1:
             raw += f"|{self.frames}"
         if self.seconds:

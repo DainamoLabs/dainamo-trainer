@@ -27,6 +27,7 @@ from ..fsutil import replace
 from . import db, procs
 
 JOBS_DIR = os.path.join(db.DATA_DIR, "jobs")
+CACHE_DIR = os.path.join(db.DATA_DIR, "cache")  # encoded items and captions, shared by jobs (``engine.cache``)
 EXIT_CODES = {"completed": 0, "stopped": 3}
 
 
@@ -195,7 +196,7 @@ class Scheduler:
         d = job_dir(job["id"])
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, "job.json"), "w") as f:
-            json.dump(job["config"], f, indent=2)
+            json.dump({**job["config"], "cache_dir": CACHE_DIR}, f, indent=2)
         try:
             os.remove(os.path.join(d, "control.json"))
         except OSError:
@@ -232,6 +233,10 @@ class Scheduler:
                 db.execute("UPDATE jobs SET status='stopping' WHERE id=?", (job_id,))
             elif job["status"] == "stopping" and job_id in self.procs:
                 procs.kill_tree(self.procs[job_id].pid)
+
+    def paused(self) -> threading.Lock:
+        """``with scheduler.paused():`` keeps the queue from starting or reaping jobs meanwhile."""
+        return self._lock
 
     def requeue(self, job_id: str):
         with self._lock:

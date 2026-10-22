@@ -148,6 +148,8 @@ export type Evaluation = {
 
 // bytes a job's folder uses: LoRA checkpoints (output), samples, cached captions and latents, training state
 export type DiskUse = { output: number; samples: number; cache: number; state: number; other: number; total: number };
+// a job's: also the bytes of the shared cache's files it uses (encoded captions and latents; not in its total)
+export type JobDiskUse = DiskUse & { shared: number };
 
 export type Job = {
   id: string;
@@ -247,7 +249,7 @@ async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
     } catch {
       /* not json */
     }
-    throw new Error(msg);
+    throw Object.assign(new Error(msg), { status: r.status });
   }
   const ct = r.headers.get("content-type") || "";
   return (ct.includes("json") ? r.json() : r.text()) as Promise<T>;

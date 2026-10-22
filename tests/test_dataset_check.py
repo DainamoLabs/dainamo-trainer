@@ -66,13 +66,22 @@ def test_files_are_read_once(tmp_path, monkeypatch):
 def test_clips(tmp_path):
     import subprocess
 
-    for name, seconds in (("short.mp4", 0.5), ("blip.mp4", 0.04)):
+    for name, seconds in (("short.mp4", 0.5), ("blip.mp4", 0.04), ("long.mp4", 3)):
         subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"testsrc=duration={seconds}:size=128x128:rate=24",
                         "-pix_fmt", "yuv420p", str(tmp_path / name)], check=True)
     image_model = {i["id"]: i for i in dataset_check.check(str(tmp_path), "", [512], 16, None)["issues"]}
-    assert image_model["clips_skipped"]["count"] == 2 and "small" not in image_model
-    video_model = {i["id"]: i for i in dataset_check.check(str(tmp_path), "", [256], 32, 39)["issues"]}
+    assert image_model["clips_skipped"]["count"] == 3 and "small" not in image_model
+    result = dataset_check.check(str(tmp_path), "", [256], 32, 39)
+    video_model = {i["id"]: i for i in result["issues"]}
     assert [f["name"] for f in video_model["clip_too_short"]["files"]] == ["blip.mp4"]
     assert [f["name"] for f in video_model["short_clips"]["files"]] == ["short.mp4"]
     assert video_model["short_clips"]["title"] == "1 clip shorter than 39 frames (1.6 s)"
-    assert video_model["small"]["count"] == 2  # 128x128 clips at 256
+    # a clip longer than the clip length trains only its start
+    assert [f["name"] for f in video_model["long_clips"]["files"]] == ["long.mp4"]
+    assert video_model["long_clips"]["title"] == "1 clip longer than 39 frames (1.6 s)"
+    assert video_model["small"]["count"] == 3  # 128x128 clips at 256
+    assert result["longest_clip"] == 72  # 3 s at 24 fps
+    # an Auto clip length trains each clip at its own length (the longest a clip trains at being 241 frames)
+    auto = dataset_check.check(str(tmp_path), "", [256], 32, 226, clip_length=241, auto_frames=True)
+    assert {i["id"] for i in auto["issues"]} & {"short_clips", "long_clips"} == set()
+    assert "clip_too_short" in {i["id"] for i in auto["issues"]} and auto["longest_clip"] == 72

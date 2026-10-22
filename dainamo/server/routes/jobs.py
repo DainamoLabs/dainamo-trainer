@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import time
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse
@@ -14,7 +15,7 @@ from pydantic import BaseModel
 from ...engine.dataset import resolutions
 from ...engine.families import get_family
 from .. import db
-from ..queue import job_dir, read_status, scheduler, send_control
+from ..queue import CACHE_DIR, job_dir, read_status, scheduler, send_control
 from ..validation import check_evaluation, check_resolution, check_settings
 from .common import dataset_or_404, job_or_404, not_found, profile_or_404
 
@@ -64,8 +65,8 @@ def list_jobs():
     return [_job_summary(j) for j in db.query("SELECT * FROM jobs ORDER BY position, created")]
 
 
-@router.post("/jobs")
-def create_job(body: JobIn):
+def _job_config(body: JobIn) -> dict:
+    """A job's config (all but its id) from the Create Job form, checked and filled in."""
     prof = profile_or_404(body.profile_id)
     Family = get_family(prof["family"])
     audio = "audio" in Family.info.media
@@ -100,13 +101,140 @@ def create_job(body: JobIn):
     if settings.get("picker_enabled") and settings.get("val_dataset"):
         d = dataset_or_404(settings["val_dataset"])
         val_dsets.append({"id": d["id"], "name": d["name"], "path": d["path"], "trigger": d["trigger"], "repeats": 1})
+    return {"name": body.name.strip() or "job", "output_name": body.output_name.strip(),
+            "family": prof["family"], "profile_name": prof["name"], "profile": prof["data"],
+            "datasets": dsets, "validation_datasets": val_dsets, "settings": settings}
+
+
+@router.post("/jobs")
+def create_job(body: JobIn):
     jid = db.new_id()
-    config = {"id": jid, "name": body.name.strip() or "job", "output_name": body.output_name.strip(),
-              "family": prof["family"], "profile_name": prof["name"], "profile": prof["data"],
-              "datasets": dsets, "validation_datasets": val_dsets, "settings": settings}
+    config = {"id": jid, **_job_config(body)}
     db.execute("INSERT INTO jobs (id, name, status, family, profile_name, gpu, position, created, config) "
-               "VALUES (?,?,?,?,?,?,?,?,?)", (jid, config["name"], "queued", prof["family"], prof["name"],
+               "VALUES (?,?,?,?,?,?,?,?,?)", (jid, config["name"], "queued", config["family"], config["profile_name"],
                                               body.gpu, db.now(), db.now(), json.dumps(config)))
+    return job_or_404(jid)
+
+
+class JobEdit(JobIn):
+    restart: bool = False  # the changes make a job that has trained start again from step 0
+
+
+def _restart_reason(key: str) -> str | None:
+    """Why a job that has trained can't change setting ``key`` and carry on from its last save, if it can't: its
+    saved LoRA and optimizer state wouldn't fit another network or optimizer, and a slider would learn something
+    else. (What the checkpoint picker and concept bleed score: ``_restart_reasons``.)"""
+    if key in ("network_type", "rank", "alpha", "lokr_factor"):
+        return "the network (LoRA or LoKr, rank, alpha)"
+    if key == "optimizer":
+        return "the optimizer"
+    if key.startswith("slider_") and key != "slider_sample_strengths":
+        return "the slider"
+    return None
+
+
+# while the checkpoint picker is on, what its validation items (and how they're scored) come from, along with the
+# datasets: changed mid-run, checkpoints scored before and after wouldn't compare. Likewise the concept bleed check's
+# renders. (The strength sweep and bleed limit only apply to the scores at the end, so they can change.)
+PICKER_INPUTS = ("val_dataset", "val_holdout", "val_timesteps", "seed", "resolution", "num_frames", "auto_frames",
+                 "clip_seconds")
+BLEED_INPUTS = ("bleed_prompts", "bleed_width", "bleed_height", "bleed_seed")
+
+
+def _restart_reasons(old: dict, new: dict) -> list[str]:
+    """What in config ``new`` a job that has trained as ``old`` can't carry on with: another model, settings
+    ``_restart_reason`` names, or what the checkpoint picker or concept bleed scores while it's on (settings
+    ``old`` doesn't have, from before they existed, aren't compared)."""
+    o, n = old.get("settings", {}), new["settings"]
+    reasons = ["the model"] if old.get("profile_name") != new["profile_name"] else []
+    for k, v in o.items():
+        why = _restart_reason(k)
+        if why and v != n.get(k) and why not in reasons:
+            reasons.append(why)
+
+    def changed(keys):
+        return any(k in o and o[k] != n.get(k) for k in keys)
+
+    if n.get("picker_enabled") and (not o.get("picker_enabled") or changed(PICKER_INPUTS)
+                                    or _dataset_choices(old) != _dataset_choices(new)):
+        reasons.append("what the checkpoint picker scores (made from the datasets, resolution, clip length and seed)")
+    if n.get("bleed_enabled") and (not o.get("bleed_enabled") or changed(BLEED_INPUTS)):
+        reasons.append("the concept bleed check")
+    return reasons
+
+
+def _dataset_choices(c: dict) -> list[tuple]:
+    s = c.get("settings", {})  # a dataset from before per-dataset settings has the job's
+    return [(d["id"], d.get("repeats"), *(d.get(k, s.get(k)) for k in ("resolution", "flip", "caption_dropout")))
+            for d in c.get("datasets", [])]
+
+
+def _changes(old: dict, new: dict) -> list[str]:
+    """What an edit changed, for the job's log: "learning_rate 0.0001 → 5e-05", "datasets"."""
+    def short(v):
+        t = json.dumps(v) if isinstance(v, (list, dict)) else str(v)
+        return t if len(t) <= 40 else t[:37] + "..."
+
+    s = old.get("settings", {})
+    out = [f"{k} {short(s[k])} → {short(v)}" for k, v in sorted(new["settings"].items()) if k in s and s[k] != v]
+    return out + (["datasets"] if _dataset_choices(old) != _dataset_choices(new) else [])
+
+
+def _and(words: list[str]) -> str:
+    return words[0] if len(words) == 1 else ", ".join(words[:-1]) + " and " + words[-1]
+
+
+def _clear_progress(jid: str):
+    """Delete what a job has trained, so it starts again from step 0."""
+    d = job_dir(jid)
+    for sub in ("state", "samples", "output"):
+        shutil.rmtree(os.path.join(d, sub), ignore_errors=True)
+    for f in ("metrics.jsonl", "status.json"):
+        try:
+            os.remove(os.path.join(d, f))
+        except OSError:
+            pass
+
+
+@router.put("/jobs/{jid}")
+def edit_job(jid: str, body: JobEdit):
+    """Change a job that isn't running. One that hasn't trained yet takes any change. One that has carries on
+    from its last save with the changes (noted in its log), unless one is something it can't carry on with
+    (``_restart_reasons``): then it starts again from step 0, which ``restart`` has to confirm (else 409)."""
+    new = _job_config(body)
+    with scheduler.paused():  # so the queue doesn't start the job meanwhile
+        j = job_or_404(jid)
+        if j["status"] in ("running", "stopping"):
+            raise HTTPException(400, "Stop the job first")
+        old = j["config"]
+        if "evaluate" in old:
+            raise HTTPException(400, "Cancel its checkpoint evaluation first")
+        done = int(read_status(jid).get("step") or 0)
+        trained = done > 0 or os.path.exists(os.path.join(job_dir(jid), "state", "last.pt"))
+        restart = _restart_reasons(old, new) if trained else []
+        if restart and not body.restart:
+            raise HTTPException(409, f"Changing {_and(restart)} starts the job again from step 0, and what it trained "
+                                     f"in {done} steps (its checkpoints and samples) is deleted.")
+        changed = []
+        if trained and not restart:
+            steps = int(new["settings"]["steps"])
+            if steps != int(old["settings"].get("steps") or 0):
+                if j["status"] == "completed":
+                    raise HTTPException(400, "To train a finished job for more steps, use Continue training")
+                if steps <= done:
+                    raise HTTPException(400, f"Train to more than step {done}, where it got to")
+            new["profile"] = old["profile"]  # the model as it trained with it, though the profile may have changed
+            changed = _changes(old, new)
+        config = {"id": jid, **new}
+        db.execute("UPDATE jobs SET name=?, family=?, profile_name=?, gpu=?, config=? WHERE id=?",
+                   (config["name"], config["family"], config["profile_name"], body.gpu, json.dumps(config), jid))
+        if restart:
+            _clear_progress(jid)
+            db.execute("UPDATE jobs SET status='queued', position=?, exit_code=NULL WHERE id=?", (db.now(), jid))
+        elif changed:  # its log says where the run changed
+            with open(os.path.join(job_dir(jid), "log.txt"), "a", encoding="utf-8") as f:
+                f.write(f"\n===== edited {time.strftime('%Y-%m-%d %H:%M:%S')}: it carries on from step {done} with "
+                        f"{'; '.join(changed)} =====\n")
     return job_or_404(jid)
 
 
@@ -271,14 +399,7 @@ def job_action(jid: str, body: ActionIn):
             raise HTTPException(400, "Stop the job first")
         if "evaluate" in j["config"]:
             raise HTTPException(400, "Cancel its checkpoint evaluation first")
-        d = job_dir(jid)
-        for sub in ("state", "samples", "output"):
-            shutil.rmtree(os.path.join(d, sub), ignore_errors=True)
-        for f in ("metrics.jsonl", "status.json"):
-            try:
-                os.remove(os.path.join(d, f))
-            except OSError:
-                pass
+        _clear_progress(jid)
         scheduler.requeue(jid)
     elif a in ("up", "down"):
         queued = db.query("SELECT id, position FROM jobs WHERE status='queued' ORDER BY position, created")
@@ -374,29 +495,81 @@ def job_disk(jid: str) -> dict:
     return sizes
 
 
+def _cache_files(jid: str) -> set[str]:
+    """The shared cache's files a job used when it last ran (as its trainer lists them in cache.json)."""
+    try:
+        with open(os.path.join(job_dir(jid), "cache.json")) as f:
+            return {os.path.join(CACHE_DIR, p) for p in json.load(f)["files"]}
+    except (OSError, ValueError, KeyError, TypeError):
+        return set()
+
+
+def _cache_in_use() -> set[str]:
+    """The shared cache's files that queued and running jobs use."""
+    return set().union(*(_cache_files(r["id"])
+                         for r in db.query("SELECT id FROM jobs WHERE status IN ('queued','running','stopping')")))
+
+
+def _size(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _clean_shared_cache() -> int:
+    """Delete the shared cache's encodings that no queued or running job uses, and the folders left empty;
+    -> bytes freed. Files still being written (``.tmp``) are left alone."""
+    freed = 0
+    with scheduler.paused():  # no job starts meanwhile
+        used = _cache_in_use()
+        for kind in ("latents", "text"):
+            base = os.path.join(CACHE_DIR, kind)
+            for sig in os.listdir(base) if os.path.isdir(base) else []:
+                d = os.path.join(base, sig)
+                for name in os.listdir(d):
+                    p = os.path.join(d, name)
+                    if name == "signature.json" or name.endswith(".tmp") or p in used:
+                        continue
+                    size = _size(p)
+                    try:
+                        os.remove(p)
+                        freed += size
+                    except OSError:
+                        pass
+                if os.listdir(d) == ["signature.json"]:
+                    shutil.rmtree(d, ignore_errors=True)
+    return freed
+
+
 @router.get("/disk")
 def disk():
-    """Bytes each job's folder uses, by part (checkpoints, samples, cache, training state, other), and in all."""
+    """Bytes each job's folder uses, by part (checkpoints, samples, cache, training state, other), and in all; and
+    the shared cache's size, with how much of it queued and running jobs use."""
     jobs = {j["id"]: job_disk(j["id"]) for j in db.query("SELECT id FROM jobs")}
     keys = (*DISK_PARTS, "other", "total")
-    return {"jobs": jobs, "total": {k: sum(j[k] for j in jobs.values()) for k in keys}}
+    return {"jobs": jobs, "total": {k: sum(j[k] for j in jobs.values()) for k in keys},
+            "shared_cache": {"total": _dir_size(CACHE_DIR), "in_use": sum(_size(p) for p in _cache_in_use())}}
 
 
 @router.get("/jobs/{jid}/disk")
 def disk_of_job(jid: str):
+    """``job_disk``, and ``shared``: the bytes of the shared cache's files it uses (not counted in its total)."""
     job_or_404(jid)
-    return job_disk(jid)
+    return {**job_disk(jid), "shared": sum(_size(p) for p in _cache_files(jid))}
 
 
 class CleanIn(BaseModel):
     parts: list[str]  # "cache" (re-made when the job runs again) and/or "state" (needed to resume or continue)
-    jobs: list[str] | None = None  # None: every finished job
+    jobs: list[str] | None = None  # None: every finished job, and the shared cache
 
 
 @router.post("/disk/clean")
 def clean_disk(body: CleanIn):
     """Delete the cached captions and latents, and/or the training state, of finished jobs. A stopped or failed
-    job's state is kept, since resuming needs it; so is anything of a job that's queued or running."""
+    job's state is kept, since resuming needs it; so is anything of a job that's queued or running. Clearing
+    every job's cache also clears what the shared cache holds that no queued or running job uses. (A job's own
+    cache is from before caches were shared.)"""
     if not body.parts or any(p not in ("cache", "state") for p in body.parts):
         raise HTTPException(400, "Choose what to clear: cache and/or state")
     rows = db.query("SELECT id, name, status, config FROM jobs")
@@ -417,6 +590,8 @@ def clean_disk(body: CleanIn):
             freed += _dir_size(path)
             shutil.rmtree(path, ignore_errors=True)
         cleaned += freed > before
+    if body.jobs is None and "cache" in body.parts:
+        freed += _clean_shared_cache()
     return {"freed": freed, "jobs": cleaned, "kept": kept}
 
 

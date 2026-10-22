@@ -279,6 +279,10 @@ class QwenImage2Driver(FamilyDriver):
         return spec["prompt"], [vision_image(r) for r in refs] or None
 
     # --- vae --------------------------------------------------------------
+    def cache_inputs(self, kind: str, settings: dict) -> dict:
+        inputs = super().cache_inputs(kind, settings)
+        return inputs if kind == "text" else {**inputs, "keep_alpha": bool(settings.get("keep_alpha", True))}
+
     def load_vae(self):
         _, _, vae_config = qwen_image_2_assets()
         self.log(f"Loading VAE {self.profile['vae']}")

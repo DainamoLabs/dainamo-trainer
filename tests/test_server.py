@@ -239,6 +239,20 @@ def test_resolution_takes_one_or_several(client, tmp_path):
     client.post(f"/api/jobs/{r.json()['id']}/action", json={"action": "stop"})
 
 
+def test_an_auto_clip_length_trains_each_clip_whole(client, tmp_path):
+    client.put("/api/settings", json={"queue": {"gpus": [99]}})
+    pid = client.post("/api/profiles", json={"name": "ac", "family": "minimax_h3", "data": {}}).json()["id"]
+    did = client.post("/api/datasets", json={"name": "ac", "path": str(tmp_path)}).json()["id"]
+    r = client.post("/api/jobs", json={"name": "ac", "profile_id": pid, "datasets": [{"id": did}],
+                                       "settings": {"auto_frames": True, "num_frames": 39}})
+    s = r.json()["config"]["settings"]
+    # the trainer then takes each clip at its own length, up to the longest a clip trains at
+    assert r.status_code == 200 and (s["auto_frames"], s["num_frames"]) == (True, 241)
+    client.post(f"/api/jobs/{r.json()['id']}/action", json={"action": "stop"})
+    check = client.get(f"/api/datasets/{did}/check?family=minimax_h3&auto=true").json()
+    assert check["longest_clip"] == 0  # no clips
+
+
 def test_each_dataset_has_its_own_resolutions(client, tmp_path):
     from PIL import Image
 
@@ -609,6 +623,116 @@ def test_a_finished_job_can_be_given_more_steps(client):
     client.post(f"/api/jobs/{jid}/action", json={"action": "stop"})
 
 
+def test_editing_a_job(client, tmp_path, monkeypatch):
+    import json
+    import os
+
+    from dainamo.server import db
+    from dainamo.server.queue import job_dir, scheduler
+
+    monkeypatch.setattr(scheduler, "_launch", lambda: None)  # its jobs stay queued
+    pid = client.post("/api/profiles", json={"name": "ed", "family": "krea2", "data": {}}).json()["id"]
+    did = client.post("/api/datasets", json={"name": "ed", "path": str(tmp_path)}).json()["id"]
+    jid = client.post("/api/jobs", json={"name": "ed", "profile_id": pid, "datasets": [{"id": did}],
+                                         "settings": {"steps": 3000}}).json()["id"]
+
+    def edit(settings=None, **job):
+        """Save the job as the form does: its settings and datasets as they are, with ``settings`` changed."""
+        cfg = client.get(f"/api/jobs/{jid}/config").json()
+        datasets = [{k: d[k] for k in ("id", "repeats", "resolution", "flip", "caption_dropout")} for d in cfg["datasets"]]
+        return client.put(f"/api/jobs/{jid}", json={"name": cfg["name"], "profile_id": pid, "gpu": "auto",
+                                                    "datasets": datasets, "settings": {**cfg["settings"], **(settings or {})},
+                                                    **job})
+
+    # before it trains it takes any change, and keeps its place in the queue
+    r = edit({"steps": 4000, "rank": 16}, name="ed v1", gpu="1")
+    assert r.status_code == 200
+    j = r.json()
+    assert (j["status"], j["name"], j["gpu"], j["config"]["name"]) == ("queued", "ed v1", "1", "ed v1")
+    assert (j["config"]["settings"]["steps"], j["config"]["settings"]["rank"]) == (4000, 16)
+
+    d = job_dir(jid)
+    os.makedirs(os.path.join(d, "state"))
+    open(os.path.join(d, "state", "last.pt"), "wb").close()
+    with open(os.path.join(d, "status.json"), "w") as f:
+        json.dump({"phase": "stopped", "step": 1200}, f)
+    db.execute("UPDATE jobs SET status='stopped' WHERE id=?", (jid,))
+
+    # once it has trained, its own settings sent back change nothing, and most changes carry on from its last save,
+    # each noted in its log: how long it trains, what it saves and samples, how it learns, what it learns from
+    assert edit().status_code == 200
+    r = edit({"steps": 5000, "sample_every": 100, "offload": 20, "learning_rate": 3.3e-5, "num_frames": 49},
+             datasets=[{"id": did, "repeats": 3}])
+    s = r.json()["config"]["settings"]
+    assert (r.json()["status"], s["steps"], s["sample_every"], s["offload"], s["rank"]) == ("stopped", 5000, 100, 20, 16)
+    assert (s["learning_rate"], r.json()["config"]["datasets"][0]["repeats"]) == (3.3e-5, 3)
+    assert os.path.exists(os.path.join(d, "state", "last.pt"))
+    with open(os.path.join(d, "log.txt"), encoding="utf-8") as f:
+        log = f.read()
+    assert "carries on from step 1200 with" in log and "learning_rate 0.0001 → 3.3e-05" in log and "datasets" in log
+    assert "more than step 1200" in edit({"steps": 1000}).json()["detail"]
+    # while the checkpoint picker is on, what it scores can't change mid-run; what it does at the end can
+    db.execute("UPDATE jobs SET config=json_set(config, '$.settings.picker_enabled', json('true')) WHERE id=?", (jid,))
+    assert edit({"picker_enabled": True, "sweep_enabled": True, "bleed_max": 10}).status_code == 200
+    r = edit({"picker_enabled": True, "num_frames": 97})
+    assert r.status_code == 409 and "what the checkpoint picker scores" in r.json()["detail"]
+    assert edit({"picker_enabled": True}, datasets=[{"id": did, "repeats": 2}]).status_code == 409
+    assert edit({"picker_enabled": False, "num_frames": 97}).status_code == 200  # turned off, it scores nothing
+    assert edit({"picker_enabled": True}).status_code == 409  # and turned on, checkpoints so far weren't scored
+    # another network can't carry on from the saved one: it starts again from step 0, once that's confirmed
+    r = edit({"rank": 32, "optimizer": "adamw"})
+    assert r.status_code == 409
+    assert "network (LoRA or LoKr, rank, alpha) and the optimizer" in r.json()["detail"] and "1200 steps" in r.json()["detail"]
+    assert client.get(f"/api/jobs/{jid}/config").json()["settings"]["rank"] == 16
+    r = edit({"rank": 32}, restart=True)
+    assert r.status_code == 200 and r.json()["status"] == "queued"
+    assert r.json()["config"]["settings"]["rank"] == 32
+    assert not os.path.exists(os.path.join(d, "state")) and not os.path.exists(os.path.join(d, "status.json"))
+
+    # a finished job trains on with Continue training, and a running one can't change
+    os.makedirs(os.path.join(d, "state"))
+    open(os.path.join(d, "state", "last.pt"), "wb").close()
+    with open(os.path.join(d, "status.json"), "w") as f:
+        json.dump({"phase": "completed", "step": 5000}, f)
+    db.execute("UPDATE jobs SET status='completed' WHERE id=?", (jid,))
+    assert "Continue training" in edit({"steps": 6000}).json()["detail"]
+    assert edit({"sample_every": 50}).json()["config"]["settings"]["sample_every"] == 50
+    db.execute("UPDATE jobs SET status='running' WHERE id=?", (jid,))
+    assert "Stop the job" in edit({"sample_every": 25}).json()["detail"]
+    db.execute("UPDATE jobs SET status='stopped' WHERE id=?", (jid,))
+
+
+def test_clearing_the_shared_cache_spares_what_running_jobs_use(client):
+    import json
+    import os
+
+    from dainamo.server import db
+    from dainamo.server.queue import CACHE_DIR, job_dir
+
+    for rel, size in (("latents/vae1/signature.json", 10), ("latents/vae1/a.pt", 100), ("latents/vae1/b.pt", 200),
+                      ("latents/vae1/c.pt.77.tmp", 50), ("text/te1/signature.json", 10), ("text/te1/x.pt", 400)):
+        path = os.path.join(CACHE_DIR, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"x" * size)
+    jid = db.new_id()
+    db.execute("INSERT INTO jobs (id, name, status, family, gpu, position, created, config) VALUES (?,?,?,?,?,?,?,?)",
+               (jid, "busy", "running", "krea2", "99", 0.0, db.now(), json.dumps({"settings": {}})))
+    os.makedirs(job_dir(jid))
+    with open(os.path.join(job_dir(jid), "cache.json"), "w") as f:
+        json.dump({"root": CACHE_DIR, "files": ["latents/vae1/a.pt"]}, f)  # as its trainer lists them
+
+    assert client.get("/api/disk").json()["shared_cache"] == {"total": 770, "in_use": 100}
+    assert client.get(f"/api/jobs/{jid}/disk").json()["shared"] == 100  # on its Disk use card
+    assert client.post("/api/disk/clean", json={"parts": ["cache"]}).json()["freed"] >= 600
+    # what the running job uses stays, and so does a file another job is still writing
+    assert sorted(os.listdir(os.path.join(CACHE_DIR, "latents", "vae1"))) == ["a.pt", "c.pt.77.tmp", "signature.json"]
+    assert not os.path.exists(os.path.join(CACHE_DIR, "text", "te1"))  # emptied, so gone
+    db.execute("UPDATE jobs SET status='completed' WHERE id=?", (jid,))
+    client.post("/api/disk/clean", json={"parts": ["cache"]})
+    assert sorted(os.listdir(os.path.join(CACHE_DIR, "latents", "vae1"))) == ["c.pt.77.tmp", "signature.json"]
+
+
 def test_disk_use_and_clearing_what_finished_jobs_dont_need(client):
     import json
     import os
@@ -630,7 +754,7 @@ def test_disk_use_and_clearing_what_finished_jobs_dont_need(client):
 
     done, stopped, running = job("done", "completed"), job("paused", "stopped"), job("busy", "running")
     assert client.get(f"/api/jobs/{done}/disk").json() == {"output": 300, "samples": 200, "cache": 5000, "state": 1000,
-                                                          "other": 10, "total": 6510}
+                                                          "other": 10, "total": 6510, "shared": 0}
     assert client.get("/api/disk").json()["jobs"][stopped]["total"] == 6510
 
     r = client.post("/api/disk/clean", json={"parts": ["state"], "jobs": [done, stopped, running]}).json()

@@ -6,9 +6,12 @@ A job directory holds ``job.json`` (written by the server). The trainer writes:
   samples/       samples generated during training (PNG, or MP4 + poster for video families)
   output/        LoRA checkpoints (ComfyUI-compatible .safetensors)
   state/         resumable optimizer state
-  cache/         cached VAE payloads and text embeddings
+  cache.json     the files of the encoding cache it uses (``engine.cache``), so they're kept while it runs
 and polls ``control.json`` for stop / sample-now / save-now requests. SIGTERM is
 treated like a stop request, so state is saved before exiting.
+
+Encoded items and captions go to the cache that jobs share, ``job.json``'s ``cache_dir`` (else the job's own
+``cache/``), and are reused by any job encoding them the same way.
 
 A job.json with ``evaluate`` set is a checkpoint evaluation of a finished job instead (see
 ``run_evaluation``): the job's saved checkpoints are scored, and nothing is trained. Settings with
@@ -32,6 +35,7 @@ import time
 import torch
 
 from ..fsutil import replace
+from . import cache
 from . import dataset as ds
 from . import evaluation
 from .families import get_family
@@ -82,8 +86,11 @@ class Trainer:
         self.device = torch.device("cuda")
         self.text_files: dict[str, str] = {}
         self.opt = None  # the optimizer, once training has one
-        for sub in ("samples", "output", "state", "cache"):
+        for sub in ("samples", "output", "state"):
             os.makedirs(os.path.join(job_dir, sub), exist_ok=True)
+        self.cache_root = self.job.get("cache_dir") or os.path.join(job_dir, "cache")
+        self.cache_dirs: dict[str, str] = {}  # kind -> its folder in the cache, once known
+        self.cache_used: set[str] = set()  # the cache files this run uses
         self.status = {"phase": "starting", "step": 0, "total_steps": int(self.s["steps"]), "loss": None,
                        "avg_loss": None, "lr": None, "it_per_sec": None, "eta_seconds": None, "message": "",
                        "samples": [], "checkpoints": [], "started_at": time.time(), "vram_gb": None,
@@ -170,24 +177,41 @@ class Trainer:
             return {}
 
     # --- caching ----------------------------------------------------------
+    def cache_dir(self, driver, kind: str) -> str:
+        """The shared cache's folder for ``kind`` ("latents" or "text") as this job's model encodes it."""
+        if kind not in self.cache_dirs:
+            self.cache_dirs[kind] = cache.folder(self.cache_root, driver, kind, self.s)
+        return self.cache_dirs[kind]
+
+    def use_cache(self, files):
+        """Record cache files this run uses in ``cache.json``, so clearing the cache keeps them while it runs."""
+        self.cache_used.update(files)
+        path = os.path.join(self.job_dir, "cache.json")
+        with open(path + ".tmp", "w") as f:
+            json.dump({"root": self.cache_root,
+                       "files": sorted(os.path.relpath(p, self.cache_root) for p in self.cache_used)}, f)
+        replace(path + ".tmp", path)
+
     def cache_text(self, driver, conds: dict[str, tuple[str, list | None]]) -> dict[str, str]:
         """Encode text conditions {key: (prompt, images)} to the disk cache; returns key -> file.
         Embeddings are loaded per step rather than all held in RAM."""
-        cache_dir = os.path.join(self.job_dir, "cache", "text")
-        os.makedirs(cache_dir, exist_ok=True)
+        cache_dir = self.cache_dir(driver, "text")
         files, todo = {}, []
         for key, (prompt, images) in conds.items():
             f = os.path.join(cache_dir, hashlib.sha1(key.encode()).hexdigest() + ".pt")
             files[key] = f
             if not os.path.exists(f):
                 todo.append((prompt, images, f))
+        self.use_cache(files.values())
         if todo:
             self.phase("caching_text", f"Encoding {len(todo)} captions")
             driver.load_text_encoder()
             for i, (prompt, images, f) in enumerate(todo):
                 self.check_control_during_prep()
-                torch.save(driver.encode_condition(prompt, images), f + ".tmp")
-                os.replace(f + ".tmp", f)
+                # another job may be encoding the same caption: each writes its own temporary file
+                tmp = f"{f}.{os.getpid()}.tmp"
+                torch.save(driver.encode_condition(prompt, images), tmp)
+                replace(tmp, f)
                 self.status["message"] = f"Encoding captions {i + 1}/{len(todo)}"
                 self.progress(self.status["message"], keep=i + 1 == len(todo))
                 self.write_status()
@@ -199,11 +223,11 @@ class Trainer:
 
     def cache_items(self, driver, items: list[ds.Item]) -> list[str]:
         """VAE-encode items through the driver; returns one cache file per item."""
-        cache_dir = os.path.join(self.job_dir, "cache", "latents")
-        os.makedirs(cache_dir, exist_ok=True)
+        cache_dir = self.cache_dir(driver, "latents")
         files = [os.path.join(cache_dir, it.key() + ".pt") for it in items]
         # repeats share a cache file, so dedupe by file
         todo = [(it, f) for f, it in dict(zip(files, items)).items() if not os.path.exists(f)]
+        self.use_cache(files)
         if todo:
             what = ("audio clips" if any(it.is_audio for it, _ in todo)
                     else "clips and images" if any(it.is_video for it, _ in todo) else "images")
@@ -211,8 +235,9 @@ class Trainer:
             driver.load_vae()
             for i, (it, f) in enumerate(todo):
                 self.check_control_during_prep()
-                torch.save(driver.encode_item(it, self.s), f + ".tmp")
-                os.replace(f + ".tmp", f)
+                tmp = f"{f}.{os.getpid()}.tmp"
+                torch.save(driver.encode_item(it, self.s), tmp)
+                replace(tmp, f)
                 self.status["message"] = f"Encoding {i + 1}/{len(todo)}"
                 self.progress(self.status["message"], keep=i + 1 == len(todo))
                 self.write_status()
@@ -760,6 +785,12 @@ class Trainer:
             network.load_state_dict(st["lora"])
             opt.load_state_dict(st["opt"])
             sched.load_state_dict(st["sched"])
+            # the learning rate and weight decay as the job has them now (an edit may have changed them), which the
+            # saved state would otherwise put back to what it started with; the schedule follows the settings anyway
+            lr, wd = float(s["learning_rate"]), float(s.get("weight_decay", 0.0))
+            sched.base_lrs = [lr for _ in opt.param_groups]
+            for g in opt.param_groups:
+                g.update(initial_lr=lr, weight_decay=wd, lr=lr * sched.lr_lambdas[0](sched.last_epoch))
             start = st["step"]
             for k in ("samples", "checkpoints", "evals"):
                 self.status[k] = st["status"].get(k, [])

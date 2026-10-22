@@ -6,17 +6,19 @@ export type CheckIssue = {
   id: string; level: "error" | "warning" | "info"; title: string; detail: string; count: number;
   files?: FileRef[]; groups?: FileRef[][];
 };
-export type CheckResult = { files: number; images: number; videos: number; audio?: number; issues: CheckIssue[] };
+// longest_clip: the longest clip's frames at 24 fps (0: no clips)
+export type CheckResult = { files: number; images: number; videos: number; audio?: number; issues: CheckIssue[]; longest_clip?: number };
 
 /** The dataset health check for training at ``resolution`` with a model ``family`` (re-run as they change);
- * ``seconds`` is a music model's clip length (0: whole songs). */
-export function useDatasetCheck(id: string | null, params: { resolution?: string; family?: string; frames?: number; seconds?: number }) {
+ * ``frames`` is a video model's clip length (``auto``: each clip at its own length), ``seconds`` a music model's
+ * (0: whole songs). */
+export function useDatasetCheck(id: string | null, params: { resolution?: string; family?: string; frames?: number; seconds?: number; auto?: boolean }) {
   const [result, setResult] = useState<CheckResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [nonce, setNonce] = useState(0);
   const query = `resolution=${q(params.resolution || "")}&family=${q(params.family || "")}&frames=${params.frames || 0}`
-    + `&seconds=${params.seconds ?? -1}`;
+    + `&seconds=${params.seconds ?? -1}${params.auto ? "&auto=true" : ""}`;
   useEffect(() => {
     if (!id) { setResult(null); return; }
     let live = true;

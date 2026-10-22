@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { go } from "../App";
-import { api, type Dataset, type Family, type Gpu, type Profile, type SystemRam } from "../api";
+import { api, type Dataset, type Family, type Gpu, type JobDetail, type Profile, type SystemRam } from "../api";
 import { CheckIssues, useDatasetCheck } from "../components/DatasetCheck";
 import { EVAL_DEFAULTS, EvalSettings, evalCost } from "../components/EvalSettings";
-import { IconPlay, IconPlus, IconX } from "../components/icons";
-import { ImagesInput, Info, Num, usePoll, useToast } from "../components/ui";
+import { IconPlay, IconPlus, IconSave, IconX } from "../components/icons";
+import { ConfirmDialog, ImagesInput, Info, Num, usePoll, useToast } from "../components/ui";
 import { OffloadControl, gpuTarget, peakOf, streamedFor, useVramProjection } from "../components/Vram";
 
 type S = Record<string, any>;
@@ -21,6 +21,7 @@ const BASE_SETTINGS: S = {
   network_type: "lora", lokr_factor: 16,
   // video families
   num_frames: 39, i2v_probability: 0.5, train_audio: true, audio_loss_weight: 1, sample_frames: 39,
+  auto_frames: false, // each clip at its own length, up to MAX_CLIP_FRAMES
   // music families: songs train as clips this long (0: whole songs), and samples are this long
   clip_seconds: 30, sample_seconds: 30,
   // optional checkpoint evaluation (off by default)
@@ -30,6 +31,8 @@ const BASE_SETTINGS: S = {
   slider_sample_strengths: "-1, 1", slider_images: 16, slider_preserve: [], slider_keep_layout: true,
   slider_layout_sigma: 0.9,
 };
+// the longest a clip trains at (the server's MAX_FRAMES: 10 s at 24 fps)
+const MAX_CLIP_FRAMES = 241;
 // what switching to a slider sets: it learns one direction, so it needs fewer steps and less rank
 const SLIDER_DEFAULTS: S = { steps: 500, rank: 16, alpha: 16, picker_enabled: false };
 // a LoKr learns more slowly than a LoRA at the same rate, so it starts at this multiple of the family's rate
@@ -65,6 +68,7 @@ const INFO = {
   dropout: "Randomly zeroes this share of the LoRA's input in each layer during training, which can stop it memorising a small dataset. 0 turns it off; 0.05–0.1 is typical.",
   maxGradNorm: "Caps the size of each update, so one unusual batch can't knock training off course. 0 turns the cap off; 1 is the usual value.",
   weightDecay: "Pulls the LoRA's weights slightly toward zero at every update, which can curb overfitting. 0 turns it off.",
+  autoFrames: "Trains each clip at its own full length, up to 241 frames (10 s), instead of cutting longer ones to one clip length; none is ever sped up or slowed down. VRAM is set by the longest clip, so long clips need more of it.",
   checkpointing: "Recomputes parts of the model during the backward pass instead of keeping them in VRAM: much less VRAM for somewhat slower steps. Leave it on unless the VRAM projection shows room to spare.",
   keepAlpha: "Images with an alpha channel train as RGBA, so the LoRA keeps their transparency. Off, they're composited over white.",
   sampleAtStart: "Renders the sample prompts before the first update, so they show the base model: a baseline to compare the later samples with.",
@@ -110,6 +114,37 @@ function load<T>(k: string): T | null {
   try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch { return null; }
 }
 
+/** What the form starts from to duplicate or edit a job: its config's names, profile (found by name), settings
+ * and datasets. */
+export function formOf(cfg: any, profiles: Profile[]) {
+  return {
+    name: cfg.name, output_name: cfg.output_name || "", profile_id: profiles.find((p) => p.name === cfg.profile_name)?.id,
+    settings: cfg.settings,
+    // jobs from before per-dataset settings use the job's resolution, flip and dropout for every dataset
+    datasets: cfg.datasets.map((d: any) => ({
+      id: d.id, repeats: d.repeats, resolution: d.resolution ?? cfg.settings.resolution,
+      flip: d.flip ?? cfg.settings.flip, caption_dropout: d.caption_dropout ?? cfg.settings.caption_dropout,
+    })),
+  };
+}
+
+// a job being edited: the form's starting point, its profile's name, and the steps it has trained
+type Edit = { id: string; job: ReturnType<typeof formOf> & { gpu: string }; profileName: string; done: number };
+
+/** The Create Job form filled in with a job's settings, saving them back to the job. */
+export function EditJob({ id, families }: { id: string; families: Family[] }) {
+  const [edit, setEdit] = useState<Edit | null>(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    Promise.all([api.get<JobDetail>(`/api/jobs/${id}`), api.get<Profile[]>("/api/profiles")]).then(([job, profiles]) =>
+      setEdit({ id, job: { ...formOf(job.config, profiles), gpu: job.gpu }, profileName: job.config.profile_name,
+        done: job.status_detail?.step || 0 }), (e) => setError(e.message));
+  }, [id]);
+  if (error) return <div className="page"><div className="error-box">{error}</div></div>;
+  if (!edit) return <div className="page"><div className="muted">Loading…</div></div>;
+  return <CreateJob families={families} edit={edit} />;
+}
+
 /** A job's training resolutions: the setting is one number, or a list of them. */
 export const resList = (v: unknown): number[] =>
   [...new Set((Array.isArray(v) ? v : [v]).map(Number).filter((n) => n > 0))].sort((a, b) => a - b);
@@ -143,11 +178,14 @@ type DsCard = { id: string; repeats: number; resolution: number | number[]; flip
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
-/** The health check of a dataset card's dataset, for this model at the card's resolutions (music: clip length). */
-function CardCheck({ id, resolution, family, frames, seconds }: {
-  id: string; resolution: unknown; family?: string; frames: number; seconds?: number;
+/** The health check of a dataset card's dataset, for this model at the card's resolutions (music: clip length);
+ * ``onLongest`` hears its longest clip's frames. */
+function CardCheck({ id, resolution, family, frames, seconds, auto, onLongest }: {
+  id: string; resolution: unknown; family?: string; frames: number; seconds?: number; auto?: boolean;
+  onLongest?: (id: string, frames: number) => void;
 }) {
-  const { result, loading } = useDatasetCheck(id, { resolution: seconds == null ? resList(resolution).join(",") : "", family, frames, seconds });
+  const { result, loading } = useDatasetCheck(id, { resolution: seconds == null ? resList(resolution).join(",") : "", family, frames, seconds, auto });
+  useEffect(() => { if (result) onLongest?.(id, result.longest_clip || 0); }, [result]);
   if (!result) return loading ? <div className="faint small">Checking the dataset…</div> : null;
   return <div style={{ opacity: loading ? 0.5 : 1 }}><CheckIssues result={result} compact /></div>;
 }
@@ -164,21 +202,22 @@ function Sel(props: { label: string; v: string; on: (s: string) => void; opts: [
   );
 }
 
-export default function CreateJob({ families }: { families: Family[] }) {
+export default function CreateJob({ families, edit }: { families: Family[]; edit?: Edit }) {
   const toast = useToast();
   const [profiles] = usePoll<Profile[]>("/api/profiles", 0);
   const [datasets] = usePoll<Dataset[]>("/api/datasets", 0);
   const [sys] = usePoll<{ gpus: Gpu[]; ram?: SystemRam }>("/api/system", 0);
 
   const clone = useMemo(() => {
+    if (edit) return edit.job;
     const c = load<any>(CLONE_KEY);
     localStorage.removeItem(CLONE_KEY);
     return c;
   }, []);
   const last = clone || load<any>(STORE);
 
-  const [name, setName] = useState(clone ? clone.name + " v2" : "");
-  const [outName, setOutName] = useState("");
+  const [name, setName] = useState(edit ? clone.name : clone ? clone.name + " v2" : "");
+  const [outName, setOutName] = useState(edit ? clone.output_name : "");
   const [profileId, setProfileId] = useState<string>(last?.profile_id || "");
   const [gpu, setGpu] = useState<string>(last?.gpu || "auto");
   const [s, setS] = useState<S>(() => {
@@ -209,6 +248,8 @@ export default function CreateJob({ families }: { families: Family[] }) {
   });
   const setCard = (i: number, patch: Partial<Card>) => setCards((cs) => cs.map((c, j) => (j === i ? { ...c, ...patch } : c)));
   const [busy, setBusy] = useState(false);
+  // saving an edit that starts a job that has trained again from step 0: why, to confirm
+  const [restartAsk, setRestartAsk] = useState("");
   const set = (k: string) => (v: any) => setS((x) => ({ ...x, [k]: v }));
 
   const profile = profiles?.find((p) => p.id === profileId);
@@ -278,9 +319,20 @@ export default function CreateJob({ families }: { families: Family[] }) {
   // section numbers, after the slider's own section when there is one
   const num = (n: number) => String(n + (slider && n > 1 ? 1 : 0)).padStart(2, "0");
   const epochs = perEpoch ? (s.steps * s.batch_size * s.grad_accum) / perEpoch : 0;
+  // an Auto clip length trains each clip whole, so the longest one (as the datasets' health checks find it) sets
+  // the VRAM; until they're in, the most a clip trains at
+  const [longest, setLongest] = useState<Record<string, number>>({});
+  const noteLongest = (id: string, frames: number) => setLongest((m) => (m[id] === frames ? m : { ...m, [id]: frames }));
+  const autoFrames = !!s.auto_frames;
+  const longestKnown = chosen.every((c) => longest[c.id] != null);
+  const longestClip = Math.min(MAX_CLIP_FRAMES, Math.max(0, ...chosen.map((c) => longest[c.id] || 0)));
+  const clipFrames = autoFrames ? (longestKnown ? Math.max(1, longestClip) : MAX_CLIP_FRAMES) : s.num_frames;
+  // turning Auto off keeps the length it showed
+  const setAutoFrames = (on: boolean) => setS((x) => ({ ...x, auto_frames: on,
+    ...(!on && longestKnown && longestClip ? { num_frames: Math.max(5, longestClip) } : {}) }));
   const missingCaps = chosen.reduce((n, c) => n + c.d.count - c.d.captioned, 0);
 
-  const submit = async () => {
+  const submit = async (restart = false) => {
     // the first dataset's resolution, flip and dropout are remembered as the starting point for new ones
     const first = chosen[0];
     const settings = {
@@ -290,21 +342,30 @@ export default function CreateJob({ families }: { families: Family[] }) {
       ...(first ? { resolution: first.resolution, flip: first.flip, caption_dropout: first.caption_dropout }
         : rendered ? { resolution: dsCards[0].resolution } : {}),
     };
+    const job = {
+      name: name.trim() || `${profile?.name || "job"} ${new Date().toLocaleDateString()}`,
+      output_name: outName.trim(),
+      profile_id: profileId,
+      gpu,
+      datasets: chosen.map((c) => ({ id: c.id, repeats: c.repeats, resolution: c.resolution, flip: c.flip, caption_dropout: c.caption_dropout })),
+      settings,
+    };
     setBusy(true);
     try {
-      await api.post("/api/jobs", {
-        name: name.trim() || `${profile?.name || "job"} ${new Date().toLocaleDateString()}`,
-        output_name: outName.trim(),
-        profile_id: profileId,
-        gpu,
-        datasets: chosen.map((c) => ({ id: c.id, repeats: c.repeats, resolution: c.resolution, flip: c.flip, caption_dropout: c.caption_dropout })),
-        settings,
-      });
-      localStorage.setItem(STORE, JSON.stringify({ profile_id: profileId, gpu, settings }));
-      toast("Job added to the queue");
-      go("queue");
+      if (edit) {
+        await api.put(`/api/jobs/${edit.id}`, { ...job, restart });
+        toast(restart ? "Saved; the job starts again from step 0"
+          : edit.done > 0 ? `Changes saved; it carries on from step ${edit.done}` : "Changes saved");
+        go("queue", edit.id);
+      } else {
+        await api.post("/api/jobs", job);
+        localStorage.setItem(STORE, JSON.stringify({ profile_id: profileId, gpu, settings }));
+        toast("Job added to the queue");
+        go("queue");
+      }
     } catch (e: any) {
-      toast(e.message, true);
+      if (edit && e.status === 409) setRestartAsk(e.message);
+      else toast(e.message, true);
     } finally {
       setBusy(false);
     }
@@ -329,7 +390,7 @@ export default function CreateJob({ families }: { families: Family[] }) {
     low_vram: lowVram,
     // low VRAM samples without the VAE, unless a card's images (a first frame, references) need it
     sample_prompts: lowVram ? fromCards(cards).filter((c) => c.images).map((c) => ({ images: c.images })) : [],
-    ...(isVideo ? { num_frames: s.num_frames, sample_frames: s.sample_frames } : {}),
+    ...(isVideo ? { num_frames: clipFrames, sample_frames: s.sample_frames } : {}),
     ...(isAudio ? { clip_seconds: s.clip_seconds, sample_seconds: s.sample_seconds } : {}),
   }, "train");
   const target = gpuTarget(sys?.gpus, gpu);
@@ -338,10 +399,20 @@ export default function CreateJob({ families }: { families: Family[] }) {
   return (
     <div className="page">
       <div className="page-head">
-        <div>
-          <h1>Create Job</h1>
-          <p>Configure a LoRA training run and add it to the queue.</p>
-        </div>
+        {edit ? (
+          <div style={{ minWidth: 0 }}>
+            <div className="small"><a href="#/queue">Queue</a> <span className="faint">/</span> <a href={`#/queue/${edit.id}`}>{edit.job.name}</a> <span className="faint">/</span></div>
+            <h1>Edit job</h1>
+            <p>{edit.done > 0
+              ? `It has trained ${plural(edit.done, "step")}, and carries on from its last save with your changes. Changing its model, network (LoRA or LoKr, rank, alpha), optimizer or slider starts it again from step 0 instead, as does changing what the checkpoint picker or concept bleed check scores while it's on (with the picker on, that includes the datasets, resolution, clip length and seed).`
+              : "Change its settings before it trains."}</p>
+          </div>
+        ) : (
+          <div>
+            <h1>Create Job</h1>
+            <p>Configure a LoRA training run and add it to the queue.</p>
+          </div>
+        )}
       </div>
 
       <div className="grid create-layout" style={{ gridTemplateColumns: "minmax(0,1fr) 300px", alignItems: "start" }}>
@@ -360,6 +431,7 @@ export default function CreateJob({ families }: { families: Family[] }) {
                     {profiles?.map((p) => <option key={p.id} value={p.id}>{p.name}{p.name === families.find((f) => f.id === p.family)?.label ? "" : ` · ${families.find((f) => f.id === p.family)?.label || p.family}`}</option>)}
                   </select>
                 )}
+                {edit && !edit.job.profile_id && <span className="help">This job's profile, {edit.profileName}, is gone; it trains with the one chosen here.</span>}
               </label>
               <Sel label="GPU" info={INFO.gpu} v={gpu} on={setGpu} opts={[["auto", "Auto (queue decides)"], ...(sys?.gpus || []).map((g) => [String(g.index), `GPU ${g.index} · ${g.name.replace("NVIDIA GeForce ", "")}`] as [string, string])]} />
               {family && (
@@ -498,7 +570,7 @@ export default function CreateJob({ families }: { families: Family[] }) {
                         )}
                         {!isAudio && <Resolutions v={c.resolution} on={(v) => setDsCard(i, { resolution: v })} video={isVideo && (!d || d.videos > 0)} />}
                         {d && <CardCheck id={d.id} resolution={c.resolution} family={family?.id} frames={isVideo ? s.num_frames : 0}
-                          seconds={isAudio ? Number(s.clip_seconds) || 0 : undefined} />}
+                          seconds={isAudio ? Number(s.clip_seconds) || 0 : undefined} auto={isVideo && autoFrames} onLongest={noteLongest} />}
                         <div className="ds-card-opts">
                           {!slider && (
                             <label className="field">
@@ -571,8 +643,19 @@ export default function CreateJob({ families }: { families: Family[] }) {
             </div>
             {isVideo && (
               <div className="grid cols-4" style={{ marginTop: 16 }}>
-                <Num label="Clip length (frames)" v={s.num_frames} on={set("num_frames")} min={5}
-                  help={`At 24 fps, snapped down to ${family?.frame_rule || "a length the model takes"}. Shorter clips use what they have.`} />
+                <div className="field">
+                  <span>Clip length (frames)<Info text={INFO.autoFrames} /></span>
+                  <div className="row" style={{ gap: 10 }}>
+                    <input type="number" min={5} style={{ flex: 1, minWidth: 0 }} disabled={autoFrames}
+                      value={autoFrames ? (longestKnown && longestClip ? longestClip : "") : s.num_frames} placeholder={autoFrames ? "each clip's" : undefined}
+                      onChange={(e) => set("num_frames")(e.target.value === "" ? 0 : Number(e.target.value))} />
+                    <label className="check"><input type="checkbox" checked={autoFrames} onChange={(e) => setAutoFrames(e.target.checked)} /> Auto</label>
+                  </div>
+                  <span className="help">{autoFrames
+                    ? `Each clip trains whole, up to ${MAX_CLIP_FRAMES} frames, snapped down to ${family?.frame_rule || "a length the model takes"}`
+                      + (longestKnown && longestClip ? `; the longest is ${longestClip} (${(longestClip / 24).toFixed(1)} s).` : ".")
+                    : `At 24 fps, snapped down to ${family?.frame_rule || "a length the model takes"}. Shorter clips use what they have; longer ones train their start.`}</span>
+                </div>
                 {firstFrame && (
                   <Num label="First-frame share" v={s.i2v_probability} on={set("i2v_probability")} step={0.05} min={0}
                     help="Share of steps trained with the clip's first frame as a keyframe (image-to-video)." />
@@ -753,12 +836,17 @@ export default function CreateJob({ families }: { families: Family[] }) {
           <div className="kv"><span>Projected VRAM</span><span className={vramPeak && target && vramPeak.total > target.totalGb ? "vram-peak over" : ""}>
             {vramPeak ? `≈ ${vramPeak.total.toFixed(1)} GB` : "—"}{s.offload ? ` · ${s.offload}% offloaded` : ""}{lowVram ? " · low VRAM" : ""}</span></div>
           {!slider && missingCaps > 0 && <div className="validation warning" style={{ marginTop: 10 }}>{missingCaps} file(s) have no caption — they'll train on the trigger word only.</div>}
-          <button className="btn primary" style={{ width: "100%", marginTop: 16, padding: "11px 14px" }} disabled={busy || !profileId || (chosen.length === 0 && !slider) || !sliderReady} onClick={submit}>
-            <IconPlay /> Add to queue
+          <button className="btn primary" style={{ width: "100%", marginTop: 16, padding: "11px 14px" }} disabled={busy || !profileId || (chosen.length === 0 && !slider) || !sliderReady} onClick={() => submit()}>
+            {edit ? <><IconSave /> Save changes</> : <><IconPlay /> Add to queue</>}
           </button>
+          {edit && <button className="btn ghost" style={{ width: "100%", marginTop: 8 }} onClick={() => go("queue", edit.id)}>Cancel</button>}
           {chosen.length === 0 && !slider && <div className="help" style={{ marginTop: 8, textAlign: "center" }}>Choose at least one dataset</div>}
           {!sliderReady && <div className="help" style={{ marginTop: 8, textAlign: "center" }}>Fill in the slider's prompts</div>}
         </div>
+        {restartAsk && (
+          <ConfirmDialog title="Start again from step 0?" danger confirmLabel="Save and start again" message={restartAsk}
+            onClose={() => setRestartAsk("")} onConfirm={() => submit(true)} />
+        )}
       </div>
     </div>
   );

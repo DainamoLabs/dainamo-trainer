@@ -170,6 +170,9 @@ class YuE2Driver(FamilyDriver):
                               sample=True), None
 
     # --- vae ------------------------------------------------------------------------------------------
+    def cache_inputs(self, kind: str, settings: dict) -> dict:
+        return {"files": [self.profile["diffusion_model"]]}  # the composer and the VAE are in the checkpoint
+
     def load_vae(self):
         if self.vae is not None:
             return

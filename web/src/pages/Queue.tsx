@@ -1,15 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { go } from "../App";
-import { api, fmtDuration, fmtTime, type DiskUse, type Job, type JobDetail } from "../api";
+import { api, fmtDuration, fmtTime, type DiskUse, type Job, type JobDetail, type JobDiskUse } from "../api";
 import { EvalPanel } from "../components/EvalPanel";
 import { EvaluateDialog } from "../components/EvalSettings";
 import { HardwareCards } from "../components/Hardware";
 import { LossChart } from "../components/LossChart";
-import { IconCamera, IconCopy, IconDown, IconDownload, IconImages, IconPlay, IconRefresh, IconSave, IconStop, IconTarget, IconTrash, IconUp } from "../components/icons";
+import { IconCamera, IconCopy, IconDown, IconDownload, IconEdit, IconImages, IconPlay, IconRefresh, IconSave, IconStop, IconTarget, IconTrash, IconUp } from "../components/icons";
 import { ConfirmDialog, Lightbox, Modal, StatusPill, fmtSize, usePoll, useToast } from "../components/ui";
 import { SamplesPanel } from "../components/Samples";
 import { Terminal } from "../components/Terminal";
-import { CLONE_KEY } from "./CreateJob";
+import { CLONE_KEY, formOf } from "./CreateJob";
 
 const PHASES: Record<string, string> = {
   starting: "Starting", preparing: "Scanning datasets", caching_text: "Encoding captions", caching_latents: "Encoding training files",
@@ -34,15 +34,7 @@ function useJobAction() {
 async function cloneJob(id: string) {
   const cfg = await api.get<any>(`/api/jobs/${id}/config`);
   const profiles = await api.get<any[]>("/api/profiles");
-  const prof = profiles.find((p) => p.name === cfg.profile_name);
-  localStorage.setItem(CLONE_KEY, JSON.stringify({
-    name: cfg.name, profile_id: prof?.id, settings: cfg.settings, gpu: "auto",
-    // jobs from before per-dataset settings use the job's resolution, flip and dropout for every dataset
-    datasets: cfg.datasets.map((d: any) => ({
-      id: d.id, repeats: d.repeats, resolution: d.resolution ?? cfg.settings.resolution,
-      flip: d.flip ?? cfg.settings.flip, caption_dropout: d.caption_dropout ?? cfg.settings.caption_dropout,
-    })),
-  }));
+  localStorage.setItem(CLONE_KEY, JSON.stringify({ ...formOf(cfg, profiles), gpu: "auto" }));
   go("create");
 }
 
@@ -51,7 +43,8 @@ const FINISHED = ["completed", "stopped", "failed", "interrupted"];
 /** What a job's folder holds on disk, with clearing what can be made again (or isn't needed any more). */
 function DiskCard({ job }: { job: JobDetail }) {
   const toast = useToast();
-  const [disk, reload] = usePoll<DiskUse>(`/api/jobs/${job.id}/disk`, 0, [job.status]);
+  // while it runs, the shared cache's files it uses grow as it encodes them
+  const [disk, reload] = usePoll<JobDiskUse>(`/api/jobs/${job.id}/disk`, job.status === "running" ? 10000 : 0, [job.status]);
   const [confirm, setConfirm] = useState<"cache" | "state" | null>(null);
   if (!disk) return null;
   const finished = FINISHED.includes(job.status) && !job.config?.evaluate;
@@ -67,7 +60,9 @@ function DiskCard({ job }: { job: JobDetail }) {
   const rows: [string, number, React.ReactNode][] = [
     ["LoRA checkpoints", disk.output, null],
     ["Samples", disk.samples, null],
-    ["Cached captions and latents", disk.cache, finished && disk.cache > 0 && <button className="btn sm" onClick={() => setConfirm("cache")}>Clear</button>],
+    // a job's own cache is from before caches were shared between jobs
+    ...(disk.cache > 0 ? [["Cached captions and latents (its own, from before they were shared)", disk.cache,
+      finished && <button className="btn sm" onClick={() => setConfirm("cache")}>Clear</button>] as [string, number, React.ReactNode]] : []),
     ["Training state (to resume or continue)", disk.state,
       job.status === "completed" && finished && disk.state > 0 && <button className="btn sm" onClick={() => setConfirm("state")}>Delete</button>],
     ["Log, metrics and status", disk.other, null],
@@ -78,9 +73,15 @@ function DiskCard({ job }: { job: JobDetail }) {
       {rows.map(([label, size, action]) => (
         <div className="kv" key={label}><span>{label}</span><span className="row" style={{ gap: 10 }}>{fmtSize(size)}{action}</span></div>
       ))}
+      {disk.shared > 0 && (
+        <div className="help" style={{ marginTop: 10 }}>
+          It also uses {fmtSize(disk.shared)} of encoded captions and latents in the cache jobs share (not counted above). Any
+          job encoding the same files the same way reuses them; Clear caches on the Queue page frees what no queued or running job uses.
+        </div>
+      )}
       {confirm === "cache" && (
         <ConfirmDialog title="Clear the cache" confirmLabel={`Free ${fmtSize(disk.cache)}`} onClose={() => setConfirm(null)} onConfirm={() => clean("cache")}
-          message="The encoded captions and images are deleted. If this job continues or is evaluated, they're encoded again first, which loads the text encoder and VAE." />
+          message="Its own encoded captions and images are deleted. Jobs now use the shared cache instead, so if this job continues or is evaluated, they're encoded there first (unless another job already has)." />
       )}
       {confirm === "state" && (
         <ConfirmDialog title="Delete the training state" danger confirmLabel={`Free ${fmtSize(disk.state)}`} onClose={() => setConfirm(null)} onConfirm={() => clean("state")}
@@ -247,7 +248,8 @@ function JobDetailView({ id }: { id: string }) {
 
   if (!job) return <div className="page"><div className="muted">Loading…</div></div>;
   const st = job.status_detail || ({} as JobDetail["status_detail"]);
-  const total = st.total_steps || job.config?.settings?.steps || 0;
+  // the job's own step count (an edited or continued job shows its new one before it starts again)
+  const total = job.config?.settings?.steps || st.total_steps || 0;
   const running = job.status === "running";
   const evaluating = !!job.config?.evaluate; // queued or running for a checkpoint evaluation
   const slider = !!job.config?.settings?.slider_enabled;
@@ -280,6 +282,9 @@ function JobDetailView({ id }: { id: string }) {
             <button className="btn" title="Score the saved checkpoints with the checkpoint picker and/or concept bleed, and recommend one" onClick={() => setEvaluate(true)}><IconTarget /> Evaluate checkpoints</button>
           )}
           {!running && job.status !== "queued" && job.status !== "stopping" && <button className="btn" onClick={() => act(job, "restart", reload)}><IconRefresh /> Restart</button>}
+          {!running && job.status !== "stopping" && !evaluating && (
+            <button className="btn" title="Change this job's settings" onClick={() => go("edit", job.id)}><IconEdit /> Edit</button>
+          )}
           {!running && <button className="btn" onClick={() => cloneJob(job.id)}><IconCopy /> Duplicate</button>}
         </div>
       </div>
@@ -343,15 +348,17 @@ export default function Queue({ jobId }: { jobId: string }) {
 
 function QueueList({ jobs, reload }: { jobs: Job[] | null; reload: () => void }) {
   const toast = useToast();
-  const [disk, reloadDisk] = usePoll<{ jobs: Record<string, DiskUse>; total: DiskUse }>("/api/disk", 0, [jobs?.length]);
+  type SharedCache = { total: number; in_use: number };
+  const [disk, reloadDisk] = usePoll<{ jobs: Record<string, DiskUse>; total: DiskUse; shared_cache: SharedCache }>("/api/disk", 0, [jobs?.length]);
   const [confirmClean, setConfirmClean] = useState(false);
-  // what clearing would free: the caches of finished jobs
-  const clearable = (jobs || []).filter((j) => FINISHED.includes(j.status) && !j.evaluating)
+  const shared = disk?.shared_cache || { total: 0, in_use: 0 };
+  // what clearing would free: the shared cache but what queued and running jobs use, and finished jobs' own caches
+  const clearable = shared.total - shared.in_use + (jobs || []).filter((j) => FINISHED.includes(j.status) && !j.evaluating)
     .reduce((n, j) => n + (disk?.jobs[j.id]?.cache || 0), 0);
   const clean = async () => {
     try {
       const r = await api.post<{ freed: number; jobs: number }>("/api/disk/clean", { parts: ["cache"] });
-      toast(`Freed ${fmtSize(r.freed)} from ${r.jobs} job${r.jobs === 1 ? "" : "s"}`);
+      toast(`Freed ${fmtSize(r.freed)}`);
       reloadDisk();
     } catch (e: any) {
       toast(e.message, true);
@@ -370,15 +377,16 @@ function QueueList({ jobs, reload }: { jobs: Job[] | null; reload: () => void })
         <button className="btn primary" onClick={() => go("create")}>New job</button>
       </div>
       <HardwareCards />
-      {disk && disk.total.total > 0 && (
+      {disk && disk.total.total + shared.total > 0 && (
         <div className="row wrap small queue-disk">
-          <span className="muted">Jobs use {fmtSize(disk.total.total)} on disk: {fmtSize(disk.total.output)} of LoRAs, {fmtSize(disk.total.cache)} of cached captions and latents, {fmtSize(disk.total.state)} of training state.</span>
-          {clearable > 0 && <button className="btn sm" onClick={() => setConfirmClean(true)}>Clear caches of finished jobs</button>}
+          <span className="muted">Jobs use {fmtSize(disk.total.total + shared.total)} on disk: {fmtSize(disk.total.output)} of LoRAs, {fmtSize(shared.total + disk.total.cache)} of
+            cached captions and latents (shared between jobs that encode them the same way), {fmtSize(disk.total.state)} of training state.</span>
+          {clearable > 0 && <button className="btn sm" onClick={() => setConfirmClean(true)}>Clear caches</button>}
         </div>
       )}
       {confirmClean && (
         <ConfirmDialog title="Clear caches" confirmLabel={`Free ${fmtSize(clearable)}`} onClose={() => setConfirmClean(false)} onConfirm={clean}
-          message="The encoded captions and images of finished jobs are deleted. A job that continues or is evaluated encodes them again first. Checkpoints, samples and training state stay." />
+          message="The encoded captions and images that no queued or running job is using are deleted. A job that needs them again encodes them again first. Checkpoints, samples and training state stay." />
       )}
       {jobs && jobs.length === 0 && <div className="empty"><strong>Nothing in the queue</strong><a href="#/create">Create a job →</a></div>}
       {[["In progress", running], ["Queued", queued], ["Finished", done]].map(([title, list]) =>

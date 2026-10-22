@@ -191,10 +191,12 @@ def thumb(path: str, size: int = 384):
 
 
 @router.get("/datasets/{did}/check")
-def check_dataset(did: str, resolution: str = "", family: str = "", frames: int = 0, seconds: int = -1):
+def check_dataset(did: str, resolution: str = "", family: str = "", frames: int = 0, seconds: int = -1,
+                  auto: bool = False):
     """Health check (``dataset_check``) for training at ``resolution`` (comma-separated sizes) with a
-    model ``family``; ``frames`` is the clip length for video models (blank: the family's default), and
-    ``seconds`` a music model's (0: whole songs; -1: the family's default)."""
+    model ``family``; ``frames`` is the clip length for video models (blank: the family's default; ``auto``:
+    each clip at its own length, up to the longest a clip trains at), and ``seconds`` a music model's (0: whole
+    songs; -1: the family's default)."""
     d = dataset_or_404(did)
     F = family_or_400(family) if family else None
     if F and "audio" in F.info.media:
@@ -202,13 +204,12 @@ def check_dataset(did: str, resolution: str = "", family: str = "", frames: int 
         return dataset_check.check(d["path"], d["trigger"], token_limit=F.caption_tokens, clip_seconds=clip)
     res = resolutions(check_resolution(resolution)) if resolution.strip() else \
         resolutions(F.info.training_defaults.get("resolution", 1024) if F else 1024)
-    video_frames = None
+    video_frames = clip_length = None
     if F and "video" in F.info.media:
-        video_frames = frames or int(F.info.training_defaults.get("num_frames", 39))
-        if F.snap_frames:
-            video_frames = F.snap_frames(video_frames)
+        clip_length = MAX_FRAMES if auto else frames or int(F.info.training_defaults.get("num_frames", 39))
+        video_frames = F.snap_frames(clip_length) if F.snap_frames else clip_length
     return dataset_check.check(d["path"], d["trigger"], res, F.bucket_divisibility if F else 16, video_frames,
-                               F.caption_tokens if F else None)
+                               F.caption_tokens if F else None, clip_length=clip_length, auto_frames=auto)
 
 
 class BulkCaptionIn(BaseModel):

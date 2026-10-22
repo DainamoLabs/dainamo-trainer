@@ -165,7 +165,7 @@ def test_a_job_trains_and_a_finished_one_continues(tmp_path, monkeypatch):
     assert any(v.abs().sum() > 0 for k, v in first.items() if "lora_B" in k)  # it trained
 
     # given more steps, it carries on from step 6; the finished LoRA is kept under its step
-    job["settings"]["steps"] = 12
+    job["settings"].update(steps=12, learning_rate=0.005)  # and a learning rate edited meanwhile
     (job_dir / "job.json").write_text(json.dumps(job))
     assert trainer_mod.Trainer(str(job_dir)).run() == "completed"
     st = json.loads((job_dir / "status.json").read_text())
@@ -178,5 +178,51 @@ def test_a_job_trains_and_a_finished_one_continues(tmp_path, monkeypatch):
     assert all(torch.equal(kept[k], first[k]) for k in first)
     assert not torch.equal(load_file(str(job_dir / "output" / "t.safetensors"))["diffusion_model.blocks.0.lora_B.weight"],
                            first["diffusion_model.blocks.0.lora_B.weight"])
-    steps = [json.loads(line)["step"] for line in (job_dir / "metrics.jsonl").read_text().splitlines()]
-    assert steps == list(range(1, 13))
+    metrics = [json.loads(line) for line in (job_dir / "metrics.jsonl").read_text().splitlines()]
+    assert [m["step"] for m in metrics] == list(range(1, 13))
+    assert [m["lr"] for m in metrics] == [0.01] * 6 + [0.005] * 6  # not the one the saved state started with
+
+
+def test_jobs_share_encodings_and_encode_only_what_changed(tmp_path, monkeypatch):
+    encoded = {"images": 0, "captions": []}
+
+    class Counting(TinyFamily):
+        def encode_prompt(self, prompt):
+            encoded["captions"].append(prompt)
+            return super().encode_prompt(prompt)
+
+        def encode_image(self, pixels):
+            encoded["images"] += 1
+            return super().encode_image(pixels)
+
+    monkeypatch.setattr(trainer_mod, "get_family", lambda name: Counting)
+    data = tmp_path / "train"
+    _images(str(data), [(200, 30, 30), (190, 40, 20)])
+    for i in range(2):
+        (data / f"{i}.txt").write_text(f"photo {i}")
+
+    def run(name):
+        """A job on the dataset -> what it encoded."""
+        encoded.update(images=0, captions=[])
+        job_dir = tmp_path / name
+        job_dir.mkdir()
+        (job_dir / "job.json").write_text(json.dumps({
+            "name": name, "family": "tiny", "profile": {}, "cache_dir": str(tmp_path / "cache"),
+            "datasets": [{"path": str(data), "trigger": "", "repeats": 1, "resolution": 64}],
+            "settings": {"steps": 2, "rank": 2, "alpha": 2, "resolution": 64, "seed": 1, "optimizer": "adamw",
+                         "learning_rate": 0.01, "sample_every": 0}}))
+        assert trainer_mod.Trainer(str(job_dir)).run() == "completed"
+        return dict(encoded)
+
+    first = run("a")
+    assert first["images"] == 2 and {"photo 0", "photo 1"} <= set(first["captions"])
+    assert run("b") == {"images": 0, "captions": []}  # another job on the same dataset encodes nothing
+    (data / "1.txt").write_text("photo 1, red")  # a caption changes and an image is added
+    Image.new("RGB", (64, 64), (10, 20, 200)).save(data / "2.png")
+    (data / "2.txt").write_text("photo 2")
+    third = run("c")
+    assert third["images"] == 1 and sorted(third["captions"]) == ["photo 1, red", "photo 2"]
+    # each job lists the cache files it uses, so clearing the cache spares them while it runs
+    used = json.loads((tmp_path / "c" / "cache.json").read_text())["files"]
+    assert sum(f.startswith("latents/") for f in used) == 3 and all(os.path.exists(tmp_path / "cache" / f) for f in used)
+    assert not (tmp_path / "c" / "cache").exists()

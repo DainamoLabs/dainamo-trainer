@@ -201,6 +201,12 @@ class LTX25Driver(FamilyDriver):
         return self.encode_condition(prompt, None)
 
     # --- vae ------------------------------------------------------------------------------------------
+    def cache_inputs(self, kind: str, settings: dict) -> dict:
+        if kind == "text":  # the DiT file's text connectors run with the text encoder
+            return {"files": [self.profile["text_encoder"], self.profile["diffusion_model"]]}
+        return {"files": [self.profile["vae"], self.profile.get("audio_vae")],
+                "train_audio": bool(settings.get("train_audio", True))}
+
     def load_vae(self):
         path = self.profile["vae"]
         self.log(f"Loading video VAE {path}")

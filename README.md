@@ -72,7 +72,11 @@ the warning.
   Datasets) for this model and its resolutions, and lists any errors and
   warnings. A video model can mix an image dataset and a clip dataset,
   for example stills at 1024 and clips at 384 and 512: images train as
-  single frames and clips at the clip length. With several resolutions, each
+  single frames and clips at the clip length. A clip shorter than that trains
+  at its own length and a longer one trains its start, never sped up or
+  slowed down. **Auto**, beside the clip length, trains each clip whole
+  instead, up to 241 frames (10 s), like ai-toolkit's Auto Frame Count; VRAM
+  is then set by the longest clip, which the cards' health checks find. With several resolutions, each
   file is trained at each size, bucketed by aspect ratio, which helps the LoRA
   work across sizes, and the smaller steps are faster. A file too small for a
   larger size isn't upscaled or counted twice. VRAM is set by the biggest step
@@ -97,7 +101,17 @@ the warning.
   loading, warnings and errors. It follows new output unless you scroll up,
   can fill the window, and the full log can be downloaded. You can stop a job
   (it saves its state), resume it, restart it from scratch, ask for samples
-  or a checkpoint now, or duplicate its settings into a new job.
+  or a checkpoint now, or duplicate its settings into a new job. **Edit**
+  opens a job that isn't running in the Create Job form. Before it trains, any
+  setting can change. Once it has, it carries on from its last save with the
+  changes, which its log notes: its datasets, clip length, resolution, batch
+  size, learning rate and schedule, steps, samples and memory settings can all
+  change mid-run. Its model, network (LoRA or LoKr, rank, alpha), optimizer
+  and slider can't, since the saved state wouldn't fit them, and while the
+  checkpoint picker or concept bleed check is on, neither can what it scores
+  (for the picker, that includes the datasets, resolution, clip length and
+  seed), since earlier scores wouldn't compare. Changing one of these starts the
+  job again from step 0 (after asking).
   **Continue training** gives a finished job more steps: it picks up from its
   last step with the same optimizer state and cached captions and images, and
   its final LoRA so far is kept as `name_002000.safetensors` (which "keep last
@@ -106,12 +120,19 @@ the warning.
   full-size view) loads its prompt, seed, size, the sampler training samples use
   (the profile's steps and CFG, Euler) and the checkpoint from that step (or the
   nearest saved one) into the Sandbox, so Generate re-creates it.
-  **Disk use** shows what a job's folder holds: checkpoints, samples, cached
-  captions and latents, and the training state. A finished job's cache can be
-  cleared (it's made again if the job continues or is evaluated), and a
-  completed job's training state deleted (it can't continue afterwards). The
-  Queue page shows the total, each job's size, and clears the caches of all
-  finished jobs at once.
+  Encoded captions and latents go to a cache that jobs share (`data/cache/`).
+  A job reuses what another encoded with the same VAE or text encoder files
+  and the same settings, whichever diffusion model each trains, and encodes
+  only the files and captions that are new or changed. Model files are known
+  by their contents (a few MB read across each), so a copy elsewhere counts as
+  the same file, but another precision or a fine-tune doesn't. LTX's captions
+  also depend on its DiT file (its text connectors), and YuE2's checkpoint
+  holds its composer and VAE. **Disk use** shows what a job's folder holds:
+  checkpoints, samples and the training state (and its own cache, for jobs
+  from before caches were shared). A completed job's training state can be
+  deleted (it can't continue afterwards). The Queue page shows the total, each
+  job's size and the shared cache's, and clears the cache of everything no
+  queued or running job is using.
   Sample prompts are cards: each one can set its own width, height, seed and
   LoRA strength, or leave them blank to use the Sampling defaults.
 - **Sandbox**: generate with a profile and any LoRAs to test them. Pick a
@@ -196,7 +217,8 @@ the warning.
   - captions longer than the model reads (Krea 2 and MiniMax H3 read 512
     tokens, LTX 2.5 1024);
   - two files sharing one caption (a.png and a.jpg);
-  - clips shorter than the clip length;
+  - clips shorter or longer than the clip length (a longer one trains only its
+    start);
   - notes: captions without the trigger word, caption files with no image,
     and how many videos a split dataset's clips were cut from.
 
@@ -587,8 +609,9 @@ generations.
 ## Split into clips (video models)
 
 A video model trains on the start of each clip, up to the job's clip length
-(39 frames, 1.6 s, by default for MiniMax H3), so most of a long video is never
-used, and VRAM limits how long a clip can be. **Split into clips**, on the page
+(39 frames, 1.6 s, by default for MiniMax H3, or with Auto each clip whole up to
+10 s), so most of a long video is never used, and VRAM limits how long a clip
+can be. **Split into clips**, on the page
 of a dataset with videos, makes a new dataset with each video cut into clips
 that a job trains on whole. The original dataset is left as it is.
 
@@ -999,7 +1022,15 @@ a short job trains, saves and finishes, then continues to more steps (keeping
 its finished LoRA, which "keep last N" spares). Evaluate checkpoints scores
 every checkpoint and the base model the same way twice, leaves the job's own
 results as they were, and a stopped or failed evaluation keeps what it had
-scored.
+scored. Jobs on the same dataset share its encodings: a second job encodes
+nothing, and after a caption changes and an image is added, a third encodes
+just those.
+
+`tests/test_cache.py` checks which model files and settings make the shared
+cache's folders (another checkpoint with the same VAE and text encoder shares
+them; another text encoder, family or Qwen-Image alpha setting doesn't; LTX's
+captions follow its DiT; YuE2's checkpoint holds both) and that a model file is
+known by its contents wherever it is.
 
 `tests/test_slider.py` checks the slider step: the base model's three
 predictions run with the LoRA off and without gradients, the LoRA trains at the
@@ -1090,7 +1121,8 @@ check, sign-in (cookie, bearer key, `?key=` links, password changes), the
 notification messages for each service against a local webhook, the outcome
 of jobs that ended while the server was down, queueing a checkpoint evaluation
 and putting the job back afterwards (finished, cancelled or killed), giving a
-finished job more steps, disk use and clearing caches and training state,
+finished job more steps, editing jobs (and which changes keep their progress),
+disk use and clearing caches (sparing what running jobs use) and training state,
 bulk caption edits (preview, whole words, regular expressions, undo), turning
 a training sample into Sandbox settings, and finding and killing worker
 processes with their children.

@@ -119,10 +119,14 @@ def _plural(n: int, word: str, many: str | None = None) -> str:
 
 
 def check(root: str, trigger: str = "", resolution: list[int] | None = None, div: int = 16,
-          video_frames: int | None = None, token_limit: int | None = None, clip_seconds: int | None = None) -> dict:
+          video_frames: int | None = None, token_limit: int | None = None, clip_seconds: int | None = None,
+          clip_length: int | None = None, auto_frames: bool = False) -> dict:
     """``resolution``: the sizes it will train at; ``video_frames``: the clip length when the model trains
-    on clips (None: an image model); ``token_limit``: caption tokens the model reads; ``clip_seconds``: a
-    music model's clip length (0: whole songs; None: not a music model, which ``resolution`` etc. are then for)."""
+    on clips (None: an image model), snapped to one it takes, and ``clip_length`` the one asked for (default
+    ``video_frames``), or with ``auto_frames`` the longest a clip trains at, each training at its own length;
+    ``token_limit``: caption tokens the model reads; ``clip_seconds``: a music model's clip length (0: whole
+    songs; None: not a music model, which ``resolution`` etc. are then for). The result's ``longest_clip`` is
+    the longest clip's frames at 24 fps."""
     files = list_media(root) if os.path.isdir(root) else []
     rel = {f: os.path.relpath(f, root) for f in files}
     issues: list[dict] = []
@@ -177,18 +181,25 @@ def check(root: str, trigger: str = "", resolution: list[int] | None = None, div
                 "for many, pick a smaller resolution or use larger sources.",
                 [f for f in used if any(f in fs for fs in small.values())])
 
+    frames = {f: int(infos[f]["seconds"] * FPS + 1e-3) for f in clips}  # as the trainer counts them
     if video_frames:
         need = video_frames / FPS
-        frames = {f: int(infos[f]["seconds"] * FPS + 1e-3) for f in clips}  # as the trainer counts them
         short = [f for f in clips if frames[f] < video_frames]
         too_short = [f for f in short if frames[f] < 2]
         if too_short:
             add("clip_too_short", "error", f"{_plural(len(too_short), 'clip')} too short to use",
                 "Under two frames at 24 fps; they're skipped.", too_short)
         rest = [f for f in short if f not in too_short]
-        if rest:
+        if rest and not auto_frames:  # with auto, every clip trains at its own length
             add("short_clips", "info", f"{_plural(len(rest), 'clip')} shorter than {video_frames} frames ({need:.1f} s)",
                 "They train at their own, shorter length.", rest)
+        limit = clip_length or video_frames
+        long = [f for f in clips if frames[f] > limit]
+        if long:
+            add("long_clips", "info", f"{_plural(len(long), 'clip')} longer than {limit} frames ({limit / FPS:.1f} s)",
+                f"Only their first {limit / FPS:.1f} s train" + (", the longest a clip trains at" if auto_frames else
+                                                                  "; an Auto clip length trains each whole, up to 10 s")
+                + ". Split into clips (on the dataset's page) cuts them into clips that train whole.", long)
         cut = split_clips(root)
         grouped = [f for f in clips if os.path.normpath(f) in cut]
         if grouped:
@@ -260,7 +271,7 @@ def check(root: str, trigger: str = "", resolution: list[int] | None = None, div
     order = {"error": 0, "warning": 1, "info": 2}
     issues.sort(key=lambda i: order[i["level"]])
     return {"files": len(files), "images": sum(1 for f in ok if infos[f]["kind"] == "image"), "videos": len(clips),
-            "audio": len(songs), "issues": issues}
+            "audio": len(songs), "issues": issues, "longest_clip": max(frames.values(), default=0)}
 
 
 def _check_songs(add, songs: list[str], infos: dict, clip_seconds: int):

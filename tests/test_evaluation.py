@@ -158,10 +158,11 @@ def test_multi_resolution_items_cache_keys_and_holdout(tmp_path):
                                   ("small.png", 512, (496, 496))]  # the small one isn't counted twice
     assert len(got) == 6  # repeats apply at each size
     assert ds.resolutions(1024) == [1024] and ds.resolutions([1024, 512, 512]) == [512, 1024]
-    # a single-resolution job keeps the cache keys it had before multi-resolution training
+    # an item's cache key: its file (path, size, modified time) and how it's prepared
     one = next(it for it in ds.build_items([{"path": str(tmp_path)}], 1024, 16, False) if it.size == (1168, 880))
     st = os.stat(one.path)
-    assert one.key() == hashlib.sha1(f"{one.path}|{st.st_mtime_ns}|{one.size}|False|1024".encode()).hexdigest()
+    assert one.key() == hashlib.sha1(
+        f"{one.path}|{st.st_size}|{st.st_mtime_ns}|{one.size}|False|1024".encode()).hexdigest()
     train, val = evaluation.split_holdout(got, 1, seed=0)
     assert len(val) == 1 and val[0].resolution == max(it.resolution for it in got if it.path == val[0].path)
     assert not any(t.path == val[0].path for t in train)

@@ -3,7 +3,7 @@ import { api, SIGNED_OUT, type AuthStatus, type Family, type Gpu, type Job, type
 import { useJobAlerts } from "./components/alerts";
 import { IconImages, IconLayers, IconPlus, IconQueue, IconSettings, IconSparkle } from "./components/icons";
 import { usePoll } from "./components/ui";
-import CreateJob from "./pages/CreateJob";
+import CreateJob, { EditJob } from "./pages/CreateJob";
 import Datasets from "./pages/Datasets";
 import Profiles from "./pages/Profiles";
 import Queue from "./pages/Queue";
@@ -11,7 +11,7 @@ import Sandbox from "./pages/Sandbox";
 import SettingsPage from "./pages/Settings";
 import SignIn from "./pages/SignIn";
 
-export type Tab = "create" | "queue" | "sandbox" | "datasets" | "profiles" | "settings";
+export type Tab = "create" | "edit" | "queue" | "sandbox" | "datasets" | "profiles" | "settings";
 
 const TABS: { id: Tab; label: string; icon: React.FC<React.SVGProps<SVGSVGElement>> }[] = [
   { id: "create", label: "Create Job", icon: IconPlus },
@@ -23,7 +23,7 @@ const TABS: { id: Tab; label: string; icon: React.FC<React.SVGProps<SVGSVGElemen
 
 function readHash(): { tab: Tab; arg: string } {
   const [tab, arg] = window.location.hash.replace(/^#\/?/, "").split("/");
-  const ok = ["create", "queue", "sandbox", "datasets", "profiles", "settings"].includes(tab);
+  const ok = ["create", "edit", "queue", "sandbox", "datasets", "profiles", "settings"].includes(tab);
   return { tab: (ok ? tab : "create") as Tab, arg: arg ? decodeURIComponent(arg) : "" };
 }
 
@@ -83,7 +83,7 @@ export default function App() {
         </div>
         <nav className="nav">
           {TABS.map((t) => (
-            <button key={t.id} className={route.tab === t.id ? "active" : ""} onClick={() => go(t.id)}>
+            <button key={t.id} className={(route.tab === "edit" ? "queue" : route.tab) === t.id ? "active" : ""} onClick={() => go(t.id)}>
               <t.icon /> <span>{t.label}</span>
               {t.id === "queue" && active > 0 && <span className="count">{active}</span>}
             </button>
@@ -110,6 +110,7 @@ export default function App() {
       <main className="main">
         <PageError key={route.tab}>
           {route.tab === "create" && <CreateJob families={families} />}
+          {route.tab === "edit" && <EditJob key={route.arg} id={route.arg} families={families} />}
           {route.tab === "queue" && <Queue jobId={route.arg} />}
           {route.tab === "sandbox" && <Sandbox families={families} workflows={system?.workflows || []} gpus={system?.gpus || []} ram={system?.ram} />}
           {route.tab === "datasets" && <Datasets datasetId={route.arg} families={families} />}
