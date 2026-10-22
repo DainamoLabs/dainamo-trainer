@@ -18,8 +18,13 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      # a stalled package mirror once made this take 25 minutes: retry a stalled download sooner, and give up
+      # (failing fast, for a re-run) rather than use up the job's time
       - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends -o Acquire::http::Timeout=10 -o Acquire::Retries=5 ffmpeg
       # PyTorch's CPU build first, so requirements.txt finds it installed instead of fetching the CUDA one
       - name: Install dependencies
         run: |
