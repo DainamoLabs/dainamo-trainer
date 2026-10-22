@@ -26,8 +26,11 @@ import torch
 from ... import comfy_io
 from ...fp8_linear import assert_materialized, materialize
 from ...hf_assets import moss_tokenizer_and_config
-from ..base import FamilyDriver, FamilyInfo, MemoryProfile, ProfileField, count_blocks
+from ..base import Download, FamilyDriver, FamilyInfo, MemoryProfile, ProfileField, count_blocks
 from .model import MossConfig, MossImageDiT
+
+# where the model manager downloads the files from, at the commit they were checked against
+HF_REPO, HF_REV = "Comfy-Org/MOSS-Image", "24147db865fcdc207270f844777587223fed8d6e"
 
 T_TRAIN = 1000
 MAX_TEXT_TOKENS = 4096
@@ -138,6 +141,25 @@ class MossImageDriver(FamilyDriver):
         "text_encoder": ["layers.31.mlp.down_proj.weight", "layers.0.linear_attn.in_proj_qkv.weight"],
         "vae": ["bn.running_mean", "encoder.conv_in.weight"],
     }
+    downloads = [
+        Download("diffusion_model", HF_REPO, "diffusion_models/moss_image_sft_int8_convrot.safetensors", 5_413_698_958,
+                 "SFT · int8 convrot", HF_REV, recommended=True,
+                 sha256="b4d1475bc7eeffd7b809e82ea13a1fba1fb85c4e18365af3813722faa5c0fe4f"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/moss_image_sft_bf16.safetensors", 10_164_655_808,
+                 "SFT · bf16", HF_REV, sha256="f96738d8116d78b7316b57c663d8c98591ddafab7488f48e3099b7655e34ab6f"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/moss_image_base_int8_convrot.safetensors",
+                 5_413_698_958, "Base · int8 convrot", HF_REV,
+                 sha256="f601c1e1161915fb3fea003da0c1782e374dd960fbb3978bc0e4e3fa1f2d8e6f"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/moss_image_base_bf16.safetensors", 10_164_655_808,
+                 "Base · bf16", HF_REV, sha256="cacd158728a1fb9e57c408a922b54752ec71fceb566b3821269927964e62b41f"),
+        Download("text_encoder", HF_REPO, "text_encoders/qwen3.5_9b_int8_convrot.safetensors", 9_748_121_532,
+                 "int8 convrot", HF_REV, recommended=True,
+                 sha256="32e3787472f708fa5f83624acbf5ef23f7fc89c439e05065ea57cfe5a97f025a"),
+        Download("text_encoder", HF_REPO, "text_encoders/qwen3.5_9b_bf16.safetensors", 19_306_312_328, "bf16", HF_REV,
+                 sha256="7e6e9f08d598f829cb940e60ac0c698e1f1c27a47daffd7e598cd78c78b4cc53"),
+        Download("vae", HF_REPO, "vae/flux2-vae.safetensors", 336_211_292, "bf16", HF_REV, recommended=True,
+                 sha256="868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3"),
+    ]
 
     def __init__(self, profile: dict, device: torch.device, log=print):
         super().__init__(profile, device, log)

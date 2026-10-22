@@ -31,6 +31,43 @@ class ProfileField:
 
 
 @dataclass
+class Download:
+    """A file for a profile's path field that the model manager offers to download from Hugging Face, from a pinned
+    commit so it's the file described here. Only files Dainamo can read are listed (no w4a8, GPTQ, w6a8 or mxfp8)."""
+
+    field: str  # the profile field it fills
+    repo: str
+    path: str  # in the repo; its folder is the ComfyUI models folder it goes in
+    size: int  # bytes
+    label: str  # what tells it from the field's other files, e.g. "Turbo · int8 convrot"
+    revision: str
+    sha256: str = ""  # checked once it's downloaded; "" where the repo doesn't publish it (gated repos)
+    folder: str = ""  # the ComfyUI models folder, for a file at the repo's top level
+    gated: bool = False  # Hugging Face wants you signed in, having accepted the model's terms
+    recommended: bool = False  # the one to take when unsure (one per field and variant)
+    variant: str = ""  # the profile variant it's for ("": any)
+    note: str = ""
+
+    @property
+    def id(self) -> str:
+        return f"{self.repo}/{self.path}"
+
+    @property
+    def name(self) -> str:
+        return self.path.rsplit("/", 1)[-1]
+
+    @property
+    def kind_folder(self) -> str:
+        return self.folder or self.path.split("/")[0]
+
+    def to_json(self) -> dict:
+        return {"id": self.id, "field": self.field, "repo": self.repo, "path": self.path, "name": self.name,
+                "size": self.size, "label": self.label, "folder": self.kind_folder, "gated": self.gated,
+                "recommended": self.recommended, "variant": self.variant, "note": self.note,
+                "url": f"https://huggingface.co/{self.repo}"}
+
+
+@dataclass
 class MemoryProfile:
     """Working memory of a family's models for the VRAM projection (``engine.memory``), measured with
     ``scripts/measure_memory.py``. Per-token values count every token of the sequence (image, text
@@ -427,12 +464,34 @@ class FamilyDriver:
     # optional leading dims of signature tensors, for files that share key names with other models'
     # (e.g. Qwen3-VL 4B vs 8B): {field: {key suffix: (dim0, dim1, ...)}}
     signature_shapes: dict[str, dict[str, tuple[int, ...]]] = {}
+    # the files the model manager can download for the path fields
+    downloads: list[Download] = []
+
+    @classmethod
+    def matches(cls, field: str, tensors: dict[str, tuple[str, tuple[int, ...]]]) -> bool:
+        """Whether a file with these tensors ({key: (dtype, shape)}, ``memory.tensors``) has the signature of
+        ``field``'s model (True for a field without one)."""
+        for suffix in cls.signature_keys.get(field, []):
+            if not any(k.endswith(suffix) for k in tensors):
+                return False
+        for suffix, want in cls.signature_shapes.get(field, {}).items():
+            key = next((k for k in tensors if k.endswith(suffix)), None)
+            if key is None:
+                return False
+            dtype, shape = tensors[key]
+            shape = list(shape)
+            if dtype == "U8" and len(shape) == 2:
+                shape[1] *= 2  # nvfp4: two codes per byte
+            if tuple(shape[: len(want)]) != tuple(want):
+                return False
+        return True
 
     @classmethod
     def validate_profile(cls, profile: dict) -> list[dict]:
         """Returns [{field, level: error|warning|ok, message}] without loading weights."""
         import os
-        from ..comfy_io import describe_quant, read_header
+        from ..comfy_io import describe_quant
+        from ..memory import tensors
 
         out = []
         for f in cls.info.profile_fields:
@@ -446,31 +505,15 @@ class FamilyDriver:
             if not os.path.exists(os.path.expanduser(val)):
                 is_hub = not val.startswith(("/", "~", ".")) and val.count("/") >= 2
                 out.append({"field": f.key, "level": "warning" if is_hub else "error",
-                            "message": "Will download from Hugging Face" if is_hub else "File not found"})
+                            "message": "Downloads from Hugging Face on first use, into its cache, where ComfyUI "
+                                       "doesn't look" if is_hub else "File not found"})
                 continue
             try:
-                keys, meta = read_header(os.path.expanduser(val))
+                keys = tensors(val)
             except Exception as e:
                 out.append({"field": f.key, "level": "error", "message": f"Not a readable .safetensors file: {e}"})
                 continue
-            wanted = cls.signature_keys.get(f.key, [])
-            keyset = set(keys)
-            ok = all(any(k.endswith(w) for k in keyset) for w in wanted) if wanted else True
-            if ok and cls.signature_shapes.get(f.key):
-                from safetensors import safe_open
-                with safe_open(os.path.expanduser(val), "pt") as sf:
-                    for suffix, want in cls.signature_shapes[f.key].items():
-                        key = next((k for k in keyset if k.endswith(suffix)), None)
-                        if key is None:
-                            ok = False
-                            continue
-                        sl = sf.get_slice(key)
-                        shape = list(sl.get_shape())
-                        if sl.get_dtype() == "U8" and len(shape) == 2:
-                            shape[1] *= 2  # nvfp4: two codes per byte
-                        if tuple(shape[: len(want)]) != tuple(want):
-                            ok = False
-            if not ok:
+            if not cls.matches(f.key, keys):
                 want = f.hint or f"a {f.label.lower()} for {cls.info.label}"
                 out.append({"field": f.key, "level": "error", "message": f"Wrong file? Expected {want}"})
                 continue
@@ -481,4 +524,11 @@ class FamilyDriver:
                 continue
             msg = f"{len(keys)} tensors" + (f" · {', '.join(sorted(labels))} (ComfyUI)" if labels else "")
             out.append({"field": f.key, "level": "ok", "message": msg})
+        # a Turbo (distilled) model trained without its adapter loses its few-step sampling
+        dm = os.path.basename((profile.get("diffusion_model") or "").strip()).lower()
+        if ("turbo" in dm and any(f.key == "training_adapter" for f in cls.info.profile_fields)
+                and not (profile.get("training_adapter") or "").strip()):
+            out.append({"field": "training_adapter", "level": "warning",
+                        "message": "This looks like a Turbo model: without its training adapter, the LoRA breaks "
+                                   "Turbo's few-step sampling"})
         return out

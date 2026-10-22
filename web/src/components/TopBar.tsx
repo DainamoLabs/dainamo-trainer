@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import type { Tab } from "../App";
 import { fmtDuration, type Gpu, type Job } from "../api";
 import { FINISHED, PHASES } from "../pages/Queue";
 import { Temp } from "./Hardware";
 import { IconAlert, IconImages, IconLayers, IconPlus, IconQueue, IconSettings, IconSparkle } from "./icons";
-import { smooth, useMetrics } from "./LossChart";
+import { Spark } from "./LossChart";
 
 const PAGES: { id: Tab; label: string; icon: React.FC<React.SVGProps<SVGSVGElement>> }[] = [
   { id: "queue", label: "Queue", icon: IconQueue },
@@ -39,21 +39,6 @@ function progressOf(j: Job) {
   const steps = counted ? `${(p.step || 0).toLocaleString()} / ${p.total_steps!.toLocaleString()}` : null;
   const training = !stopping && !j.evaluating && p.phase === "training";
   return { pct, left, meta: [!training && phase, steps, left && `${left} left`].filter(Boolean).join(" · ") };
-}
-
-/** The job's loss so far, smoothed, as a small line. */
-function Spark({ id }: { id: string }) {
-  const points = useMetrics(id, 10000);
-  const d = useMemo(() => {
-    const ps = smooth(points.filter((p) => isFinite(p.loss)), 0.95);
-    if (ps.length < 10) return "";
-    const n = 32;
-    const ys = Array.from({ length: n }, (_, i) => ps[Math.round(((ps.length - 1) * i) / (n - 1))].loss);
-    const lo = Math.min(...ys), hi = Math.max(...ys);
-    return ys.map((v, i) => `${i ? "L" : "M"}${((64 * i) / (n - 1)).toFixed(1)},${(2 + 16 * (1 - (v - lo) / (hi - lo || 1))).toFixed(1)}`).join("");
-  }, [points]);
-  if (!d) return null;
-  return <svg className="tb-spark" viewBox="0 0 64 20" aria-hidden="true"><path d={d} /></svg>;
 }
 
 function Ring({ pct }: { pct: number }) {
@@ -108,7 +93,7 @@ export function TopBar({ tab, arg, jobs, gpus, waiting }: { tab: Tab; arg: strin
             <a className="tb-chip tb-job" href={`#/queue/${encodeURIComponent(job.id)}`} title={`${job.name} · ${prog.meta}`}>
               <span className="tb-live" aria-hidden="true" />
               <span className="tb-text"><span className="tb-name">{job.name}</span><span className="tb-meta">{prog.meta}</span></span>
-              {job.progress.phase === "training" && !job.evaluating && <Spark id={job.id} />}
+              {job.progress.phase === "training" && !job.evaluating && <Spark values={job.loss_curve} className="tb-spark" />}
               {prog.pct != null && <span className="tb-pct">{Math.floor(prog.pct)}%</span>}
               {prog.pct != null && <span className="tb-line" aria-hidden="true"><span style={{ width: `${prog.pct}%` }} /></span>}
             </a>

@@ -38,12 +38,15 @@ from ... import dataset as ds
 from ... import refmod
 from ...fp8_linear import assert_materialized, materialize
 from ...hf_assets import minimax_assets
-from ..base import FamilyDriver, FamilyInfo, MemoryProfile, ProfileField, Workflow
+from ..base import Download, FamilyDriver, FamilyInfo, MemoryProfile, ProfileField, Workflow
 from . import packing as P
 from .audio_vae import MiniMaxH3AudioVAE
 from .text_encoder import TEXT_ENCODER_LAYER, AudioRef, encode_minimax_h3_prompt, trim_caption_tokens
 from .transformer import MiniMaxH3Transformer
 from .vae import MiniMaxH3VideoVAE, RotaryEmbedding3d, IMAGENET_MEAN, IMAGENET_STD
+
+# where the model manager downloads the files from, at the commit they were checked against
+HF_REPO, HF_REV = "Comfy-Org/MiniMax-H3", "e5eb578a89295337b8ff433a035929ce0279e0b6"
 
 MAX_TEXT_TOKENS = 512
 # the checkpoint's float32 islands (and the fp16-stored AdaLN projections, computed in fp32)
@@ -130,6 +133,52 @@ class MinimaxH3Driver(FamilyDriver):
         "vae": ["decoder.x_embedder.weight", "encoder.conv_in.weight"],
         "audio_vae": ["dec_in_proj.weight", "pre_block.attn.qkv.weight"],
     }
+    downloads = [
+        Download("diffusion_model", HF_REPO, "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+                 20_970_379_616, "fl2va · pruned · int8 convrot", HF_REV, recommended=True, variant="fl2va",
+                 sha256="e889202c41dafb67b10d67b97f0d8541508036a6090af23425a5c2615d03c47a"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/minimax_h3_fl2va_pruned_fp8_scaled.safetensors",
+                 20_958_205_608, "fl2va · pruned · fp8 scaled", HF_REV, variant="fl2va",
+                 sha256="12944c1f7791637e7de12208aef04da82bd26b95271b1b47d817364315ade993"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors",
+                 40_225_724_176, "fl2va · pruned · bf16", HF_REV, variant="fl2va",
+                 sha256="a32572fb90b5508b201ec7c2eddcc184b13ddfd3c6f6d2cf06a0b46535d541b4"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/minimax_h3_fl2va_int8_convrot.safetensors",
+                 34_038_892_334, "fl2va · int8 convrot", HF_REV, variant="fl2va",
+                 sha256="7ad4c73e6e378b822ffd1629f27f632d3787d95f5e468e3af958f98c58df96a5"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/minimax_h3_fl2va_bf16.safetensors", 66_280_487_368,
+                 "fl2va · bf16", HF_REV, variant="fl2va",
+                 sha256="907d4add438438ec1544f5240c3b38532ed934fe6be75677a6bbda2a6fdd6182"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+                 20_970_379_616, "ref2va · pruned · int8 convrot", HF_REV, recommended=True, variant="ref2va",
+                 sha256="9255f52b6677845ad238f20dfaafa94727053694127ab7f255c048f0f9365779"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/minimax_h3_ref2va_pruned_fp8_scaled.safetensors",
+                 20_958_205_608, "ref2va · pruned · fp8 scaled", HF_REV, variant="ref2va",
+                 sha256="f86f2f79ebd2d76eb8eeb46091e83982e6ff51d255747e7b16e92834b392b8e9"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/minimax_h3_ref2va_pruned_bf16.safetensors",
+                 40_225_724_176, "ref2va · pruned · bf16", HF_REV, variant="ref2va",
+                 sha256="37c0da793e20ca735272ec2be655f08a2e10f97a3ec8fdfb40f5b39a736ed6fe"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors",
+                 34_038_894_550, "ref2va · int8 convrot", HF_REV, variant="ref2va",
+                 sha256="9eef934046a0671bc8a5daf87100705e1478419c574cfde70c50fbe6885f76a9"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/minimax_h3_ref2va_bf16.safetensors", 66_280_487_368,
+                 "ref2va · bf16", HF_REV, variant="ref2va",
+                 sha256="e32c54c1a7b4f5f397f195cea267ccb18806303bb665678c4bee60953bdf3026"),
+        Download("text_encoder", HF_REPO, "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", 15_687_142_551,
+                 "nvfp4 (AWQ)", HF_REV, recommended=True,
+                 sha256="35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6"),
+        Download("text_encoder", HF_REPO, "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+                 27_141_342_152, "int8 convrot", HF_REV,
+                 sha256="bc2ced0fbea64757fa9acddccfc0b3f4819d1dcf1da6c124d690d368be283923"),
+        Download("text_encoder", HF_REPO, "text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors", 51_506_295_256,
+                 "bf16", HF_REV, sha256="600d567f6a9629c8574e8e7041b199bdd9c59a986afa7906910a81919610607d"),
+        Download("vae", HF_REPO, "vae/minimax_h3_video_vae_int8_convrot.safetensors", 2_811_065_184, "int8 convrot",
+                 HF_REV, recommended=True, sha256="52a2c8c73583c86e4f41cdcce3a6ad0ea562987bc0bf3d60a0cef5f5c8e60c0e"),
+        Download("vae", HF_REPO, "vae/minimax_h3_video_vae_fp16.safetensors", 5_207_808_496, "fp16", HF_REV,
+                 sha256="7c1f131492e7eddacaac9069a61b81bdd39de5cc96561e677c5eab1cdce5e522"),
+        Download("audio_vae", HF_REPO, "vae/minimax_h3_audio_vae_fp32.safetensors", 605_254_808, "fp32", HF_REV,
+                 recommended=True, sha256="8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48"),
+    ]
 
     def __init__(self, profile: dict, device: torch.device, log=print):
         super().__init__(profile, device, log)

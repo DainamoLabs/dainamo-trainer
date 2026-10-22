@@ -73,6 +73,8 @@ ACTIVATIONS_IN_FLIGHT = 3
 def _header(path: str, mtime: float) -> dict[str, tuple[str, tuple[int, ...]]]:
     with open(path, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
+        if n > 100 << 20:  # not a .safetensors file (a .gguf's first bytes would read it all)
+            raise ValueError("not a .safetensors file")
         header = json.loads(f.read(n))
     header.pop("__metadata__", None)
     return {k: (v["dtype"], tuple(v["shape"])) for k, v in header.items()}

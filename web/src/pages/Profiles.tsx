@@ -1,7 +1,10 @@
 import { useEffect, useState } from "react";
-import { api, type Family, type Profile } from "../api";
-import { IconCopy, IconEdit, IconLayers, IconPlus, IconTrash } from "../components/icons";
+import { api, byFamily, type Family, type ModelsOverview, type Profile } from "../api";
+import { go } from "../App";
+import { IconCopy, IconDownload, IconEdit, IconLayers, IconPlus, IconTrash } from "../components/icons";
+import { DownloadDialog } from "../components/ModelDownload";
 import { Modal, PathInput, usePoll, useToast } from "../components/ui";
+import ModelFiles from "./ModelFiles";
 
 type Validation = { field: string; level: string; message: string };
 
@@ -43,13 +46,19 @@ function ProfileEditor(props: { families: Family[]; initial: Partial<Profile> | 
   const [data, setData] = useState<Record<string, unknown>>(props.initial?.data || defaultsFor(fam));
   const [checks, setChecks] = useState<Validation[]>([]);
   const [busy, setBusy] = useState(false);
+  // the files on this machine and the ones to download, for each path field (a server older than this page has none)
+  const [models, reloadModels] = usePoll<ModelsOverview>("/api/models", 0);
+  const [download, setDownload] = useState<string | null>(null); // the field whose Download dialog is open
+  const fileFields = models?.families.find((f) => f.id === family)?.fields || [];
+  // a file being downloaded is checked again every few seconds, to show how far it's got
+  const downloading = checks.some((c) => c.level === "warning" && /^(Downloading|Waiting)/.test(c.message));
 
   useEffect(() => {
-    const t = setTimeout(() => {
-      api.post<Validation[]>("/api/profiles/validate", { name, family, data }).then(setChecks, () => {});
-    }, 350);
-    return () => clearTimeout(t);
-  }, [family, JSON.stringify(data)]);
+    const check = () => api.post<Validation[]>("/api/profiles/validate", { name, family, data }).then(setChecks, () => {});
+    const t = setTimeout(check, 350);
+    const again = downloading ? setInterval(check, 3000) : undefined;
+    return () => { clearTimeout(t); clearInterval(again); };
+  }, [family, JSON.stringify(data), downloading]);
 
   const set = (k: string, v: unknown) => setData((d) => ({ ...d, [k]: v }));
   const save = async () => {
@@ -96,12 +105,19 @@ function ProfileEditor(props: { families: Family[]; initial: Partial<Profile> | 
         {fam && <Needs fam={fam} />}
         {fam?.profile_fields.map((f) => {
           const v = checks.find((c) => c.field === f.key);
+          const mf = fileFields.find((x) => x.key === f.key);
+          const value = String(data[f.key] ?? "");
+          // files on this machine it could be, offered while the field is empty or its file is wrong
+          const found = (mf?.found || []).filter((x) => !x.unsupported.length && x.path !== value).slice(0, 4);
           return (
             <label className="field" key={f.key} onClick={(e) => f.kind === "path" && e.preventDefault()}>
               <span>{f.label}{!f.required && <span className="faint"> · optional</span>}{f.hint && <span className="field-hint">{f.hint}</span>}</span>
               {f.kind === "path" ? (
-                <PathInput value={String(data[f.key] ?? "")} onChange={(x) => set(f.key, x)} exts=".safetensors,.sft,.gguf" validation={v}
-                  placeholder={f.hint ? `${f.hint} (.safetensors)` : undefined} />
+                <PathInput value={value} onChange={(x) => set(f.key, x)} exts=".safetensors,.sft,.gguf" validation={v}
+                  placeholder={f.hint ? `${f.hint} (.safetensors)` : undefined}
+                  extra={mf && mf.downloads.length > 0 && (
+                    <button type="button" className="btn" title="Download it from Hugging Face" onClick={() => setDownload(f.key)}><IconDownload /> Download</button>
+                  )} />
               ) : f.kind === "select" ? (
                 <select value={String(data[f.key] ?? f.default ?? "")} onChange={(e) => set(f.key, e.target.value)}>
                   {(f.options || []).map((o) => <option key={o} value={o}>{o}</option>)}
@@ -111,20 +127,35 @@ function ProfileEditor(props: { families: Family[]; initial: Partial<Profile> | 
               ) : (
                 <input value={String(data[f.key] ?? "")} onChange={(e) => set(f.key, e.target.value)} />
               )}
+              {f.kind === "path" && found.length > 0 && (!value.trim() || v?.level === "error") && (
+                <div className="row wrap" style={{ gap: 6 }}>
+                  <span className="help">On this machine:</span>
+                  {found.map((x) => (
+                    <button key={x.path} type="button" className="chip" title={x.path} onClick={() => set(f.key, x.path)}>
+                      {x.name.replace(/\.safetensors$/, "")}
+                    </button>
+                  ))}
+                </div>
+              )}
               {f.help && <span className="help">{f.help}</span>}
             </label>
           );
         })}
       </div>
+      {download && (
+        <DownloadDialog family={family} field={download} variant={data.variant ? String(data.variant) : undefined}
+          onClose={() => setDownload(null)}
+          onUse={(path) => set(download, path)}
+          onStarted={(t) => { set(t.field, t.dest); reloadModels(); }} />
+      )}
     </Modal>
   );
 }
 
-export default function Profiles({ families }: { families: Family[] }) {
+export default function Profiles({ families, view }: { families: Family[]; view: string }) {
   const toast = useToast();
   const [profiles, reload] = usePoll<Profile[]>("/api/profiles", 0);
   const [editing, setEditing] = useState<Partial<Profile> | null | undefined>(undefined);
-  const famLabel = (id: string) => families.find((f) => f.id === id)?.label || id;
 
   const remove = async (p: Profile) => {
     if (!confirm(`Delete profile "${p.name}"? Model files are not touched.`)) return;
@@ -143,42 +174,64 @@ export default function Profiles({ families }: { families: Family[] }) {
         <button className="btn primary" onClick={() => setEditing(null)} disabled={!families.length}><IconPlus /> New profile</button>
       </div>
 
-      {profiles && profiles.length === 0 && (
+      <div className="view-tabs" role="tablist" aria-label="Profiles">
+        {([["", "Profiles"], ["files", "Model files"]] as const).map(([v, label]) => (
+          <button key={v} role="tab" aria-selected={view === v} className={view === v ? "on" : ""} onClick={() => go("profiles", v)}>
+            {label}
+            {v === "" && profiles && profiles.length > 0 && <span className="count">{profiles.length}</span>}
+          </button>
+        ))}
+      </div>
+
+      {view === "files" && <ModelFiles families={families} onCreate={setEditing} />}
+
+      {view !== "files" && profiles && profiles.length === 0 && (
         <div className="empty">
           <strong>No profiles yet</strong>
-          Create one to point Dainamo at your model files, e.g. the ones in your ComfyUI models folder.
-          <div style={{ marginTop: 14 }}><button className="btn primary" onClick={() => setEditing(null)}><IconPlus /> New profile</button></div>
+          Create one to point Dainamo at your model files, e.g. the ones in your ComfyUI models folder. Model files shows which
+          you have, and downloads the rest.
+          <div className="row" style={{ marginTop: 14, justifyContent: "center" }}>
+            <button className="btn primary" onClick={() => setEditing(null)}><IconPlus /> New profile</button>
+            <button className="btn" onClick={() => go("profiles", "files")}>Model files</button>
+          </div>
         </div>
       )}
 
-      <div className="grid cols-2">
-        {profiles?.map((p) => {
-          const fam = families.find((f) => f.id === p.family);
-          return (
-            <div className="card card-pad" key={p.id}>
-              <div className="row" style={{ marginBottom: 12 }}>
-                <div className="ds-cover" style={{ width: 40, height: 40, color: "var(--accent)" }}><IconLayers width={20} /></div>
-                <div style={{ minWidth: 0 }}>
-                  <div style={{ fontWeight: 600, fontSize: 15 }} className="ellipsis">{p.name}</div>
-                  <div className="muted small">{famLabel(p.family)}</div>
+      {view !== "files" && byFamily(profiles || [], families).map((g) => (
+        <section className="pf-group" key={g.id}>
+          <div className="pf-group-head">
+            <h2>{g.label}</h2>
+            <span className="count">{g.profiles.length}</span>
+          </div>
+          <div className="grid cols-2">
+            {g.profiles.map((p) => {
+              const fam = families.find((f) => f.id === p.family);
+              return (
+                <div className="card card-pad" key={p.id}>
+                  <div className="row" style={{ marginBottom: 12 }}>
+                    <div className="ds-cover" style={{ width: 40, height: 40, color: "var(--accent)" }}><IconLayers width={20} /></div>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontWeight: 600, fontSize: 15 }} className="ellipsis">{p.name}</div>
+                    </div>
+                    <div className="spacer" />
+                    <button className="btn ghost icon" title="Duplicate" onClick={() => setEditing({ name: p.name + " copy", family: p.family, data: { ...p.data } })}><IconCopy /></button>
+                    <button className="btn ghost icon" title="Edit" onClick={() => setEditing(p)}><IconEdit /></button>
+                    <button className="btn ghost icon danger" title="Delete" onClick={() => remove(p)}><IconTrash /></button>
+                  </div>
+                  {fam?.profile_fields.filter((f) => f.kind === "path" || f.kind === "select").map((f) => (
+                    <div className="kv" key={f.key}>
+                      <span>{f.label}</span>
+                      <span className="mono ellipsis" title={String(p.data[f.key] || "")} style={{ maxWidth: "70%" }}>
+                        {String(p.data[f.key] || "—").split("/").pop()}
+                      </span>
+                    </div>
+                  ))}
                 </div>
-                <div className="spacer" />
-                <button className="btn ghost icon" title="Duplicate" onClick={() => setEditing({ name: p.name + " copy", family: p.family, data: { ...p.data } })}><IconCopy /></button>
-                <button className="btn ghost icon" title="Edit" onClick={() => setEditing(p)}><IconEdit /></button>
-                <button className="btn ghost icon danger" title="Delete" onClick={() => remove(p)}><IconTrash /></button>
-              </div>
-              {fam?.profile_fields.filter((f) => f.kind === "path" || f.kind === "select").map((f) => (
-                <div className="kv" key={f.key}>
-                  <span>{f.label}</span>
-                  <span className="mono ellipsis" title={String(p.data[f.key] || "")} style={{ maxWidth: "70%" }}>
-                    {String(p.data[f.key] || "—").split("/").pop()}
-                  </span>
-                </div>
-              ))}
-            </div>
-          );
-        })}
-      </div>
+              );
+            })}
+          </div>
+        </section>
+      ))}
 
       {editing !== undefined && (
         <ProfileEditor families={families} initial={editing} onClose={() => setEditing(undefined)} onSaved={() => { setEditing(undefined); reload(); }} />

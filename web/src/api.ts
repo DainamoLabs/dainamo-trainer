@@ -45,6 +45,15 @@ export type Hardware = { gpus: Gpu[]; cpu: Cpu; ram: SystemRam };
 
 export type Profile = { id: string; name: string; family: string; data: Record<string, unknown>; updated: number };
 
+/** Profiles under their families, in the families' order (a family this server no longer has comes last, under its
+ *  id), each family's by name as the server sends them. */
+export function byFamily(profiles: Profile[], families: Family[]) {
+  const ids = new Set([...families.map((f) => f.id), ...profiles.map((p) => p.family)]);
+  return [...ids]
+    .map((id) => ({ id, label: families.find((f) => f.id === id)?.label || id, profiles: profiles.filter((p) => p.family === id) }))
+    .filter((g) => g.profiles.length);
+}
+
 export type Dataset = {
   id: string;
   name: string;
@@ -183,6 +192,7 @@ export type Job = {
   finished: number | null;
   progress: Progress;
   last_sample: Sample | null;
+  loss_curve: number[]; // its loss so far, smoothed, in at most 60 values evenly spaced over its steps
   recommended: Recommendation | null;
   datasets: string[];
   evaluating: boolean; // queued or running for a checkpoint evaluation, not training
@@ -251,6 +261,33 @@ export type Settings = {
   /** The text encoder Dainamo runs for the "encoder" provider. */
   text_encoder: { path: string; gpu: string; idle_minutes: number };
   speech: { model: string; device: "auto" | "cpu" };
+  /** ComfyUI's models folder: the model manager finds files in it and downloads into its subfolders. */
+  models: { folder: string };
+};
+
+/** A file the model manager can download for a profile field (a family driver's ``downloads``). */
+export type ModelDownloadOption = {
+  id: string; field: string; repo: string; path: string; name: string; size: number; label: string;
+  folder: string; // the models folder's subfolder it goes in: diffusion_models, text_encoders, vae, loras, checkpoints
+  gated: boolean; recommended: boolean; variant: string; note: string; url: string;
+  have: string | null; // where it is on this machine (the file of that name and size)
+  task: string | null; // its unfinished download
+};
+/** A file on this machine that a profile field can use. */
+export type FoundModel = {
+  path: string; name: string; size: number; where: string; quant: string[]; unsupported: string[];
+  download: string | null; // the catalog file it is
+};
+export type ModelField = { key: string; label: string; hint: string; required: boolean; downloads: ModelDownloadOption[]; found: FoundModel[] };
+export type ModelFamily = { id: string; label: string; fields: ModelField[] };
+export type ModelTask = {
+  id: string; download: string; family: string; family_label: string; field: string; repo: string; name: string;
+  label: string; dest: string; size: number; done: number; speed: number; gated: boolean; error: string;
+  state: "queued" | "checking" | "downloading" | "verifying" | "done" | "failed" | "cancelled" | "interrupted";
+};
+export type ModelsOverview = {
+  folder: string; folder_ok: boolean; folders: Record<string, string>; token: boolean;
+  families: ModelFamily[]; tasks: ModelTask[];
 };
 
 export type CaptionProvider = "server" | "llama" | "encoder";

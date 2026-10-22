@@ -77,7 +77,7 @@ export default function App() {
           {route.tab === "queue" && <Queue jobId={route.arg} view={route.view} />}
           {route.tab === "sandbox" && <Sandbox families={families} workflows={system?.workflows || []} gpus={system?.gpus || []} ram={system?.ram} />}
           {route.tab === "datasets" && <Datasets datasetId={route.arg} families={families} />}
-          {route.tab === "profiles" && <Profiles families={families} />}
+          {route.tab === "profiles" && <Profiles families={families} view={route.arg} />}
           {route.tab === "settings" && <SettingsPage gpus={system?.gpus || []} auth={auth} onSignOut={() => setAuth({ required: true, signed_in: false })} />}
         </PageError>
       </main>

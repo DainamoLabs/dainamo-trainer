@@ -1,7 +1,20 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { api, fmtClock, q } from "../api";
-import { IconCheck, IconFile, IconFolder, IconAlert, IconUp, IconX } from "./icons";
+import { api, byFamily, fmtClock, q, type Family, type Profile } from "../api";
+import { IconCheck, IconFile, IconFolder, IconAlert, IconLeft, IconRight, IconUp, IconX } from "./icons";
+
+/** A profile <select>'s options, under a heading per family. */
+export function ProfileOptions({ profiles, families }: { profiles: Profile[]; families: Family[] }) {
+  return (
+    <>
+      {byFamily(profiles, families).map((g) => (
+        <optgroup key={g.id} label={g.label}>
+          {g.profiles.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+        </optgroup>
+      ))}
+    </>
+  );
+}
 
 // ---- modal ---------------------------------------------------------------
 export function Modal(props: { title: React.ReactNode; onClose: () => void; children: React.ReactNode; footer?: React.ReactNode; wide?: boolean }) {
@@ -149,6 +162,7 @@ export function FileBrowser(props: { start: string; mode: "file" | "dir"; exts?:
 export function PathInput(props: {
   value: string; onChange: (v: string) => void; mode?: "file" | "dir"; exts?: string; placeholder?: string;
   validation?: { level: string; message: string };
+  extra?: React.ReactNode; // after Browse, e.g. a Download button
 }) {
   const [open, setOpen] = useState(false);
   const v = props.validation;
@@ -157,6 +171,7 @@ export function PathInput(props: {
       <div className="row">
         <input className="mono" value={props.value} placeholder={props.placeholder} onChange={(e) => props.onChange(e.target.value)} />
         <button type="button" className="btn" onClick={() => setOpen(true)}>Browse</button>
+        {props.extra}
       </div>
       {v && (
         <div className={"validation " + v.level}>
@@ -165,7 +180,7 @@ export function PathInput(props: {
       )}
       {open && (
         <FileBrowser
-          start={props.value ? props.value.replace(/[\\/][^\\/]*$/, "") || "/" : "~"}
+          start={props.value ? (props.mode === "dir" ? props.value : props.value.replace(/[\\/][^\\/]*$/, "") || "/") : "~"}
           mode={props.mode || "file"}
           exts={props.exts}
           onClose={() => setOpen(false)}
@@ -275,17 +290,51 @@ function aspect(w: number, h: number): string | null {
 
 /** Full-screen view of an image, a video (``video``) or a song (``audio``: its poster and score). With ``info`` (a
  * dataset file's), a panel at the bottom shows its name, its size in pixels and its length (as the browser reads
- * them), ``details`` and its caption. */
-export function Lightbox({ src, video, audio, info, onClose }: {
+ * them), ``details`` and its caption, which ``info.onCaption`` makes editable. ``nav`` adds previous and next (the
+ * arrow keys too) through a list of files, ``at`` of ``count``. An edited caption is saved before moving on or
+ * closing; if that fails, the view stays. */
+export function Lightbox({ src, video, audio, info, nav, onClose }: {
   src: string; video?: boolean; audio?: { poster?: string; score?: string; title?: React.ReactNode };
-  info?: { name: string; caption: string; details?: React.ReactNode[] }; onClose: () => void;
+  info?: { name: string; caption: string; details?: React.ReactNode[]; onCaption?: (caption: string) => Promise<void> };
+  nav?: { at: number; count: number; go: (step: -1 | 1) => void };
+  onClose: () => void;
 }) {
+  const toast = useToast();
   const [shape, setShape] = useState<{ src: string; facts: string[] } | null>(null);
+  const [draft, setDraft] = useState(info?.caption ?? "");
+  useEffect(() => setDraft(info?.caption ?? ""), [src, info?.caption]);
+  const dirty = !!info?.onCaption && draft.trim() !== info.caption;
+  const busy = useRef(false);
+  // save an edited caption, then do ``then`` (move or close)
+  const leave = async (then?: () => void) => {
+    if (busy.current) return;
+    busy.current = true;
+    try {
+      if (dirty) await info!.onCaption!(draft);
+      then?.();
+    } catch (e: any) {
+      toast(e.message, true);
+    } finally {
+      busy.current = false;
+    }
+  };
+  const step = (s: -1 | 1) => {
+    if (nav && nav.at + s >= 0 && nav.at + s < nav.count) leave(() => nav.go(s));
+  };
+  const keys = useRef<(e: KeyboardEvent) => void>(() => {});
+  keys.current = (e) => {
+    if (e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLInputElement) return; // typing a caption
+    if (e.key === "Escape") leave(onClose);
+    else if (nav && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+      e.preventDefault(); // not a seek in a focused video
+      step(e.key === "ArrowLeft" ? -1 : 1);
+    }
+  };
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    const onKey = (e: KeyboardEvent) => keys.current(e);
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, []);
   const measure = (w: number, h: number, sec?: number) => {
     if (!w || !h) return;
     const r = aspect(w, h);
@@ -298,15 +347,38 @@ export function Lightbox({ src, video, audio, info, onClose }: {
     : <img src={src} alt="" onLoad={(e) => measure(e.currentTarget.naturalWidth, e.currentTarget.naturalHeight)} />;
   if (!info) return <div className="lightbox" onClick={onClose}>{media}</div>;
   const facts = [...(shape?.src === src ? shape.facts : []), ...(info.details || [])];
+  const arrow = (s: -1 | 1) => nav && (
+    <button className={"lightbox-nav " + (s < 0 ? "prev" : "next")} title={s < 0 ? "Previous (←)" : "Next (→)"}
+      disabled={nav.at + s < 0 || nav.at + s >= nav.count} onClick={(e) => { e.stopPropagation(); step(s); }}>
+      {s < 0 ? <IconLeft /> : <IconRight />}
+    </button>
+  );
   return (
-    <div className="lightbox with-info" onClick={onClose}>
-      <div className="lightbox-media">{media}</div>
+    <div className="lightbox with-info" onClick={() => leave(onClose)}>
+      <div className="lightbox-media">{arrow(-1)}{media}{arrow(1)}</div>
       <div className="lightbox-info" onClick={(e) => e.stopPropagation()}>
         <div className="lightbox-facts">
+          {nav && <span className="lightbox-pos">{nav.at + 1} / {nav.count}</span>}
           <strong className="ellipsis" title={info.name}>{info.name}</strong>
           {facts.map((f, i) => <span key={i}>{f}</span>)}
         </div>
-        <div className="lightbox-caption">{info.caption || <span className="faint">No caption</span>}</div>
+        {info.onCaption ? (
+          <div className="lightbox-edit">
+            <textarea value={draft} rows={3} placeholder="No caption: write one" onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); leave(); }
+                if (e.key === "Escape") e.currentTarget.blur(); // then Escape again closes
+              }} />
+            <div className="row small">
+              <span className={"faint" + (dirty ? "" : " key-hint")}>{dirty ? "Edited: saved when you move on, or Ctrl+Enter" : nav ? "← → for the other files" : ""}</span>
+              <span className="spacer" />
+              {dirty && <button className="btn sm" onClick={() => setDraft(info.caption)}>Undo</button>}
+              <button className="btn sm primary" disabled={!dirty} onClick={() => leave()}>Save</button>
+            </div>
+          </div>
+        ) : (
+          <div className="lightbox-caption">{info.caption || <span className="faint">No caption</span>}</div>
+        )}
       </div>
     </div>
   );

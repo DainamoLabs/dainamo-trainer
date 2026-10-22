@@ -31,9 +31,13 @@ from ... import comfy_io
 from ... import dataset as ds
 from ...fp8_linear import assert_materialized, materialize
 from ...hf_assets import qwen_image_2_assets
-from ..base import FamilyDriver, FamilyInfo, MemoryProfile, ProfileField, Workflow
+from ..base import Download, FamilyDriver, FamilyInfo, MemoryProfile, ProfileField, Workflow
 from .model import QwenImage21Config, QwenImage21DiT
 from .vae import AutoencoderKLQwenImage21
+
+# where the model manager downloads the files from, at the commit they were checked against
+HF_REPO, HF_REV = "Comfy-Org/Qwen-Image-2.1", "0217efd1d9c9452e84f6448903d6e21bfa171ffd"
+ADAPTER_REPO, ADAPTER_REV = "ostris/qwen_image_2_turbo_training_adapter", "bf44edf7f84d533f36a601819a327d225ff9ff88"
 
 SYSTEM_PROMPT = "Comprehend and analyze the provided prompt."
 SYSTEM_TURN = f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
@@ -181,6 +185,28 @@ class QwenImage2Driver(FamilyDriver):
         "text_encoder": {"layers.35.mlp.down_proj.weight": (4096, 12288)},  # 8B, not Krea's 4B
         "vae": {"encoder.conv1.weight": (96, 4)},  # RGBA input, not the Qwen-Image 1 VAE
     }
+    downloads = [
+        Download("diffusion_model", HF_REPO, "diffusion_models/qwen_image_2.1_int8_convrot.safetensors", 7_256_783_064,
+                 "Base · int8 convrot", HF_REV, recommended=True,
+                 sha256="cb74113cb03faecd79611b01fd7fd642f0aa60d6f0b95086abee214d75eaa57d"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/qwen_image_2.1_bf16.safetensors", 14_230_280_616,
+                 "Base · bf16", HF_REV, sha256="89f4158d066cc33906a199fca85634f766892dd78f49b6698dabf187ac86c4bc"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/qwen_image_2.1_turbo_int8_convrot.safetensors",
+                 7_256_787_829, "Turbo · int8 convrot", HF_REV,
+                 sha256="8144a0182964aa8403ad6dbc011db837304167d235161b9aabaa8532e967314c"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/qwen_image_2.1_turbo_bf16.safetensors", 14_230_280_616,
+                 "Turbo · bf16", HF_REV, sha256="8b74237a7f505773e2c66726fa696444b4c704585c93a347cff9044937f7914a"),
+        Download("text_encoder", HF_REPO, "text_encoders/qwen3vl_8b_int8_convrot.safetensors", 9_350_798_360,
+                 "int8 convrot", HF_REV, recommended=True,
+                 sha256="8bfd0f6e12abf2d2d697ecc888e5e90b0d6741d6708f05799f53afa560452e8f"),
+        Download("text_encoder", HF_REPO, "text_encoders/qwen3vl_8b_bf16.safetensors", 17_534_334_616, "bf16", HF_REV,
+                 sha256="68bdc82bc1b66851162ae656225e7e2068166b603db19bd5d5a3b90eb12669a9"),
+        Download("vae", HF_REPO, "vae/qwen_image_2.1_vae_bf16.safetensors", 675_509_688, "bf16", HF_REV,
+                 recommended=True, sha256="bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9"),
+        Download("training_adapter", ADAPTER_REPO, "qwen_image_2_turbo_training_adapter_v1.safetensors", 159_436_160,
+                 "v1, for Turbo", ADAPTER_REV, recommended=True, folder="loras",
+                 sha256="007b44e1d949963bb1471b6d0099daea24738242eccf74661f581f5bf94ff049"),
+    ]
 
     def __init__(self, profile: dict, device: torch.device, log=print):
         super().__init__(profile, device, log)

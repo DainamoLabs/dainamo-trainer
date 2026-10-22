@@ -31,8 +31,11 @@ from PIL import Image, ImageOps
 from ... import comfy_io
 from ... import dataset as ds
 from ...fp8_linear import assert_materialized, materialize
-from ..base import FamilyDriver, FamilyInfo, MemoryProfile, ProfileField, Workflow
+from ..base import Download, FamilyDriver, FamilyInfo, MemoryProfile, ProfileField, Workflow
 from . import model as M
+
+# where the model manager downloads the files from, at the commit they were checked against
+HF_REPO, HF_REV = "Lightricks/LTX-2.5", "49b093a39c19169a8a81721dcc541e07e945232f"
 
 IMAGE_CRF = 18  # first-frame images are re-compressed like this, as LTX 2.5 was trained (diffusers' LTX2_5_IMAGE_CRF)
 DECODE_SEED = 0  # the diffusion decoder samples noise; a fixed seed keeps a latent's decode the same
@@ -131,6 +134,31 @@ class LTX25Driver(FamilyDriver):
         # from LTX 2.3's Gemma 3, whose projection has this shape too)
         "text_encoder": {"text_embedding_projection.video_aggregate_embed.weight": (4096, 188160)},
     }
+    downloads = [
+        Download("diffusion_model", HF_REPO,
+                 "diffusion_models/ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors",
+                 21_504_034_224, "Distilled · int8 convrot", HF_REV, gated=True, recommended=True,
+                 variant="distilled"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors",
+                 18_721_548_408, "Distilled · nvfp4", HF_REV, gated=True, variant="distilled"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors",
+                 42_018_190_584, "Distilled · bf16", HF_REV, gated=True, variant="distilled"),
+        Download("diffusion_model", HF_REPO,
+                 "diffusion_models/ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safetensors",
+                 21_504_034_224, "Dev · int8 convrot", HF_REV, gated=True, recommended=True, variant="dev"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors",
+                 42_018_190_584, "Dev · bf16", HF_REV, gated=True, variant="dev"),
+        Download("text_encoder", HF_REPO, "text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+                 15_372_969_374, "int8 convrot", HF_REV, gated=True, recommended=True),
+        Download("text_encoder", HF_REPO, "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
+                 26_263_858_182, "bf16", HF_REV, gated=True),
+        Download("vae", HF_REPO, "vae/ltx-2.5-video-vae-bf16.safetensors", 1_472_223_346, "Diffusion decoder · bf16",
+                 HF_REV, gated=True, recommended=True),
+        Download("vae", HF_REPO, "vae/ltx-2.5-video-vae-conv-bf16.safetensors", 1_452_269_922, "Convolutional · bf16",
+                 HF_REV, gated=True),
+        Download("audio_vae", HF_REPO, "vae/ltx-2.5-audio-vae-bf16.safetensors", 364_866_540, "bf16", HF_REV,
+                 gated=True, recommended=True),
+    ]
 
     def __init__(self, profile: dict, device: torch.device, log=print):
         super().__init__(profile, device, log)

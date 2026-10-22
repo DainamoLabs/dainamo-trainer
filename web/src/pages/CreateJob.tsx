@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { go } from "../App";
-import { api, type Dataset, type Family, type Gpu, type JobDetail, type Profile, type SystemRam } from "../api";
+import { api, byFamily, type Dataset, type Family, type Gpu, type JobDetail, type Profile, type SystemRam } from "../api";
 import { CheckIssues, useDatasetCheck } from "../components/DatasetCheck";
 import { EVAL_DEFAULTS, EvalSettings, evalCost } from "../components/EvalSettings";
 import { IconPlay, IconPlus, IconSave, IconX } from "../components/icons";
-import { ConfirmDialog, ImagesInput, Info, Num, usePoll, useToast } from "../components/ui";
+import { ConfirmDialog, ImagesInput, Info, Num, ProfileOptions, usePoll, useToast } from "../components/ui";
 import { OffloadControl, gpuTarget, peakOf, streamedFor, useVramProjection } from "../components/Vram";
 
 type S = Record<string, any>;
@@ -305,7 +305,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
     lastFamily.current = family.id;
   }, [family?.id]);
   useEffect(() => {
-    if (profiles?.length && !profiles.find((p) => p.id === profileId)) setProfileId(profiles[0].id);
+    if (profiles?.length && !profiles.find((p) => p.id === profileId)) setProfileId(byFamily(profiles, families)[0].profiles[0].id);
   }, [profiles]);
 
   const isVideo = !!family?.media.includes("video");
@@ -499,7 +499,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
                   <button className="btn" onClick={() => go("profiles")}>Create a profile first →</button>
                 ) : (
                   <select value={profileId} onChange={(e) => setProfileId(e.target.value)}>
-                    {profiles?.map((p) => <option key={p.id} value={p.id}>{p.name}{p.name === families.find((f) => f.id === p.family)?.label ? "" : ` · ${families.find((f) => f.id === p.family)?.label || p.family}`}</option>)}
+                    <ProfileOptions profiles={profiles || []} families={families} />
                   </select>
                 )}
                 {edit && !edit.job.profile_id && <span className="help">This job's profile, {edit.profileName}, is gone; it trains with the one chosen here.</span>}

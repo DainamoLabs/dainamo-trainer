@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
+import threading
 import time
 
 from fastapi import APIRouter, HTTPException
@@ -39,6 +41,48 @@ class JobIn(BaseModel):
     output_name: str = ""
 
 
+CURVE_POINTS = 60  # the most values in a job's loss curve (the Queue's cards, the top bar)
+_curves: dict[str, dict] = {}  # job id -> how much of its metrics.jsonl has been read, its losses, and the curve
+_curves_lock = threading.Lock()
+
+
+def _loss_curve(jid: str) -> list[float]:
+    """The job's loss so far, smoothed as the Loss tab smooths it, in at most CURVE_POINTS values evenly spaced over
+    its steps. Only the lines added to its metrics.jsonl since the last call are read."""
+    path = os.path.join(job_dir(jid), "metrics.jsonl")
+    with _curves_lock:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            _curves.pop(jid, None)
+            return []
+        c = _curves.get(jid)
+        if c and size == c["size"]:
+            return c["curve"]
+        with open(path, "rb") as f:
+            head = f.readline()
+            if not c or size < c["size"] or head != c["head"]:  # new, or written again (the job started over)
+                c = _curves[jid] = {"head": head, "size": 0, "losses": {}, "curve": []}
+            f.seek(c["size"])
+            chunk = f.read(size - c["size"])
+        end = chunk.rfind(b"\n") + 1  # a line still being written is read next time
+        for line in chunk[:end].splitlines():
+            try:
+                m = json.loads(line)
+                c["losses"][int(m["step"])] = float(m["loss"])  # a resumed run may log a step again: the last counts
+            except (ValueError, KeyError, TypeError):
+                continue
+        c["size"] += end
+        ema, smooth = None, []
+        for _, v in sorted(c["losses"].items()):
+            if math.isfinite(v):
+                ema = v if ema is None else 0.95 * ema + 0.05 * v
+                smooth.append(ema)
+        n = min(CURVE_POINTS, len(smooth))
+        c["curve"] = [round(smooth[round((len(smooth) - 1) * i / (n - 1))], 5) for i in range(n)] if n > 1 else smooth
+        return c["curve"]
+
+
 def _job_summary(j: dict) -> dict:
     st = read_status(j["id"])
     cfg = j.pop("config", {}) or {}
@@ -47,6 +91,7 @@ def _job_summary(j: dict) -> dict:
     # the job's own step count (a job given more steps shows them before it starts again)
     j["progress"]["total_steps"] = cfg.get("settings", {}).get("steps") or j["progress"]["total_steps"]
     j["last_sample"] = st.get("samples", [])[-1] if st.get("samples") else None
+    j["loss_curve"] = _loss_curve(j["id"])
     # a checkpoint evaluation's recommendation, else the one made in training
     j["recommended"] = (st.get("evaluation") or {}).get("recommended") or st.get("recommended")
     j["evaluating"] = "evaluate" in cfg
@@ -70,7 +115,11 @@ def _job_summary(j: dict) -> dict:
 
 @router.get("/jobs")
 def list_jobs():
-    return [_job_summary(j) for j in db.query("SELECT * FROM jobs ORDER BY position, created")]
+    jobs = [_job_summary(j) for j in db.query("SELECT * FROM jobs ORDER BY position, created")]
+    with _curves_lock:
+        for jid in set(_curves) - {j["id"] for j in jobs}:  # deleted jobs
+            del _curves[jid]
+    return jobs
 
 
 def _job_config(body: JobIn) -> dict:

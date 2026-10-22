@@ -85,6 +85,8 @@ DEFAULT_SETTINGS = {
     # a model's text encoder writing the text, for the "encoder" provider (engine/textgen.py); gpu "auto" or an index
     "text_encoder": {"path": "", "gpu": "auto", "idle_minutes": 10},
     "speech": {"model": "large-v3-turbo", "device": "auto"},  # Whisper, for clips with sound; device "auto" or "cpu"
+    # ComfyUI's models folder: the model manager looks for files in it and downloads into its subfolders
+    "models": {"folder": ""},
     "caption_styles": {"default": "detailed", "styles": CAPTION_STYLES},
 }
 

@@ -7,7 +7,7 @@ import json
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from .. import db
+from .. import db, model_files
 from .common import family_or_400, profile_or_404
 
 router = APIRouter(prefix="/api/profiles")
@@ -49,4 +49,4 @@ def delete_profile(pid: str):
 
 @router.post("/validate")
 def validate_profile(p: ProfileIn):
-    return family_or_400(p.family).validate_profile(p.data)
+    return model_files.note_downloads(family_or_400(p.family).validate_profile(p.data), p.data)

@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  api, fmtClock, fmtDuration, fmtTime, type Family, type Gpu, type LoraOption, type ModelOption, type Profile, type RefModOption, type SandboxDefaults,
+  api, byFamily, fmtClock, fmtDuration, fmtTime, type Family, type Gpu, type LoraOption, type ModelOption, type Profile, type RefModOption, type SandboxDefaults,
   type SandboxOutput, type SandboxParams, type SandboxProgress, type SandboxRun, type SandboxStatus, type SystemRam,
   type Workflow,
 } from "../api";
 import { IconPlay, IconPlus, IconRefresh, IconStop, IconTrash, IconX } from "../components/icons";
-import { AudioCard, ImagesInput, Info, Lightbox, PathInput, StatusPill, usePoll, useToast } from "../components/ui";
+import { AudioCard, ImagesInput, Info, Lightbox, PathInput, ProfileOptions, StatusPill, usePoll, useToast } from "../components/ui";
 import { OffloadControl, gpuTarget, useVramProjection } from "../components/Vram";
 
 type LoraRow = { path: string; strength: number; custom: boolean };
@@ -282,7 +282,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
 
   // pick a profile, then load its defaults; switching profiles applies them (and a workflow it supports)
   useEffect(() => {
-    if (profiles && !profile && profiles.length) setForm({ profile_id: profiles[0].id });
+    if (profiles && !profile && profiles.length) setForm({ profile_id: byFamily(profiles, families)[0].profiles[0].id });
   }, [profiles]);
   useEffect(() => {
     if (!form.profile_id) return;
@@ -487,7 +487,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
             <label className="field">
               <span>Profile<Info text={INFO.profile} /></span>
               <select value={form.profile_id} onChange={(e) => setForm({ profile_id: e.target.value })}>
-                {(profiles || []).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                <ProfileOptions profiles={profiles || []} families={families} />
               </select>
             </label>
             <label className="field">

@@ -139,6 +139,7 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
   const [delivery, setDelivery] = useState<Delivery>({});
   const [browser, setBrowser] = useState(browserAlertsOn());
   const [whisper, setWhisper] = useState<WhisperModel[]>([]);
+  const [suggested, setSuggested] = useState<string[]>([]); // models folders the profiles' files are in
   // a Dainamo server started before this page was built has no caption provider settings: it needs a restart
   const stale = !!s && (!s.llama || !s.text_encoder);
   const provider = (!stale && s?.captioner.provider) || "server";
@@ -150,6 +151,7 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
     api.get<Settings>("/api/settings").then(setS);
     api.get<Delivery>("/api/notifications").then(setDelivery, () => {});
     api.get<{ whisper_models: WhisperModel[] }>("/api/system").then((sys) => setWhisper(sys.whisper_models), () => {});
+    api.get<{ folders: string[] }>("/api/models/suggest").then((r) => setSuggested(r.folders), () => {});
   }, []);
   if (!s) return <div className="page muted">Loading…</div>;
 
@@ -206,7 +208,7 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
   return (
     <div className="page" style={{ maxWidth: 900 }}>
       <div className="page-head">
-        <div><h1>Settings</h1><p>Queue behaviour, the Sandbox, notifications, remote access and the caption provider.</p></div>
+        <div><h1>Settings</h1><p>Queue behaviour, the Sandbox, model files, notifications, remote access and the caption provider.</p></div>
         <button className="btn primary" onClick={() => save()}>Save settings</button>
       </div>
 
@@ -251,6 +253,25 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
               ? "With two or more GPUs, the Sandbox holds the GPU it runs on and training uses the others until it's released."
               : "With one GPU, the Sandbox runs only while no training job is running or queued; a job that's ready to start makes it unload."}
           </div>
+        </div>
+      </div>
+
+      <div className="card card-pad" style={{ marginBottom: 16 }}>
+        <h2>Model files</h2>
+        <div className="field">
+          <span>ComfyUI models folder</span>
+          <PathInput mode="dir" value={s.models?.folder ?? ""} placeholder="…/ComfyUI/models" onChange={(v) => setS({ ...s, models: { folder: v } })} />
+          {!s.models?.folder && suggested.length > 0 && (
+            <div className="row wrap" style={{ gap: 8 }}>
+              <span className="help">Your profiles use files in <span className="mono">{suggested[0]}</span></span>
+              <button className="btn sm" type="button" onClick={() => setS({ ...s, models: { folder: suggested[0] } })}>Use it</button>
+            </div>
+          )}
+          <span className="help">
+            Model files (on the Profiles page) looks for model files here, and downloads each into the subfolder ComfyUI reads its
+            kind from: diffusion_models, text_encoders, vae, loras or checkpoints. Choose ComfyUI's models folder, or the
+            folder its extra_model_paths.yaml points to if your models live elsewhere.
+          </span>
         </div>
       </div>
 

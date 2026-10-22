@@ -1363,3 +1363,60 @@ def test_auto_caption_runs_the_text_encoder(client, fake_encoder, tmp_path, monk
     finally:
         llama.stop(wait=True)
         client.put("/api/settings", json=NO_LOCAL_LLM)
+
+
+def test_jobs_carry_a_short_smoothed_loss_curve(client):
+    import json
+    import math
+
+    from dainamo.server import db
+    from dainamo.server.queue import job_dir
+    from dainamo.server.routes import jobs as routes
+
+    jid = db.new_id()
+    db.execute("INSERT INTO jobs (id, name, status, family, gpu, position, created, config) VALUES (?,?,?,?,?,?,?,?)",
+               (jid, "curve", "stopped", "krea2", "auto", db.now(), db.now(), "{}"))
+    os.makedirs(job_dir(jid), exist_ok=True)
+    path = os.path.join(job_dir(jid), "metrics.jsonl")
+
+    def curve():
+        return next(j for j in client.get("/api/jobs").json() if j["id"] == jid)["loss_curve"]
+
+    def expected(losses):  # the Loss tab's smoothing, then 60 values evenly spaced
+        ema, sm = None, []
+        for _, v in sorted(losses.items()):
+            if math.isfinite(v):
+                ema = v if ema is None else 0.95 * ema + 0.05 * v
+                sm.append(ema)
+        n = min(60, len(sm))
+        return [round(sm[round((len(sm) - 1) * i / (n - 1))], 5) for i in range(n)]
+
+    def log(f, steps, loss):
+        for s in steps:
+            f.write(json.dumps({"step": s, "loss": loss(s), "lr": 1e-4}) + "\n")
+
+    assert curve() == []  # nothing trained yet
+    losses = {s: 1 / s for s in range(1, 201)}
+    with open(path, "w") as f:
+        log(f, range(1, 201), lambda s: 1 / s)
+        f.write('{"step": 201, "lo')  # a line still being written
+    assert curve() == expected(losses) and len(expected(losses)) == 60
+    with open(path, "a") as f:
+        f.write('ss": NaN, "lr": 0.0001}\n')  # a NaN step doesn't bend the curve
+        log(f, range(202, 301), lambda s: 0.5)
+        log(f, range(150, 160), lambda s: 0.25)  # a resumed run logs steps again: the last value counts
+    losses.update({s: 0.5 for s in range(202, 301)} | {s: 0.25 for s in range(150, 160)})
+    assert curve() == expected(losses)
+    routes._curves.clear()
+    assert curve() == expected(losses)  # read in pieces = read at once
+
+    with open(path, "w") as f:  # started over from step 0, and already longer than before
+        log(f, range(1, 400), lambda s: 2.0 + (s % 7) / 10)
+    assert curve() == expected({s: 2.0 + (s % 7) / 10 for s in range(1, 400)})
+    with open(path, "w") as f:
+        log(f, range(1, 6), lambda s: 1.0)
+    assert curve() == [1.0] * 5
+
+    client.delete(f"/api/jobs/{jid}")
+    client.get("/api/jobs")
+    assert jid not in routes._curves

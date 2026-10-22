@@ -20,8 +20,12 @@ from einops import rearrange, repeat
 from ... import comfy_io
 from ...fp8_linear import assert_materialized, materialize
 from ...hf_assets import qwen3vl_tokenizer_and_config
-from ..base import FamilyDriver, FamilyInfo, MemoryProfile, ProfileField, count_blocks
+from ..base import Download, FamilyDriver, FamilyInfo, MemoryProfile, ProfileField, count_blocks
 from .model import Krea2Config, Krea2DiT
+
+# where the model manager downloads the files from, at the commit they were checked against
+HF_REPO, HF_REV = "Comfy-Org/Krea-2", "1171f4dc7e325bf3734586942e737872506c73e1"
+ADAPTER_REPO, ADAPTER_REV = "ostris/krea2_turbo_training_adapter", "64ba06d2354120be472d26380247c971b2fb6af3"
 
 SELECT_LAYERS = (2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35)
 PROMPT_PREFIX = (
@@ -66,9 +70,9 @@ class Krea2Driver(FamilyDriver):
                          help="The Qwen-Image VAE. The Wan 2.1 VAE has the same layout and passes the check, but "
                               "its decoder differs, so samples would come out wrong."),
             ProfileField("training_adapter", "Training adapter", required=False, hint="Krea 2 Turbo training adapter",
-                         help="For Turbo models: a de-distill LoRA applied only while training. Leave empty for Raw. "
-                              "An owner/repo/file path downloads from Hugging Face on first use.",
-                         default="ostris/krea2_turbo_training_adapter/krea2_turbo_training_adapter_v1.safetensors"),
+                         help="For Turbo models: a de-distill LoRA applied only while training (Download puts it in "
+                              "your loras folder). Leave empty for Raw.",
+                         default=""),
             ProfileField("sample_steps", "Sample steps", kind="number", default=8),
             ProfileField("sample_cfg", "Sampling CFG (0 = off)", kind="number", default=0),
             ProfileField("sample_mu", "Sampling fixed shift (mu, blank = auto)", kind="text", required=False, default="1.15",
@@ -96,6 +100,38 @@ class Krea2Driver(FamilyDriver):
         "text_encoder": {"layers.35.mlp.down_proj.weight": (2560, 9728)},  # 4B, not Qwen-Image 2.1's 8B
         "vae": {"decoder.head.2.weight": (3, 96)},  # RGB, not the Qwen-Image 2.1 RGBA VAE
     }
+    downloads = [
+        Download("diffusion_model", HF_REPO, "diffusion_models/krea2_turbo_int8_convrot.safetensors", 13_492_686_496,
+                 "Turbo · int8 convrot", HF_REV, recommended=True,
+                 sha256="8e4eeda70dd5037ab1ba2bef6b417f9f901e26093117cf397f741fc1fdaaf3f1"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/krea2_turbo_fp8_scaled.safetensors", 13_141_730_784,
+                 "Turbo · fp8 scaled", HF_REV,
+                 sha256="eb4dd8c612cfd10f64f25b057e6e6bbcb5737c94a7372177e456dbf7579502f1"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/krea2_turbo_nvfp4.safetensors", 7_673_668_448,
+                 "Turbo · nvfp4", HF_REV, sha256="61527003b2d537055494d01bc8efe51d6e86e64192ba23e3721a5647231fe394"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/krea2_turbo_bf16.safetensors", 26_283_332_608,
+                 "Turbo · bf16", HF_REV, sha256="78bbf8f4165eda19cea3cb06c78089221932a39e2eed8af9da741f942c47ffb3"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/krea2_raw_int8_convrot.safetensors", 13_492_686_496,
+                 "Raw · int8 convrot", HF_REV,
+                 sha256="5585a4a38c4bcfb6fde2d480a4aa6edf7f665721ebde56d30662c35a45f5fa5c"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/krea2_raw_fp8_scaled.safetensors", 13_141_730_784,
+                 "Raw · fp8 scaled", HF_REV,
+                 sha256="48cd5d6c100297968349b41a8e77c6591d1dac18a215807f5f25f59e5c54cd61"),
+        Download("diffusion_model", HF_REPO, "diffusion_models/krea2_raw_bf16.safetensors", 26_283_332_608,
+                 "Raw · bf16", HF_REV, sha256="f99bb0ff8e362b77342bc4994e0c50906fe7ef7074864b181b7d48d2fa6d03d7"),
+        Download("text_encoder", HF_REPO, "text_encoders/qwen3vl_4b_int8_convrot.safetensors", 4_858_559_240,
+                 "int8 convrot", HF_REV, recommended=True,
+                 sha256="32de113cbf8282b02cbff0794b637b9d6676da09314a1db5a30bcea9bf4ee01c"),
+        Download("text_encoder", HF_REPO, "text_encoders/qwen3vl_4b_fp8_scaled.safetensors", 5_242_467_968,
+                 "fp8 scaled", HF_REV, sha256="54bd5144df0bbc25dd6ccadfcb826b521445a1b06ae5a42570bdd2974ca87094"),
+        Download("text_encoder", HF_REPO, "text_encoders/qwen3vl_4b_bf16.safetensors", 8_875_719_384, "bf16", HF_REV,
+                 sha256="36f3ff447ef59201722e8f9ce6020c9819fdcfba6aa2608c4e09b1c0ce114e34"),
+        Download("vae", HF_REPO, "vae/qwen_image_vae.safetensors", 253_806_246, "bf16", HF_REV, recommended=True,
+                 sha256="a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f"),
+        Download("training_adapter", ADAPTER_REPO, "krea2_turbo_training_adapter_v1.safetensors", 228_587_504,
+                 "v1, for Turbo", ADAPTER_REV, recommended=True, folder="loras",
+                 sha256="d6898b9a4c741c0cc513a7ec89f03e7cc81f10ad0376bda8ef417819723af6e9"),
+    ]
 
     def __init__(self, profile: dict, device: torch.device, log=print):
         super().__init__(profile, device, log)

@@ -15,6 +15,8 @@ export const IconFolder = base(<path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-
 export const IconFile = base(<><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2Z" /><path d="M14 2v6h6" /></>);
 export const IconUp = base(<path d="m18 15-6-6-6 6" />);
 export const IconDown = base(<path d="m6 9 6 6 6-6" />);
+export const IconLeft = base(<path d="m15 18-6-6 6-6" />);
+export const IconRight = base(<path d="m9 18 6-6-6-6" />);
 export const IconX = base(<path d="M18 6 6 18M6 6l12 12" />);
 export const IconTrash = base(<><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6" /></>);
 export const IconStop = base(<rect x="6" y="6" width="12" height="12" rx="1.5" />);

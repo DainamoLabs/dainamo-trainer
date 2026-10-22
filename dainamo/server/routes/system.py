@@ -127,6 +127,17 @@ def _check_text_encoder(v: dict) -> dict:
     return v
 
 
+def _check_models(v: dict) -> dict:
+    from ..model_files import resolve_models_folder
+
+    folder = str(v.get("folder") or "").strip()
+    if folder:
+        folder = resolve_models_folder(folder)
+        if not os.path.isdir(folder):
+            raise HTTPException(400, f"The models folder wasn't found: {folder}")
+    return {"folder": folder}
+
+
 def _check_caption_styles(v: dict) -> dict:
     styles, seen = [], set()
     for st in v.get("styles") or []:
@@ -170,6 +181,8 @@ def put_settings(body: dict):
             v = _check_enhancer(v)
         if k == "caption_styles":
             v = _check_caption_styles(v)
+        if k == "models":
+            v = _check_models(v)
         if k == "llama":
             v = _check_llama(v)
         if k == "text_encoder":

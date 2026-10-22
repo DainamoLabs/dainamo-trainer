@@ -76,8 +76,9 @@ a.tb-chip:hover { color: var(--text); border-color: var(--border-strong); }
 .tb-text { display: flex; flex-direction: column; min-width: 0; line-height: 1.3; }
 .tb-name { max-width: 220px; font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tb-meta { font: 11px/1.3 var(--mono); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.tb-spark { width: 64px; height: 20px; flex-shrink: 0; }
-.tb-spark path { fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.spark { flex-shrink: 0; }
+.spark path { fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.tb-spark { width: 64px; height: 20px; }
 .tb-pct { font: 600 13px var(--mono); color: var(--accent); flex-shrink: 0; }
 .tb-line { position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: var(--panel-3); }
 .tb-line span { display: block; height: 100%; background: var(--accent); transition: width 0.4s; }
@@ -273,6 +274,7 @@ h3 > .pill { margin-left: 8px; vertical-align: 2px; }
 .job-thumb { width: 88px; height: 88px; border-radius: 8px; background: var(--panel-3) center/cover no-repeat; display: grid; place-items: center; color: var(--faint); }
 .job-title { font-weight: 600; font-size: 15px; }
 .job-meta { color: var(--muted); font-size: 12.5px; display: flex; gap: 14px; flex-wrap: wrap; margin-top: 3px; }
+.job-spark { width: 88px; height: 18px; }
 .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; }
 .stat { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
 .stat .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; }
@@ -290,6 +292,16 @@ h3 > .pill { margin-left: 8px; vertical-align: 2px; }
 .lightbox-facts { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; font-size: 12px; color: var(--muted); }
 .lightbox-facts strong { color: var(--text); font-size: 13px; font-weight: 600; max-width: 100%; }
 .lightbox-caption { margin-top: 6px; font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 24vh; overflow: auto; cursor: text; }
+.lightbox-pos { color: var(--text); font-variant-numeric: tabular-nums; }
+@media (hover: none) { .key-hint { visibility: hidden; } } /* no keyboard on a phone */
+.lightbox-edit { margin-top: 6px; display: flex; flex-direction: column; gap: 6px; }
+.lightbox-edit textarea { width: 100%; min-height: 60px; max-height: 24vh; resize: vertical; font-size: 13px; line-height: 1.5; }
+.lightbox-media { position: relative; }
+.lightbox-nav { position: absolute; top: 50%; transform: translateY(-50%); z-index: 1; width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center; background: rgba(0,0,0,0.55); border: 1px solid rgba(255,255,255,0.18); color: #fff; cursor: pointer; }
+.lightbox-nav.prev { left: 0; }
+.lightbox-nav.next { right: 0; }
+.lightbox-nav:hover:not(:disabled) { background: rgba(0,0,0,0.8); }
+.lightbox-nav:disabled { opacity: 0.25; cursor: default; }
 .audio-card { display: flex; flex-direction: column; gap: 8px; width: 100%; cursor: default; }
 .audio-card img { width: 100%; aspect-ratio: 4 / 1; object-fit: cover; border-radius: 6px; background: #000; display: block; }
 .audio-card audio { width: 100%; height: 36px; }
@@ -462,6 +474,22 @@ img.audio-thumb { aspect-ratio: 2; object-fit: fill; }
 .switch input:focus-visible + i { outline: 2px solid var(--accent-line); outline-offset: 2px; }
 
 /* profile editor: what files a family needs */
+/* Profiles → Model files */
+.mf-grid { align-items: start; }
+.mf-grid > .card { min-width: 0; } /* long file names shorten instead of widening the column */
+.mf-head { display: flex; align-items: center; gap: 10px 16px; flex-wrap: wrap; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel); }
+.mf-field { display: grid; grid-template-columns: 140px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 9px 0; border-top: 1px solid var(--border); font-size: 13px; }
+.mf-field:first-of-type { border-top: 0; }
+.mf-files { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.mf-file { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: 12.5px; }
+.mf-file > svg { color: var(--ok); flex: none; }
+.mf-task + .mf-task { padding-top: 12px; border-top: 1px solid var(--border); }
+.ds-pick.mf-opt { grid-template-columns: auto minmax(0, 1fr) auto; }
+.mf-opt-side { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+@media (max-width: 560px) {
+  .mf-field { grid-template-columns: minmax(0, 1fr) auto; }
+  .mf-field .mf-files { grid-column: 1 / -1; grid-row: 2; }
+}
 .needs { border: 1px solid var(--accent-line); background: var(--accent-dim); border-radius: var(--radius); padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; }
 .needs-title { font-size: 12px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase; color: var(--accent); }
 .needs-row { display: grid; grid-template-columns: 130px minmax(0, 1fr) auto; gap: 4px 12px; font-size: 13px; align-items: baseline; }
@@ -501,6 +529,12 @@ img.audio-thumb { aspect-ratio: 2; object-fit: fill; }
 .view-tabs button.on { color: var(--text); border-bottom-color: var(--accent); }
 .view-tabs button:focus-visible { outline: 2px solid var(--accent-line); outline-offset: -3px; border-radius: 6px; }
 .view-tabs .count { font-size: 11px; line-height: 1; padding: 3px 7px; border-radius: 9px; background: var(--panel-3); color: var(--muted); }
+/* Profiles: a heading per family, with a rule out to the right */
+.pf-group + .pf-group { margin-top: 28px; }
+.pf-group-head { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.pf-group-head h2 { margin: 0; font-size: 15px; font-weight: 600; }
+.pf-group-head .count { font-size: 11px; line-height: 1; padding: 3px 7px; border-radius: 9px; background: var(--panel-3); color: var(--muted); }
+.pf-group-head::after { content: ""; flex: 1; height: 1px; margin-left: 6px; background: var(--border); }
 .view-tabs .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
 .view-tabs .dot.live { background: var(--ok); animation: pulse 1.6s infinite; }
 .view-tabs .dot.err { background: var(--danger); }

@@ -27,8 +27,11 @@ from safetensors import safe_open
 from ... import comfy_io
 from ... import dataset as ds
 from ...fp8_linear import assert_materialized, materialize
-from ..base import FamilyDriver, FamilyInfo, MemoryProfile, ProfileField, Workflow, count_blocks
+from ..base import Download, FamilyDriver, FamilyInfo, MemoryProfile, ProfileField, Workflow, count_blocks
 from . import model as M
+
+# where the model manager downloads the files from, at the commit they were checked against
+HF_REPO, HF_REV = "Comfy-Org/YuE2", "2f76ca75e6ee094169de899cc7fc99d6887e2196"
 
 MAX_SECONDS = 360  # longest song or clip (the release's 9000 semantic tokens)
 MIN_SECONDS = 5
@@ -91,6 +94,13 @@ class YuE2Driver(FamilyDriver):
                      "dainamo.recommended_strength": str(LORA_STRENGTH)}
     signature_keys = {"diffusion_model": ["model.diffusion_model.llm2vae.weight", "text_encoders.yue2_tokenizer_json",
                                           "vae.decoder.layers.0.weight_v"]}
+    downloads = [
+        Download("diffusion_model", HF_REPO, "checkpoints/yue2_3b_int8_convrot.safetensors", 3_960_938_800,
+                 "int8 convrot", HF_REV, recommended=True,
+                 sha256="96fe199377309001ed8cd26a944baeee8cc31a20ba7c36d1d3c0a7e1f4149db6"),
+        Download("diffusion_model", HF_REPO, "checkpoints/yue2_3b_bf16.safetensors", 7_799_983_228, "bf16", HF_REV,
+                 sha256="33765adbf9813c9a50318218760b2fd819a319862460a04884607581961c6fee"),
+    ]
     supports_samplers = False  # the release's midpoint ODE
     fps = M.FRAME_RATE  # latent frames a second
     # measured with scripts/measure_memory.py on the int8 convrot checkpoint (10-60 s clips); VAE costs are per

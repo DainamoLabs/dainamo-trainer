@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { go } from "../App";
-import { api, fmtTime, q, type Dataset, type Family, type Gpu, type MediaItem, type Profile, type Settings, type WhisperModel } from "../api";
+import { api, byFamily, fmtTime, q, type Dataset, type Family, type Gpu, type MediaItem, type Profile, type Settings, type WhisperModel } from "../api";
 import { CheckIssues, useDatasetCheck } from "../components/DatasetCheck";
 import { IconDownload, IconEdit, IconImages, IconPlus, IconScissors, IconSparkle, IconTrash, IconUpload, IconX } from "../components/icons";
-import { ConfirmDialog, Info, Lightbox, Modal, PathInput, fmtSize, usePoll, useToast } from "../components/ui";
+import { ConfirmDialog, Info, Lightbox, Modal, PathInput, ProfileOptions, fmtSize, usePoll, useToast } from "../components/ui";
 
 type SplitStatus = {
   running: boolean; total: number; done: number; clips: number; current?: string; message?: string; errors: string[];
@@ -158,7 +158,8 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
   const d = ds?.find((x) => x.id === id);
   const [items, setItems] = useState<MediaItem[] | null>(null);
   const [filter, setFilter] = useState<"all" | "missing">("all");
-  const [light, setLight] = useState<MediaItem | null>(null);
+  // the file in the enlarged view, and the files previous and next step through: the grid's, as it was when it opened
+  const [light, setLight] = useState<{ path: string; order: string[] } | null>(null);
   const [capOpen, setCapOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
   const [trigger, setTrigger] = useState("");
@@ -237,6 +238,13 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
 
   if (ds && !d) return <div className="page"><div className="empty"><strong>Dataset not found</strong><a href="#/datasets">Back to datasets</a></div></div>;
   const shown = (items || []).filter((i) => filter === "all" || !i.caption);
+  const open = (path: string) => {
+    const from = shown.some((x) => x.path === path) ? shown : items || []; // the health check can open a filtered-out one
+    setLight({ path, order: from.map((x) => x.path) });
+  };
+  const lit = light && items?.find((x) => x.path === light.path);
+  const captionSaved = (path: string, c: string) =>
+    setItems((xs) => xs!.map((x) => (x.path === path ? { ...x, caption: c, has_caption: true } : x)));
   const missing = (items || []).filter((i) => !i.caption).length;
   const onlyAudio = !!items?.length && items.every((i) => i.kind === "audio");
 
@@ -337,10 +345,7 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
         )}
       </div>
 
-      <HealthCheck id={id} families={families} onOpen={(path) => {
-        const it = items?.find((x) => x.path === path);
-        if (it) setLight(it);
-      }} />
+      <HealthCheck id={id} families={families} onOpen={(path) => { if (items?.some((x) => x.path === path)) open(path); }} />
 
       {(over || uploading) && (
         <div className={"dropzone over"} style={{ marginBottom: 16 }}>{uploading || "Drop images, videos or audio to upload"}</div>
@@ -358,12 +363,12 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
       <div className="media-grid">
         {shown.map((it) => (
           <div className="media-card" key={it.path}>
-            <div className={"media-thumb" + (it.kind === "audio" ? " audio" : "")} style={{ backgroundImage: `url(/api/thumb?path=${q(it.path)})` }} onClick={() => setLight(it)}>
+            <div className={"media-thumb" + (it.kind === "audio" ? " audio" : "")} style={{ backgroundImage: `url(/api/thumb?path=${q(it.path)})` }} onClick={() => open(it.path)}>
               {it.kind === "video" && <span className="badge">VIDEO</span>}
               {it.kind === "audio" && <span className="badge">AUDIO</span>}
               {!it.caption && <span className="nocap" title="No caption" />}
             </div>
-            <CaptionCell item={it} onSaved={(c) => setItems((xs) => xs!.map((x) => (x.path === it.path ? { ...x, caption: c, has_caption: true } : x)))} />
+            <CaptionCell item={it} onSaved={(c) => captionSaved(it.path, c)} />
             <div className="row small" style={{ padding: "0 10px 8px" }}>
               <span className="faint ellipsis" title={it.cut_from ? `${it.name}: cut from ${it.cut_from.source} at ${fmtClock(it.cut_from.start)}` : it.name}>{it.name}</span>
               <span className="spacer" />
@@ -373,12 +378,17 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
         ))}
       </div>
 
-      {light && <Lightbox src={`/api/media?path=${q(light.path)}`} video={light.kind === "video"} onClose={() => setLight(null)}
-        audio={light.kind === "audio" ? { poster: `/api/thumb?size=1024&path=${q(light.path)}` } : undefined}
-        info={{ name: light.name, caption: light.caption, details: [
-          ...(light.size != null ? [fmtSize(light.size)] : []),
-          ...(light.cut_from ? [`cut from ${light.cut_from.source} at ${fmtClock(light.cut_from.start)}`] : []),
-        ] }} />}
+      {light && lit && <Lightbox src={`/api/media?path=${q(lit.path)}`} video={lit.kind === "video"} onClose={() => setLight(null)}
+        audio={lit.kind === "audio" ? { poster: `/api/thumb?size=1024&path=${q(lit.path)}` } : undefined}
+        nav={{ at: light.order.indexOf(lit.path), count: light.order.length,
+          go: (s) => setLight((l) => l && { ...l, path: l.order[l.order.indexOf(l.path) + s] ?? l.path }) }}
+        info={{ name: lit.name, caption: lit.caption, details: [
+          ...(lit.size != null ? [fmtSize(lit.size)] : []),
+          ...(lit.cut_from ? [`cut from ${lit.cut_from.source} at ${fmtClock(lit.cut_from.start)}`] : []),
+        ], onCaption: async (c) => {
+          await api.put("/api/caption", { path: lit.path, caption: c });
+          captionSaved(lit.path, c.trim());
+        } }} />}
       {confirmRemove && d && (
         <ConfirmDialog title="Remove dataset" danger confirmLabel="Remove" onClose={() => setConfirmRemove(false)} onConfirm={removeDataset}
           message={d.managed ? <>Remove <strong style={{ color: "var(--text)" }}>{d.name}</strong> from Dainamo?</>
@@ -578,7 +588,7 @@ function SplitModal({ dataset, families, onClose, onStarted }: { dataset: Datase
     api.get<Profile[]>("/api/profiles").then((ps) => {
       const video = ps.filter((p) => videoFamilies.some((f) => f.id === p.family));
       setProfiles(video);
-      if (video[0]) pickProfile(video[0]);
+      if (video[0]) pickProfile(byFamily(video, videoFamilies)[0].profiles[0]);
     });
     api.get<{ gpus: Gpu[] }>("/api/system").then((sys) => {
       setGpus(sys.gpus);
@@ -634,7 +644,7 @@ function SplitModal({ dataset, families, onClose, onStarted }: { dataset: Datase
           <label className="field">
             <span>Profile</span>
             <select value={profileId} onChange={(e) => pickProfile(profiles!.find((p) => p.id === e.target.value)!)} disabled={!profiles?.length}>
-              {profiles?.map((p) => <option key={p.id} value={p.id}>{p.name} · {videoFamilies.find((f) => f.id === p.family)?.label}</option>)}
+              <ProfileOptions profiles={profiles || []} families={videoFamilies} />
             </select>
           </label>
           <label className="field">

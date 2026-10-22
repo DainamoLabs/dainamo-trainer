@@ -4,7 +4,7 @@ import { api, fmtDuration, fmtTime, q, type Checkpoint, type DiskUse, type Extra
 import { EvalPanel } from "../components/EvalPanel";
 import { EvaluateDialog } from "../components/EvalSettings";
 import { HardwareCards } from "../components/Hardware";
-import { LossChart, useMetrics } from "../components/LossChart";
+import { LossChart, Spark, useMetrics } from "../components/LossChart";
 import { IconCamera, IconCopy, IconDown, IconDownload, IconEdit, IconImages, IconLayers, IconPlay, IconRefresh, IconSave, IconStop, IconTarget, IconTrash, IconUp } from "../components/icons";
 import { AudioCard, ConfirmDialog, Lightbox, Modal, StatusPill, fmtSize, usePoll, useToast } from "../components/ui";
 import { SamplesPanel } from "../components/Samples";
@@ -146,6 +146,7 @@ function JobRow({ j, reload, queuedIndex, queuedCount, size }: { j: Job; reload:
             <div className="row small" style={{ marginBottom: 5 }}>
               <span>{active ? PHASES[p.phase || ""] || p.phase : `Step ${p.step}`}{active && p.phase === "training" ? ` · step ${p.step} / ${p.total_steps}` : ""}</span>
               <span className="spacer" />
+              <Spark values={j.loss_curve} className="job-spark" />
               {p.avg_loss != null && <span className="muted">loss {p.avg_loss.toFixed(4)}</span>}
               {active && p.it_per_sec != null && <span className="muted">{(1 / p.it_per_sec).toFixed(1)} s/it</span>}
               {active && p.eta_seconds != null && p.phase === "training" && <span className="muted">ETA {fmtDuration(p.eta_seconds)}</span>}

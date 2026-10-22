@@ -40,6 +40,15 @@ export function smooth(points: Point[], alpha: number): Point[] {
   });
 }
 
+/** A loss curve (a job's ``loss_curve``: smoothed already) as a small line, scaled to fill its box; nothing until
+ *  there are 10 values (or from a server older than ``loss_curve``). */
+export function Spark({ values, className = "" }: { values?: number[]; className?: string }) {
+  if (!values || values.length < 10) return null;
+  const lo = Math.min(...values), hi = Math.max(...values), n = values.length;
+  const d = values.map((v, i) => `${i ? "L" : "M"}${((64 * i) / (n - 1)).toFixed(1)},${(2 + 16 * (1 - (v - lo) / (hi - lo || 1))).toFixed(1)}`).join("");
+  return <svg className={"spark " + className} viewBox="0 0 64 20" preserveAspectRatio="none" aria-hidden="true"><path d={d} /></svg>;
+}
+
 export function LossChart({ points, totalSteps }: { points: Point[]; totalSteps: number }) {
   const W = 760, H = 220, L = 46, R = 12, T = 12, B = 26;
   const [hover, setHover] = useState<number | null>(null);
