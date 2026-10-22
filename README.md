@@ -1,5 +1,7 @@
 # Dainamo Trainer
 
+[![CI](https://github.com/DainamoLabs/dainamo-trainer/actions/workflows/ci.yml/badge.svg)](https://github.com/DainamoLabs/dainamo-trainer/actions/workflows/ci.yml)
+
 A browser-based LoRA trainer for diffusion models with its own training engine.
 It reads ComfyUI-format model files directly (including `fp8_scaled` weights)
 and saves LoRAs that load in ComfyUI.
@@ -1128,6 +1130,10 @@ system RAM and streamed from there.
 uv pip install --python .venv/bin/python pytest   # once
 .venv/bin/python -m pytest tests -v
 ```
+
+GitHub Actions (`.github/workflows/ci.yml`) runs these on every push to master
+and every pull request, on a machine without a GPU: the tests that need one, or
+model files, skip themselves there. It also type-checks and builds the web UI.
 
 `tests/test_quant.py` builds small ComfyUI-style fp8 and int8/convrot files to
 check loading, forward/backward parity, per-channel scale precision and LoRA

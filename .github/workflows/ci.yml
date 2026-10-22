@@ -1,0 +1,47 @@
+# On every push to master and every pull request: the Python tests on a CPU-only machine (those that need a GPU
+# or model files skip themselves there), and the web UI's type check and build.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  python:
+    name: Python tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      # PyTorch's CPU build first, so requirements.txt finds it installed instead of fetching the CUDA one
+      - name: Install dependencies
+        run: |
+          pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt pytest
+      - name: Test
+        run: python -m pytest tests -q -rs
+
+  web:
+    name: Web UI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - name: Type check and build
+        run: npm run build

@@ -17,7 +17,7 @@ export type Tab = "create" | "edit" | "queue" | "sandbox" | "datasets" | "profil
 function readHash(): { tab: Tab; arg: string; view: string } {
   const [tab, arg, view] = window.location.hash.replace(/^#\/?/, "").split("/");
   const ok = ["create", "edit", "queue", "sandbox", "datasets", "profiles", "settings"].includes(tab);
-  return { tab: (ok ? tab : "create") as Tab, arg: arg ? decodeURIComponent(arg) : "", view: view || "" };
+  return { tab: (ok ? tab : "queue") as Tab, arg: arg ? decodeURIComponent(arg) : "", view: view || "" };
 }
 
 export function go(tab: Tab, arg = "", view = "") {
