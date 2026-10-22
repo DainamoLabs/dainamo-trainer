@@ -13,6 +13,11 @@ Two kinds of trainable adapter:
     the large one, both trained in full. Saved as ``<prefix>.<module>.lokr_w1`` / ``lokr_w2``, the
     LyCORIS key layout ComfyUI loads. The product is never built at full size: the forward pass
     applies ``w2`` and ``w1`` to the input in turn (``kron_delta``).
+
+Frozen adapters (the Sandbox's LoRAs, a training adapter) can also hold whole changes, as ComfyUI's loader
+takes them and a LoRA extracted from a finetune has them (``engine.extract``): ``<module>.diff`` (a weight's, or
+any tensor's) and ``<module>.diff_b`` (a bias's). On a Linear they apply in its wrapper; on anything else (a
+norm's scale) the Sandbox adds them to the tensor in place (``AdapterStack``).
 """
 
 from __future__ import annotations
@@ -57,11 +62,13 @@ def kron_delta(x: torch.Tensor, w1: torch.Tensor, w2) -> torch.Tensor:
 
 
 class Frozen:
-    """A frozen adapter's weights on one layer, applied at ``scale``: a LoRA (``down``, ``up``), or a
-    LoKr (``w1``, and ``w2`` full or as a low-rank pair)."""
+    """A frozen adapter's weights on one layer, applied at ``scale``: a LoRA (``down``, ``up``), a LoKr
+    (``w1``, and ``w2`` full or as a low-rank pair), or a whole change to the weight (``full``) or the bias
+    (``bias``)."""
 
-    def __init__(self, scale: float, down=None, up=None, w1=None, w2=None):
+    def __init__(self, scale: float, down=None, up=None, w1=None, w2=None, full=None, bias=None):
         self.scale, self.down, self.up, self.w1, self.w2 = scale, down, up, w1, w2
+        self.full, self.bias = full, bias
 
     def to(self, device, dtype, strength: float = 1.0) -> Frozen:
         """A copy on ``device`` in ``dtype``, its scale times ``strength``."""
@@ -69,9 +76,24 @@ class Frozen:
             if t is None:
                 return None
             return tuple(mv(x) for x in t) if isinstance(t, tuple) else t.to(device, dtype)
-        return Frozen(self.scale * strength, mv(self.down), mv(self.up), mv(self.w1), mv(self.w2))
+        return Frozen(self.scale * strength, mv(self.down), mv(self.up), mv(self.w1), mv(self.w2), mv(self.full),
+                      mv(self.bias))
+
+    def dense(self) -> torch.Tensor:
+        """The change to the tensor it applies to, at full size and scaled, in fp32."""
+        if self.bias is not None or self.full is not None:
+            t = self.bias if self.bias is not None else self.full
+            return t.float() * self.scale
+        if self.w1 is None:
+            return self.up.float() @ self.down.float() * self.scale
+        w2 = self.w2[0].float() @ self.w2[1].float() if isinstance(self.w2, tuple) else self.w2.float()
+        return torch.kron(self.w1.float(), w2) * self.scale
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if self.bias is not None:
+            return self.bias * self.scale
+        if self.full is not None:
+            return x.to(self.full.dtype) @ self.full.t() * self.scale
         if self.w1 is None:
             x = x.to(self.down.dtype)
             return x @ self.down.t() @ self.up.t() * self.scale
@@ -270,8 +292,8 @@ class LoRANetwork:
         matched = 0
         for name, adapter in adapter_layers(load_file(path)):
             wrapper = self.wrappers.get(name) or _wrap_existing(self.model, name, self.wrappers)
-            if wrapper is None:
-                continue
+            if wrapper is None or (adapter.full is not None and adapter.full.dim() != 2):
+                continue  # not a Linear's (a norm's scale): training adapters apply only to Linears
             wrapper.assistants.append(adapter.to(device, dtype, multiplier))
             matched += 1
         if matched == 0:
@@ -285,15 +307,20 @@ KOHYA_PREFIXES = ("lora_unet_", "lycoris_")
 
 
 def adapter_layers(sd: dict[str, torch.Tensor]) -> list[tuple[str, Frozen]]:
-    """(module name, frozen adapter) for every LoRA (``lora_A``/``lora_B``) and LoKr (``lokr_w1``/``lokr_w2``,
-    either may be a low-rank ``_a``/``_b`` pair) in a PEFT/ComfyUI-style state dict. As loaders do,
-    alpha scales by the rank: a LoRA's, or a LoKr's low-rank pair's (a LoKr of full matrices: 1)."""
+    """(module name, frozen adapter) for every LoRA (``lora_A``/``lora_B``), LoKr (``lokr_w1``/``lokr_w2``,
+    either may be a low-rank ``_a``/``_b`` pair) and whole change (``diff``, ``diff_b``) in a PEFT/ComfyUI-style
+    state dict; a layer may have several. As loaders do, alpha scales by the rank: a LoRA's, or a LoKr's
+    low-rank pair's (a LoKr of full matrices: 1)."""
     if any(k.endswith(".dora_scale") for k in sd):
         raise ValueError("DoRA adapters aren't supported")
     out = []
     for key in sd:
         base, _, suffix = key.rpartition(".")
-        if key.endswith(".lora_A.weight"):
+        if suffix == "diff_b":
+            out.append((base, Frozen(1.0, bias=sd[key])))
+        elif suffix == "diff":
+            out.append((base, Frozen(1.0, full=sd[key])))
+        elif key.endswith(".lora_A.weight"):
             base = key[: -len(".lora_A.weight")]
             a, b = sd[key], sd[f"{base}.lora_B.weight"]
             alpha = sd.get(f"{base}.alpha")
@@ -335,21 +362,71 @@ def _wrap_existing(model: nn.Module, name: str, wrappers: dict) -> LoRALinear | 
     return wrapper
 
 
+def _tensor(model: nn.Module, path: str) -> torch.Tensor | None:
+    """The parameter or buffer at ``path`` ("layers.0.norm.weight"), or None."""
+    owner, _, attr = path.rpartition(".")
+    try:
+        module = model.get_submodule(owner) if owner else model
+    except AttributeError:
+        return None
+    t = getattr(module, attr, None)
+    return t if isinstance(t, torch.Tensor) else None
+
+
 class AdapterStack:
     """Frozen LoRAs and LoKrs applied at inference, each at its own strength (the Sandbox). Wrapping is
-    permanent; ``set`` replaces what the wrappers apply."""
+    permanent; ``set`` replaces what the wrappers apply. A change to a tensor that isn't a Linear layer's (a
+    norm's scale, from a LoRA extracted from a finetune) is added to it in place, and its original is kept, to
+    put back when it's cleared or switched off. Tensors are looked up by name each time: a streamed block's
+    point at its copy in RAM between forward passes, which is the one changed."""
 
     def __init__(self, model: nn.Module, device, dtype=torch.bfloat16):
         self.model, self.device, self.dtype = model, device, dtype
         self.wrappers: dict[str, LoRALinear] = {}
+        self.originals: dict[str, torch.Tensor] = {}  # tensor name -> its value without the changes
+        self.changes: dict[str, torch.Tensor] = {}  # tensor name -> the sum of the changes to it (fp32)
+        self.patched = False
 
     def clear(self):
         for w in self.wrappers.values():
             w.assistants = []
+        self._put(False)
+        self.originals, self.changes = {}, {}
 
     def set_enabled(self, enabled: bool):
         for w in self.wrappers.values():
             w.assistants_enabled = enabled
+        self._put(enabled)
+
+    def _patch(self, name: str, adapter: Frozen, strength: float) -> bool:
+        """Add ``adapter``'s change to the tensor it's for, in place (on ``set_enabled``): a bias, a module's weight,
+        or a tensor named as itself. False if there's no such tensor of its shape."""
+        delta = adapter.dense() * strength
+        paths = [f"{name}.bias"] if adapter.bias is not None else [f"{name}.weight", name]
+        for path in paths:
+            t = _tensor(self.model, path)
+            if t is not None and t.is_floating_point() and t.numel() == delta.numel():
+                break
+        else:
+            return False
+        if path not in self.originals:
+            self.originals[path] = t.detach().clone()
+        delta = delta.reshape(t.shape).to(t.device)
+        self.changes[path] = self.changes[path] + delta if path in self.changes else delta
+        return True
+
+    @torch.no_grad()
+    def _put(self, on: bool):
+        """The in-place changes on (``on``) or off."""
+        if not self.originals or on == self.patched:
+            return
+        for path, orig in self.originals.items():
+            t = _tensor(self.model, path)
+            if t is None:
+                continue
+            value = orig.float() + self.changes[path].to(orig.device) if on else orig
+            t.copy_(value.to(t.device, t.dtype))
+        self.patched = on
 
     def _from_kohya(self, sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """kohya-style ``lora_unet_<path_with_underscores>.lora_down/lora_up`` (or ``.lokr_w1`` ...) -> PEFT
@@ -388,10 +465,11 @@ class AdapterStack:
             matched = 0
             for name, adapter in layers:
                 wrapper = self.wrappers.get(name) or _wrap_existing(self.model, name, self.wrappers)
-                if wrapper is None:
-                    continue
-                wrapper.assistants.append(adapter.to(self.device, self.dtype, float(strength)))
-                matched += 1
+                if wrapper is not None and (adapter.full is None or adapter.full.dim() == 2):
+                    wrapper.assistants.append(adapter.to(self.device, self.dtype, float(strength)))
+                    matched += 1
+                elif wrapper is None and self._patch(name, adapter, float(strength)):
+                    matched += 1
             if matched == 0:
                 self.clear()
                 raise ValueError(f"LoRA {label} matches no layers of this model (wrong model family?)")

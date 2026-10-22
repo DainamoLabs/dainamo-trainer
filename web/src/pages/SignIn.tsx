@@ -25,7 +25,7 @@ export default function SignIn({ onDone }: { onDone: () => void }) {
     <div className="signin">
       <form className="card card-pad signin-card" onSubmit={submit}>
         <div className="brand">
-          <img src="/logo.png" alt="" />
+          <img src="/logo.svg" alt="" />
           <div className="brand-name">Dainamo<span>Trainer</span></div>
         </div>
         <label className="field">

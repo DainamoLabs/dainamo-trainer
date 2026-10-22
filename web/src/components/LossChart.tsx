@@ -1,8 +1,38 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { api } from "../api";
 
 type Point = { step: number; loss: number };
 
-function smooth(points: Point[], alpha: number): Point[] {
+/** A job's logged losses, fetched again every ``ms`` for the steps after the last one it has (none without an ``id``). */
+export function useMetrics(id: string | null, ms = 3000): Point[] {
+  const [metrics, setMetrics] = useState<Point[]>([]);
+  const lastStep = useRef(0);
+  useEffect(() => {
+    lastStep.current = 0;
+    setMetrics([]);
+    if (!id) return;
+    let live = true;
+    type M = { points: Point[]; last: number };
+    const pull = (): Promise<void> => api.get<M>(`/api/jobs/${id}/metrics?after=${lastStep.current}`).then(({ points, last }) => {
+      if (!live) return;
+      if (last < lastStep.current) {
+        // the job was restarted and its metrics rewritten from step 1
+        lastStep.current = 0;
+        setMetrics([]);
+        return pull();
+      }
+      if (!points.length) return;
+      lastStep.current = points[points.length - 1].step;
+      setMetrics((xs) => [...xs.filter((x) => x.step < points[0].step), ...points]);
+    }, () => {});
+    pull();
+    const t = setInterval(pull, ms);
+    return () => { live = false; clearInterval(t); };
+  }, [id, ms]);
+  return metrics;
+}
+
+export function smooth(points: Point[], alpha: number): Point[] {
   let ema: number | null = null;
   return points.map((p) => {
     ema = ema == null ? p.loss : alpha * ema + (1 - alpha) * p.loss;

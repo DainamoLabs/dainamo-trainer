@@ -1,31 +1,34 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { go } from "../App";
-import { api, fmtDuration, fmtTime, type DiskUse, type Job, type JobDetail, type JobDiskUse, type RefModMade } from "../api";
+import { api, fmtDuration, fmtTime, q, type Checkpoint, type DiskUse, type ExtractMade, type Job, type JobDetail, type JobDiskUse, type RefModMade } from "../api";
 import { EvalPanel } from "../components/EvalPanel";
 import { EvaluateDialog } from "../components/EvalSettings";
 import { HardwareCards } from "../components/Hardware";
-import { LossChart } from "../components/LossChart";
-import { IconCamera, IconCopy, IconDown, IconDownload, IconEdit, IconImages, IconPlay, IconRefresh, IconSave, IconStop, IconTarget, IconTrash, IconUp } from "../components/icons";
+import { LossChart, useMetrics } from "../components/LossChart";
+import { IconCamera, IconCopy, IconDown, IconDownload, IconEdit, IconImages, IconLayers, IconPlay, IconRefresh, IconSave, IconStop, IconTarget, IconTrash, IconUp } from "../components/icons";
 import { AudioCard, ConfirmDialog, Lightbox, Modal, StatusPill, fmtSize, usePoll, useToast } from "../components/ui";
 import { SamplesPanel } from "../components/Samples";
 import { Terminal } from "../components/Terminal";
 import { CLONE_KEY, formOf } from "./CreateJob";
 
-const PHASES: Record<string, string> = {
+export const PHASES: Record<string, string> = {
   starting: "Starting", preparing: "Scanning datasets", caching_text: "Encoding captions", caching_latents: "Encoding training files",
   loading: "Loading model", rendering: "Rendering training images", training: "Training", sampling: "Sampling", evaluating: "Evaluating checkpoint", completed: "Completed", stopped: "Stopped", failed: "Failed",
-  encoding: "Making the RefMod",
+  encoding: "Making the RefMod", extracting: "Extracting the LoRA",
 };
 
 function useJobAction() {
   const toast = useToast();
-  // a RefMod job (``refmod``) is made again from the start: "restart" asks about the file it made
-  return async (job: { id: string; name: string; evaluating?: boolean; refmod?: boolean }, action: string, after?: () => void) => {
+  // a RefMod job (``refmod``) or an extracted LoRA's (``extract``) is made again from the start: "restart" asks
+  // about the file it made
+  return async (job: { id: string; name: string; evaluating?: boolean; refmod?: boolean; extract?: boolean }, action: string, after?: () => void) => {
     if (action === "restart" && !confirm(job.refmod ? `Make "${job.name}" again? The RefMod it made and its preview will be deleted.`
+      : job.extract ? `Extract "${job.name}" again? The LoRA it made will be deleted.`
       : `Restart "${job.name}" from step 0? Its checkpoints and samples will be deleted.`)) return;
     try {
       await api.post(`/api/jobs/${job.id}/action`, { action });
-      const msg: Record<string, string> = { stop: job.evaluating ? "Stopping the checkpoint evaluation" : job.refmod ? "Stopping" : "Stopping — saving state…", sample: "Sampling requested", save: "Checkpoint requested", resume: job.refmod ? "Queued to be made again" : "Re-queued (resumes from last save)", restart: job.refmod ? "Queued to be made again" : "Restarted" };
+      const again = job.refmod ? "Queued to be made again" : job.extract ? "Queued to be extracted again" : "";
+      const msg: Record<string, string> = { stop: job.evaluating ? "Stopping the checkpoint evaluation" : again ? "Stopping" : "Stopping — saving state…", sample: "Sampling requested", save: "Checkpoint requested", resume: again || "Re-queued (resumes from last save)", restart: again || "Restarted" };
       if (msg[action]) toast(msg[action]);
       after?.();
     } catch (e: any) {
@@ -41,7 +44,7 @@ async function cloneJob(id: string) {
   go("create");
 }
 
-const FINISHED = ["completed", "stopped", "failed", "interrupted"];
+export const FINISHED = ["completed", "stopped", "failed", "interrupted"];
 
 /** What a job's folder holds on disk, with clearing what can be made again (or isn't needed any more). */
 function DiskCard({ job }: { job: JobDetail }) {
@@ -53,6 +56,7 @@ function DiskCard({ job }: { job: JobDetail }) {
   const finished = FINISHED.includes(job.status) && !job.config?.evaluate;
   const refmod = !!job.config?.settings?.refmod_enabled;
   const finetune = !!job.config?.settings?.finetune_enabled;
+  const extract = !!job.config?.settings?.extract_enabled;
   const clean = async (part: "cache" | "state") => {
     try {
       const r = await api.post<{ freed: number; kept: string[] }>("/api/disk/clean", { parts: [part], jobs: [job.id] });
@@ -63,12 +67,12 @@ function DiskCard({ job }: { job: JobDetail }) {
     }
   };
   const rows: [string, number, React.ReactNode][] = [
-    [refmod ? "RefMod" : finetune ? "Finetuned models" : "LoRA checkpoints", disk.output, null],
-    [refmod ? "Preview" : "Samples", disk.samples, null],
+    [refmod ? "RefMod" : finetune ? "Finetuned models" : extract ? "Extracted LoRA" : "LoRA checkpoints", disk.output, null],
+    ...(extract ? [] : [[refmod ? "Preview" : "Samples", disk.samples, null] as [string, number, React.ReactNode]]),
     // a job's own cache is from before caches were shared between jobs
     ...(disk.cache > 0 ? [["Cached captions and latents (its own, from before they were shared)", disk.cache,
       finished && <button className="btn sm" onClick={() => setConfirm("cache")}>Clear</button>] as [string, number, React.ReactNode]] : []),
-    ...(refmod && !disk.state ? [] : [["Training state (to resume or continue)", disk.state,
+    ...((refmod || extract) && !disk.state ? [] : [["Training state (to resume or continue)", disk.state,
       job.status === "completed" && finished && disk.state > 0 && <button className="btn sm" onClick={() => setConfirm("state")}>Delete</button>] as [string, number, React.ReactNode]]),
     ["Log, metrics and status", disk.other, null],
   ];
@@ -120,6 +124,7 @@ function JobRow({ j, reload, queuedIndex, queuedCount, size }: { j: Job; reload:
           <span>{j.profile_name}</span>
           {j.slider && <span>slider</span>}
           {j.refmod && <span>RefMod</span>}
+          {j.extract && <span>LoRA from a finetune</span>}
           {j.network === "lokr" && !j.refmod && <span>LoKr</span>}
           {j.network === "full" && <span>finetune</span>}
           {j.datasets.length > 0 && <span>{j.datasets.join(", ")}</span>}
@@ -136,7 +141,7 @@ function JobRow({ j, reload, queuedIndex, queuedCount, size }: { j: Job; reload:
             {p.message && <div className="faint" style={{ marginTop: 4 }}>{p.message}</div>}
           </div>
         )}
-        {!(active && j.evaluating) && (active || (p.step ?? 0) > 0) && (
+        {!(active && j.evaluating) && (active || ((p.step ?? 0) > 0 && !j.extract)) && (
           <div style={{ marginTop: 10 }}>
             <div className="row small" style={{ marginBottom: 5 }}>
               <span>{active ? PHASES[p.phase || ""] || p.phase : `Step ${p.step}`}{active && p.phase === "training" ? ` · step ${p.step} / ${p.total_steps}` : ""}</span>
@@ -158,14 +163,15 @@ function JobRow({ j, reload, queuedIndex, queuedCount, size }: { j: Job; reload:
         </>}
         {(j.status === "running" || j.status === "queued") && <button className="btn" onClick={() => act(j, "stop", reload)}><IconStop /> {j.status === "queued" ? "Cancel" : "Stop"}</button>}
         {j.status === "stopping" && <button className="btn danger" onClick={() => act(j, "stop", reload)}>Force stop</button>}
-        {["stopped", "failed", "interrupted"].includes(j.status) && <button className="btn primary" onClick={() => act(j, "resume", reload)}><IconPlay /> {j.refmod ? "Make again" : "Resume"}</button>}
-        {!active && j.status !== "queued" && <button className="btn icon" title="Duplicate settings into a new job" onClick={() => cloneJob(j.id)}><IconCopy /></button>}
+        {["stopped", "failed", "interrupted"].includes(j.status) && <button className="btn primary" onClick={() => act(j, "resume", reload)}><IconPlay /> {j.refmod ? "Make again" : j.extract ? "Extract again" : "Resume"}</button>}
+        {!active && j.status !== "queued" && !j.extract && <button className="btn icon" title="Duplicate settings into a new job" onClick={() => cloneJob(j.id)}><IconCopy /></button>}
         {!active && <button className="btn icon danger" title="Delete" onClick={() => setConfirmDel(true)}><IconTrash /></button>}
       </div>
       {confirmDel && (
         <ConfirmDialog title="Delete job" danger confirmLabel="Delete job" onClose={() => setConfirmDel(false)} onConfirm={remove}
           message={<>Remove <strong style={{ color: "var(--text)" }}>{j.name}</strong> from the queue?</>}
-          checkbox={j.refmod ? "Also delete its RefMod and preview from disk" : j.network === "full" ? "Also delete its finetuned models and samples from disk"
+          checkbox={j.refmod ? "Also delete its RefMod and preview from disk" : j.extract ? "Also delete its LoRA from disk"
+            : j.network === "full" ? "Also delete its finetuned models and samples from disk"
             : "Also delete its LoRA checkpoints and samples from disk"} />
       )}
     </div>
@@ -288,37 +294,118 @@ function RefModCard({ job, made, onOpen }: { job: JobDetail; made?: RefModMade; 
   );
 }
 
-function JobDetailView({ id }: { id: string }) {
+const EXTRACT_RANKS = [16, 32, 64, 128, 256, 512];
+const pct = (x: number) => `${(100 * x).toFixed(x >= 0.9995 ? 0 : 1)}%`;
+const basename = (p: string) => String(p || "").split(/[\\/]/).pop() || "";
+
+/** Extract a LoRA from one of a finetune's checkpoints: a job of its own, queued, so its LoRA is listed with it. */
+function ExtractDialog({ job, checkpoint, onClose }: { job: JobDetail; checkpoint: Checkpoint; onClose: () => void }) {
+  const toast = useToast();
+  const [rank, setRank] = useState(128);
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+  type Plan = { sizes: Record<string, number>; base: string; base_found: boolean };
+  const [plan, , err] = usePoll<Plan>(`/api/jobs/${job.id}/extract?file=${q(checkpoint.file)}`, 0, [checkpoint.file]);
+  const auto = `${checkpoint.file.replace(/\.safetensors$/, "")}_r${rank}`;
+  const start = async () => {
+    setBusy(true);
+    try {
+      const made = await api.post<Job>(`/api/jobs/${job.id}/extract`, { file: checkpoint.file, rank, name: name.trim() });
+      toast("Queued to extract the LoRA");
+      onClose();
+      go("queue", made.id);
+    } catch (e: any) {
+      toast(e.message, true);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Modal title="Extract a LoRA" onClose={onClose} footer={
+      <>
+        <button className="btn ghost" onClick={onClose}>Cancel</button>
+        <button className="btn primary" disabled={busy || (!!plan && !plan.base_found)} onClick={start}><IconLayers /> Extract</button>
+      </>
+    }>
+      <div className="stack" style={{ gap: 12 }}>
+        <div className="muted small">
+          What <span className="mono">{checkpoint.file}</span> (step {checkpoint.step}) changed from the model it was finetuned
+          from, <span className="mono">{plan ? basename(plan.base) : "…"}</span>, saved as a LoRA to use on that model.
+        </div>
+        {err && <div className="error-box small">{err}</div>}
+        {plan && !plan.base_found && <div className="error-box small">{plan.base || "Its profile's diffusion model"} isn't there any more, and the LoRA is the change from it.</div>}
+        <label className="field">
+          <span>Rank</span>
+          <select value={rank} onChange={(e) => setRank(Number(e.target.value))}>
+            {EXTRACT_RANKS.map((r) => <option key={r} value={r}>{r}{plan ? ` · about ${fmtSize(plan.sizes[r])}` : ""}</option>)}
+          </select>
+          <span className="help">Each weight matrix's change is kept at this rank: its largest part. A higher rank keeps more of
+            what the finetune learned, in a bigger file. Changes to norms and biases are kept whole at any rank (they're small).
+            The job's page says how much of the change the LoRA keeps.</span>
+        </label>
+        <label className="field">
+          <span>Name</span>
+          <input value={name} placeholder={auto} onChange={(e) => setName(e.target.value)} />
+        </label>
+        <div className="help">It runs in the queue and needs little VRAM: the two models are compared a block at a time, which
+          takes a few minutes when a model is on a slow disk.</div>
+      </div>
+    </Modal>
+  );
+}
+
+/** What an extract job made: its LoRA, the finetune checkpoint and original model it's the difference of, and how
+ * much of that change it keeps. */
+function ExtractCard({ job, made }: { job: JobDetail; made?: ExtractMade }) {
+  const s = job.config?.settings || {};
+  const from = s.extract_from || {};
+  return (
+    <div className="card card-pad" style={{ marginBottom: 16 }}>
+      <h2>LoRA</h2>
+      {!made ? (
+        <div className="muted small" style={{ marginBottom: 8 }}>{job.status === "queued" ? "Not extracted yet." : job.status === "running" ? "Being extracted…" : "Not extracted."}</div>
+      ) : <>
+        <div className="kv">
+          <span className="mono ellipsis">{made.file}</span>
+          <span className="row" style={{ gap: 8 }}>
+            <span className="faint small">{fmtSize(made.bytes)}</span>
+            <a className="btn sm" href={`/api/jobs/${job.id}/file/output/${made.file}`} download><IconDownload /></a>
+          </span>
+        </div>
+        <div className="kv"><span>Kept</span><span>{pct(made.kept)} of the change{made.worst ? ` · least in ${made.worst.name}: ${pct(made.worst.kept)}` : ""}</span></div>
+        <div className="kv"><span>Layers</span><span>{made.layers} as rank {made.rank} LoRAs, {made.whole} kept whole{made.unchanged ? `, ${made.unchanged} unchanged` : ""}</span></div>
+        <div className="kv"><span>Change</span><span>the finetune moved the weights by {(100 * made.change).toFixed(2)}%</span></div>
+      </>}
+      <div className="kv"><span>Finetuned</span><span className="ellipsis">{from.job_id ? <a href={`#/queue/${from.job_id}`}>{from.job_name}</a> : from.job_name}{" · "}<span className="mono">{made?.source || from.file}</span>{from.step ? ` (step ${from.step})` : ""}</span></div>
+      <div className="kv"><span>Original</span><span className="mono ellipsis">{made?.base || basename(s.extract_base)}</span></div>
+      <div className="help" style={{ marginTop: 10 }}>
+        What the finetune changed, as a LoRA: each weight matrix's change at rank {s.extract_rank} (its largest part), and the
+        changes to norms and biases whole. Kept is how much of the change it holds, by squared size; the rest is spread too
+        thin for this rank. To see whether that's enough, render the same prompt and seed with it on the original model and
+        with the finetuned model in the Sandbox, and if it falls short, extract again at a higher rank. Saved in{" "}
+        <span className="mono">{job.dir}/output/</span>; it's in the Sandbox's LoRAs, and ComfyUI loads it from{" "}
+        <span className="mono">models/loras</span> on the original model.
+      </div>
+    </div>
+  );
+}
+
+// a training job's page shows one of these below its status, chosen by the tabs (and kept in the URL)
+type View = "samples" | "loss" | "checkpoints" | "log";
+const VIEWS: [View, string][] = [["samples", "Samples"], ["loss", "Loss"], ["checkpoints", "Checkpoints"], ["log", "Log"]];
+const isView = (v?: string): v is View => VIEWS.some(([k]) => k === v);
+
+function JobDetailView({ id, view }: { id: string; view?: string }) {
   const act = useJobAction();
+  const [picked, setPicked] = useState<View | null>(isView(view) ? view : null);
+  useEffect(() => { if (isView(view)) setPicked(view); }, [view]);
   const [job, reload] = usePoll<JobDetail>(`/api/jobs/${id}`, 2500);
-  const [metrics, setMetrics] = useState<{ step: number; loss: number }[]>([]);
+  const metrics = useMetrics(id);
   const [light, setLight] = useState<string | null>(null);
   const [evaluate, setEvaluate] = useState(false);
   const [extend, setExtend] = useState(false);
+  const [extractFrom, setExtractFrom] = useState<Checkpoint | null>(null);
   const isVideoFile = (f: string) => f.endsWith(".mp4");
-  const lastStep = useRef(0);
-
-  useEffect(() => {
-    let live = true;
-    lastStep.current = 0;
-    setMetrics([]);
-    type M = { points: { step: number; loss: number }[]; last: number };
-    const pull = (): Promise<void> => api.get<M>(`/api/jobs/${id}/metrics?after=${lastStep.current}`).then(({ points, last }) => {
-      if (!live) return;
-      if (last < lastStep.current) {
-        // the job was restarted and its metrics rewritten from step 1
-        lastStep.current = 0;
-        setMetrics([]);
-        return pull();
-      }
-      if (!points.length) return;
-      lastStep.current = points[points.length - 1].step;
-      setMetrics((xs) => [...xs.filter((x) => x.step < points[0].step), ...points]);
-    });
-    pull();
-    const t = setInterval(pull, 3000);
-    return () => { live = false; clearInterval(t); };
-  }, [id]);
 
   if (!job) return <div className="page"><div className="muted">Loading…</div></div>;
   const st = job.status_detail || ({} as JobDetail["status_detail"]);
@@ -329,8 +416,17 @@ function JobDetailView({ id }: { id: string }) {
   const slider = !!job.config?.settings?.slider_enabled;
   const refmod = !!job.config?.settings?.refmod_enabled; // makes a RefMod: nothing is trained
   const finetune = !!job.config?.settings?.finetune_enabled; // trains the whole model: each checkpoint is one
+  const extract = !!job.config?.settings?.extract_enabled; // extracts a LoRA from a finetune: nothing is trained
   const made = st.refmod;
   const jobPath = `${job.dir}/output/`;
+  const checkpoints = st.checkpoints || [];
+  // until a tab is picked: a failed job opens on its log, which says why
+  const tab: View = picked || (["failed", "interrupted"].includes(job.status) ? "log" : "samples");
+  const pickTab = (v: View) => {
+    setPicked(v);
+    // in place: Back still leaves the job page rather than stepping through its tabs
+    history.replaceState(null, "", `#/queue/${encodeURIComponent(id)}/${v}`);
+  };
 
   return (
     <div className="page">
@@ -339,34 +435,35 @@ function JobDetailView({ id }: { id: string }) {
           <div className="small"><a href="#/queue">Queue</a> <span className="faint">/</span></div>
           <div className="row"><h1 className="ellipsis">{job.name}</h1><StatusPill status={job.status} /></div>
           <p>{[job.config?.profile_name, slider && `slider: ${job.config?.settings?.slider_target}`, refmod && "RefMod",
-            !refmod && !finetune && job.config?.settings?.network_type === "lokr" && "LoKr", finetune && "finetune",
+            !refmod && !finetune && !extract && job.config?.settings?.network_type === "lokr" && "LoKr", finetune && "finetune",
+            extract && `LoRA from a finetune, rank ${job.config?.settings?.extract_rank}`,
             job.config?.datasets?.map((d: any) => d.name).join(", ")].filter(Boolean).join(" · ")} {job.assigned_gpu != null && `· GPU ${job.assigned_gpu}`}</p>
         </div>
         <div className="row">
           {running && !evaluating && <>
-            {!refmod && <>
+            {!refmod && !extract && <>
               <button className="btn" onClick={() => act(job, "sample")}><IconCamera /> Sample now</button>
               <button className="btn" onClick={() => act(job, "save")}><IconSave /> Save now</button>
             </>}
-            <button className="btn" onClick={() => act({ ...job, refmod }, "stop", reload)}><IconStop /> Stop</button>
+            <button className="btn" onClick={() => act({ ...job, refmod, extract }, "stop", reload)}><IconStop /> Stop</button>
           </>}
           {evaluating && ["queued", "running"].includes(job.status) && (
             <button className="btn" onClick={() => act({ ...job, evaluating }, "stop", reload)}><IconStop /> {job.status === "queued" ? "Cancel evaluation" : "Stop evaluation"}</button>
           )}
-          {!refmod && ["stopped", "failed", "interrupted"].includes(job.status) && <button className="btn primary" onClick={() => act(job, "resume", reload)}><IconPlay /> Resume</button>}
-          {!refmod && job.status === "completed" && !evaluating && job.resumable && (
+          {!refmod && !extract && ["stopped", "failed", "interrupted"].includes(job.status) && <button className="btn primary" onClick={() => act(job, "resume", reload)}><IconPlay /> Resume</button>}
+          {!refmod && !extract && job.status === "completed" && !evaluating && job.resumable && (
             <button className="btn" title="Train this job on for more steps, from where it finished" onClick={() => setExtend(true)}><IconPlay /> Continue training</button>
           )}
-          {!refmod && !finetune && !running && !evaluating && !["queued", "stopping"].includes(job.status) && (st.checkpoints || []).length > 0 && (
+          {!refmod && !finetune && !extract && !running && !evaluating && !["queued", "stopping"].includes(job.status) && (st.checkpoints || []).length > 0 && (
             <button className="btn" title="Score the saved checkpoints with the checkpoint picker and/or concept bleed, and recommend one" onClick={() => setEvaluate(true)}><IconTarget /> Evaluate checkpoints</button>
           )}
-          {!running && job.status !== "queued" && job.status !== "stopping" && (refmod
-            ? <button className={`btn${job.status === "completed" ? "" : " primary"}`} onClick={() => act({ ...job, refmod }, "restart", reload)}><IconRefresh /> Make again</button>
+          {!running && job.status !== "queued" && job.status !== "stopping" && (refmod || extract
+            ? <button className={`btn${job.status === "completed" ? "" : " primary"}`} onClick={() => act({ ...job, refmod, extract }, "restart", reload)}><IconRefresh /> {refmod ? "Make again" : "Extract again"}</button>
             : <button className="btn" onClick={() => act(job, "restart", reload)}><IconRefresh /> Restart</button>)}
-          {!running && job.status !== "stopping" && !evaluating && (
+          {!running && job.status !== "stopping" && !evaluating && !extract && (
             <button className="btn" title="Change this job's settings" onClick={() => go("edit", job.id)}><IconEdit /> Edit</button>
           )}
-          {!running && <button className="btn" onClick={() => cloneJob(job.id)}><IconCopy /> Duplicate</button>}
+          {!running && !extract && <button className="btn" onClick={() => cloneJob(job.id)}><IconCopy /> Duplicate</button>}
         </div>
       </div>
 
@@ -389,6 +486,19 @@ function JobDetailView({ id }: { id: string }) {
         <RefModCard job={job} made={made} onOpen={setLight} />
         <Terminal jobId={job.id} live={running || job.status === "stopping"}
           alt={{ label: "Config", text: JSON.stringify(job.config, null, 2) }} />
+      </> : extract ? <>
+        <div className="stats" style={{ marginBottom: 16 }}>
+          <div className="stat"><div className="k">Phase</div><div className="v" style={{ fontSize: 15 }}>{PHASES[st.phase || ""] || st.phase || "Queued"}</div></div>
+          <div className="stat"><div className="k">Rank</div><div className="v">{job.config?.settings?.extract_rank}</div></div>
+          <div className="stat"><div className="k">Kept</div><div className="v">{st.extract ? pct(st.extract.kept) : "—"}</div></div>
+          <div className="stat"><div className="k">File size</div><div className="v" style={{ fontSize: 15 }}>{st.extract ? fmtSize(st.extract.bytes) : "—"}</div></div>
+          <div className="stat"><div className="k">Peak VRAM</div><div className="v">{st.vram_gb ? `${st.vram_gb} GB` : "—"}</div></div>
+        </div>
+        {running && <div className="progress" style={{ marginBottom: 8 }}><div style={{ width: `${st.total_steps ? (100 * (st.step || 0)) / st.total_steps : 0}%` }} /></div>}
+        {running && st.message && <div className="faint small" style={{ marginBottom: 16 }}>{st.message}</div>}
+        <ExtractCard job={job} made={st.extract} />
+        <Terminal jobId={job.id} live={running || job.status === "stopping"}
+          alt={{ label: "Config", text: JSON.stringify(job.config, null, 2) }} />
       </> : <>
       <div className="stats" style={{ marginBottom: 16 }}>
         <div className="stat"><div className="k">Phase</div><div className="v" style={{ fontSize: 15 }}>{PHASES[st.phase || ""] || st.phase || "Queued"}</div></div>
@@ -399,57 +509,80 @@ function JobDetailView({ id }: { id: string }) {
         <div className="stat"><div className="k">Peak VRAM</div><div className="v">{st.vram_gb ? `${st.vram_gb} GB` : "—"}</div></div>
         <div className="stat"><div className="k">LR</div><div className="v" style={{ fontSize: 15 }}>{st.lr?.toExponential(2) ?? "—"}</div></div>
       </div>
-      <div className="progress" style={{ marginBottom: 16 }}><div style={{ width: `${total ? (100 * (st.step || 0)) / total : 0}%` }} /></div>
+      <div className="progress" style={{ marginBottom: running && st.phase !== "training" && st.message ? 6 : 16 }}><div style={{ width: `${total ? (100 * (st.step || 0)) / total : 0}%` }} /></div>
+      {running && st.phase !== "training" && st.message && <div className="faint small ellipsis" style={{ marginBottom: 16 }}>{st.message}</div>}
 
-      <SamplesPanel jobId={job.id} samples={st.samples || []} slider={slider} />
-
-      <div className="card card-pad" style={{ marginBottom: 16 }}>
-        <h2>Loss</h2>
-        <LossChart points={metrics} totalSteps={total} />
-      </div>
-
-      <Terminal jobId={job.id} live={running || job.status === "stopping"}
-        alt={{ label: "Config", text: JSON.stringify(job.config, null, 2) }} />
-
-      <EvalPanel job={job} onOpen={setLight} />
-
-      <div className="card card-pad" style={{ marginBottom: 16 }}>
-        <h2>Checkpoints</h2>
-        {(st.checkpoints || []).length === 0 && <div className="muted small">None yet.</div>}
-        {[...(st.checkpoints || [])].reverse().map((c) => (
-          <div className="kv" key={c.file}>
-            <span className="mono ellipsis">{c.file}</span>
-            <span className="row" style={{ gap: 8 }}>
-              <span className="faint small">step {c.step}</span>
-              {c.final && <span className="pill completed">final</span>}
-              <a className="btn sm" href={`/api/jobs/${job.id}/file/output/${c.file}`} download><IconDownload /></a>
-            </span>
-          </div>
+      <div className="view-tabs" role="tablist" aria-label="Job details">
+        {VIEWS.map(([v, label]) => (
+          <button key={v} role="tab" aria-selected={tab === v} className={tab === v ? "on" : ""} onClick={() => pickTab(v)}>
+            {label}
+            {v === "checkpoints" && checkpoints.length > 0 && <span className="count">{checkpoints.length}</span>}
+            {v === "checkpoints" && evaluating && <span className="dot" title="A checkpoint evaluation is queued or running" />}
+            {v === "log" && (running || job.status === "stopping") && <span className="dot live" title="Running" />}
+            {v === "log" && job.status === "failed" && <span className="dot err" title="The job failed" />}
+          </button>
         ))}
-        {finetune ? (
-          <div className="help" style={{ marginTop: 10 }}>Saved in <span className="mono">{jobPath}</span>. Each is a whole
-            diffusion model in bf16, laid out like <span className="mono">{String(job.config?.profile?.diffusion_model || "").split(/[\\/]/).pop()}</span>: copy
-            it into ComfyUI's <span className="mono">models/diffusion_models</span> and load it in place of the original, or try
-            it in the Sandbox (Finetuned model).</div>
-        ) : (
-          <div className="help" style={{ marginTop: 10 }}>Saved in <span className="mono">{jobPath}</span> — ComfyUI-compatible; copy into <span className="mono">models/loras</span>.</div>
-        )}
       </div>
+
+      {tab === "samples" && <SamplesPanel jobId={job.id} samples={st.samples || []} slider={slider} />}
+
+      {tab === "loss" && (
+        <div className="card card-pad" style={{ marginBottom: 16 }}>
+          <h2>Loss</h2>
+          <LossChart points={metrics} totalSteps={total} />
+        </div>
+      )}
+
+      {tab === "log" && <Terminal jobId={job.id} live={running || job.status === "stopping"}
+        alt={{ label: "Config", text: JSON.stringify(job.config, null, 2) }} />}
+
+      {tab === "checkpoints" && <>
+        <EvalPanel job={job} onOpen={setLight} />
+
+        <div className="card card-pad" style={{ marginBottom: 16 }}>
+          <h2>Checkpoints</h2>
+          {checkpoints.length === 0 && <div className="muted small">None yet.</div>}
+          {[...checkpoints].reverse().map((c) => (
+            <div className="kv" key={c.file}>
+              <span className="mono ellipsis">{c.file}</span>
+              <span className="row" style={{ gap: 8 }}>
+                <span className="faint small">step {c.step}</span>
+                {job.recommended?.file === c.file && <span className="rec-star" title="Recommended by the checkpoint evaluation">★</span>}
+                {c.final && <span className="pill completed">final</span>}
+                {finetune && <button className="btn sm" title="Save what this checkpoint changed as a LoRA" onClick={() => setExtractFrom(c)}><IconLayers /> Extract LoRA</button>}
+                <a className="btn sm" href={`/api/jobs/${job.id}/file/output/${c.file}`} download><IconDownload /></a>
+              </span>
+            </div>
+          ))}
+          {finetune ? (
+            <div className="help" style={{ marginTop: 10 }}>Saved in <span className="mono">{jobPath}</span>. Each is a whole
+              diffusion model in bf16, laid out like <span className="mono">{String(job.config?.profile?.diffusion_model || "").split(/[\\/]/).pop()}</span>: copy
+              it into ComfyUI's <span className="mono">models/diffusion_models</span> and load it in place of the original, or try
+              it in the Sandbox (Finetuned model). Extract LoRA saves what a checkpoint changed as a LoRA, a much smaller file
+              to use on the original model.</div>
+          ) : (
+            <div className="help" style={{ marginTop: 10 }}>Saved in <span className="mono">{jobPath}</span> — ComfyUI-compatible; copy into <span className="mono">models/loras</span>.</div>
+          )}
+        </div>
+
+        <DiskCard job={job} />
+      </>}
       </>}
 
-      <DiskCard job={job} />
+      {(refmod || extract) && <DiskCard job={job} />}
 
       {light && <Lightbox src={light} video={isVideoFile(light)} onClose={() => setLight(null)}
         audio={light.endsWith(".mp3") ? { poster: light.replace(/\.mp3$/, "_poster.png") } : undefined} />}
-      {evaluate && <EvaluateDialog job={job} onClose={() => setEvaluate(false)} onQueued={reload} />}
+      {evaluate && <EvaluateDialog job={job} onClose={() => setEvaluate(false)} onQueued={() => { reload(); pickTab("checkpoints"); }} />}
       {extend && <ContinueDialog job={job} onClose={() => setExtend(false)} onQueued={reload} />}
+      {extractFrom && <ExtractDialog job={job} checkpoint={extractFrom} onClose={() => setExtractFrom(null)} />}
     </div>
   );
 }
 
-export default function Queue({ jobId }: { jobId: string }) {
+export default function Queue({ jobId, view }: { jobId: string; view?: string }) {
   const [jobs, reload] = usePoll<Job[]>("/api/jobs", 2500);
-  if (jobId) return <JobDetailView id={jobId} />;
+  if (jobId) return <JobDetailView key={jobId} id={jobId} view={view} />;
   return <QueueList jobs={jobs} reload={reload} />;
 }
 
@@ -481,7 +614,6 @@ function QueueList({ jobs, reload }: { jobs: Job[] | null; reload: () => void })
           <h1>Queue</h1>
           <p>Running, queued and finished training jobs. Queue mode and GPUs are set in <a href="#/settings">Settings</a>.</p>
         </div>
-        <button className="btn primary" onClick={() => go("create")}>New job</button>
       </div>
       <HardwareCards />
       {disk && disk.total.total + shared.total > 0 && (

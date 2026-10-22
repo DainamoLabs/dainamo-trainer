@@ -189,6 +189,7 @@ export type Job = {
   slider: boolean; // a concept slider; without datasets it trains on images it renders
   network: "lora" | "lokr" | "full"; // the adapter it trains, or "full": a finetune of the whole model
   refmod: boolean; // makes a RefMod of its datasets instead of training
+  extract: boolean; // extracts a LoRA from a finetune's checkpoint instead of training
 };
 
 // the RefMod a job made: its file, shape (latent frames of height × width cells), the reference tokens it puts into
@@ -201,6 +202,14 @@ export type RefModMade = {
   seconds?: number; concept?: string; audio?: { file: string; poster: string };
 };
 
+// the LoRA an extract job made from a finetune: how many matrices became LoRAs and how many tensors were kept whole
+// (or hadn't changed), the share of the change's squared size it keeps (overall, and in the layer keeping least),
+// how far the finetune moved the weights (relative), and the files it compared
+export type ExtractMade = {
+  file: string; rank: number; layers: number; whole: number; unchanged: number; missing: number; kept: number;
+  worst: { name: string; kept: number } | null; change: number; bytes: number; source: string; base: string;
+};
+
 export type JobDetail = Job & {
   config: any;
   dir: string;
@@ -210,6 +219,7 @@ export type JobDetail = Job & {
     evals?: Eval[]; recommended?: Recommendation | null; sweep?: Sweep | null;
     evaluation?: Evaluation | null;
     refmod?: RefModMade;
+    extract?: ExtractMade;
   };
 };
 

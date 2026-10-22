@@ -63,6 +63,13 @@ the warning.
 | **Sandbox** | **Datasets** |
 | ![The Sandbox comparing a LoRA with the base model](docs/screenshots/sandbox.png) | ![A dataset with its captions and health check](docs/screenshots/dataset.png) |
 
+The bar along the top has the pages, and on its right what the trainer is
+doing: the running job, with its step, the time left, its loss so far and how
+far along it is (click it to open the job); or the last job, if it failed,
+until you open it; or Idle. Then each GPU's memory and temperature, Settings,
+and **New job**, which opens Create Job. On a phone the pages and New job move
+to a bar along the bottom.
+
 - **Create Job**: pick a profile, the datasets, and the training settings,
   then add the job to the queue. **Datasets** are cards you add and remove,
   each with its own **repeats** (how much it counts against the others),
@@ -95,14 +102,23 @@ the warning.
   RAM, updated every 2 seconds. GPUs are read with `nvidia-smi` on Linux and
   Windows. Linux reports the CPU's temperature through its sensor drivers;
   Windows doesn't give programs the CPU's temperature, so it shows as "—"
-  there. Each job page shows its
-  samples first, as a grid with a row per sample prompt and a column per step
+  there. Each job page shows its status at the top (phase, step,
+  loss, speed, ETA, peak VRAM, learning rate and progress, and what it's doing
+  while it prepares), with its actions, and below that one of four tabs, which
+  the address keeps (`#/queue/<job>/log`), so a reload or a link opens the same
+  one. **Samples** is a grid with a row per sample prompt and a column per step
   (or grouped by step). Click a sample to view it full size, and use the arrow
-  keys to step through training (left/right) and prompts (up/down). Below that
-  are live loss, checkpoints (with download links) and a terminal with the job's
-  output as it runs: a progress line per step (loss, speed, ETA), model
-  loading, warnings and errors. It follows new output unless you scroll up,
-  can fill the window, and the full log can be downloaded. You can stop a job
+  keys to step through training (left/right) and prompts (up/down). **Loss** is
+  the live loss chart. **Checkpoints** has the checkpoint picker's and concept
+  bleed's results (with the recommended checkpoint), the saved checkpoints
+  (with download links; a finetune's also have **Extract LoRA**, see
+  [LoRA from a finetune](#lora-from-a-finetune)) and the job's disk use. **Log**
+  is a terminal with the job's output as it runs: a progress line per step
+  (loss, speed, ETA), model loading, warnings and errors. It follows new output
+  unless you scroll up, can fill the window, and the full log can be
+  downloaded. A job opens on Samples, or on Log if it failed; the Checkpoints
+  tab counts the saves, and Log shows a dot while the job runs (red if it
+  failed). A RefMod's or an extracted LoRA's page is short, so it has no tabs. You can stop a job
   (it saves its state), resume it, restart it from scratch, ask for samples
   or a checkpoint now, or duplicate its settings into a new job. **Edit**
   opens a job that isn't running in the Create Job form. Before it trains, any
@@ -560,6 +576,37 @@ starting point. Stopping saves the model, and resuming or **Continue
 training** loads the latest save and the optimizer state in `state/`, rather
 than the profile's file.
 
+### LoRA from a finetune
+
+**Extract LoRA** beside a finetune job's checkpoint saves what that checkpoint
+changed, from the model it was finetuned from (the job's profile's), as a LoRA:
+a much smaller file to use on the original model, in the Sandbox or ComfyUI,
+and to combine with other LoRAs. Choose a rank (the form shows the file's size
+at each one: about 290 MB for MOSS-Image at 64) and a name. It's queued as a job
+of its own, whose LoRA is listed with the Sandbox's other LoRAs; nothing is
+trained, and the two models are compared a block at a time on the GPU (about
+3 GB of VRAM for MOSS-Image), so the time is mostly reading them: under a
+minute from the RAM cache, a few minutes from a slow disk.
+
+Each weight matrix's change becomes a LoRA of that rank: its best
+approximation of that rank, the change's top singular directions (found from
+the eigenvectors of the matrix's smaller Gram matrix: the same as an SVD's, about
+ten times faster on a GPU). A matrix too small for a LoRA to be any smaller is
+kept whole, as are the changes to norms (`.diff`) and biases (`.diff_b`), which
+take little room; these are key types ComfyUI's LoRA loader applies beside
+`lora_A`/`lora_B`, and the Sandbox applies them too (a norm's change is added to
+it in place, and put back for "Compare with base"). A quantized original is
+expanded as training expanded it, so the difference is what training changed,
+not the quantization's rounding. The job's page says how much of the change the
+LoRA keeps (by squared size, overall and in the layer keeping least) and how far
+the finetune moved the weights. The rest is spread too thin for that rank: render
+the same prompt and seed with the LoRA on the original model and with the
+finetuned model to see whether it matters, and extract again at a higher rank if
+it does. If the original model's file has moved, extracting is refused (the
+LoRA would be the change from the wrong model), and a warning is logged if the
+checkpoint was finetuned from another file or the weights differ by far more
+than a finetune moves them.
+
 ## RefMods (MiniMax H3)
 
 A RefMod is a set of references saved as a file: the video VAE's encodes of
@@ -993,6 +1040,7 @@ dainamo/
     lora.py               LoRA and LoKr networks + frozen adapters, ComfyUI key formats
     finetune.py           full finetuning: each weight's optimizer step in backward, bf16 stochastic rounding,
                           whole models saved in their source file's layout
+    extract.py            LoRAs extracted from a finetune: each matrix's change at a rank, other changes whole
     dataset.py            discovery, aspect buckets, caption/trigger handling
     trainer.py            family-agnostic training loop
     slider.py             concept sliders: their settings and training step
@@ -1011,7 +1059,7 @@ dainamo/
     procs.py              starting, finding and stopping worker processes (Linux and Windows)
     sandbox.py            the Sandbox worker process
     notify.py             webhooks when a job ends
-    hardware.py           the GPUs, CPU and RAM now, for the Queue's hardware cards and the sidebar
+    hardware.py           the GPUs, CPU and RAM now, for the Queue's hardware cards and the top bar
     auth.py               sign-in for remote access
     captioner.py          the local LLM: auto-captions (images, clip frames, contact sheets) and prompt enhancement
     llama_server.py       the caption server Dainamo runs (llama-server or textgen): start, readiness, idle
@@ -1121,6 +1169,14 @@ dropped) and loads like any diffusion model, and that the VRAM projection
 counts the expanded model. It runs a finetune job end to end on a tiny model
 loaded from an int8 file, continues it from its saved model, and checks the
 server's rules for finetune jobs and the Sandbox's finetuned model.
+
+`tests/test_extract.py` checks that an extracted LoRA's factors are its change's
+best approximation of their rank (as an SVD's truncation), that a finetune of a
+tiny int8 model is extracted as LoRAs and whole norm and bias changes (exactly,
+and against the int8 file as training expanded it), that the Sandbox's adapter
+stack applies it as the finetune (and puts the base model back exactly), that an
+extract job finds its checkpoint by step after the finetune renamed it, and the
+server's rules and listing for extracted LoRAs.
 
 `tests/test_ltx2.py` runs the LTX 2.5 driver on a tiny random DiT: the training
 loss with and without audio, on images, deterministic for validation, and with

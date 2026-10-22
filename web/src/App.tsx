@@ -1,7 +1,7 @@
 import { Component, useEffect, useState, type ReactNode } from "react";
 import { api, SIGNED_OUT, type AuthStatus, type Family, type Gpu, type Job, type SystemRam, type Workflow } from "./api";
 import { useJobAlerts } from "./components/alerts";
-import { IconImages, IconLayers, IconPlus, IconQueue, IconSettings, IconSparkle } from "./components/icons";
+import { TabBar, TopBar } from "./components/TopBar";
 import { usePoll } from "./components/ui";
 import CreateJob, { EditJob } from "./pages/CreateJob";
 import Datasets from "./pages/Datasets";
@@ -13,22 +13,15 @@ import SignIn from "./pages/SignIn";
 
 export type Tab = "create" | "edit" | "queue" | "sandbox" | "datasets" | "profiles" | "settings";
 
-const TABS: { id: Tab; label: string; icon: React.FC<React.SVGProps<SVGSVGElement>> }[] = [
-  { id: "create", label: "Create Job", icon: IconPlus },
-  { id: "queue", label: "Queue", icon: IconQueue },
-  { id: "sandbox", label: "Sandbox", icon: IconSparkle },
-  { id: "datasets", label: "Datasets", icon: IconImages },
-  { id: "profiles", label: "Profiles", icon: IconLayers },
-];
-
-function readHash(): { tab: Tab; arg: string } {
-  const [tab, arg] = window.location.hash.replace(/^#\/?/, "").split("/");
+// #/<tab>/<arg>/<view>: e.g. #/queue/<job id>/log, a job page open on its log
+function readHash(): { tab: Tab; arg: string; view: string } {
+  const [tab, arg, view] = window.location.hash.replace(/^#\/?/, "").split("/");
   const ok = ["create", "edit", "queue", "sandbox", "datasets", "profiles", "settings"].includes(tab);
-  return { tab: (ok ? tab : "create") as Tab, arg: arg ? decodeURIComponent(arg) : "" };
+  return { tab: (ok ? tab : "create") as Tab, arg: arg ? decodeURIComponent(arg) : "", view: view || "" };
 }
 
-export function go(tab: Tab, arg = "") {
-  window.location.hash = `/${tab}${arg ? "/" + encodeURIComponent(arg) : ""}`;
+export function go(tab: Tab, arg = "", view = "") {
+  window.location.hash = `/${tab}${arg ? "/" + encodeURIComponent(arg) : ""}${arg && view ? "/" + view : ""}`;
 }
 
 /** A page that throws while rendering shows what went wrong instead of a blank screen. */
@@ -68,7 +61,7 @@ export default function App() {
   const [system] = usePoll<{ gpus: Gpu[]; ram?: SystemRam; families: Family[]; workflows: Workflow[] }>(ready ? "/api/system" : null, 4000);
   const [jobs] = usePoll<Job[]>(ready ? "/api/jobs" : null, 4000);
   useJobAlerts(jobs, (id) => go("queue", id));
-  const active = jobs?.filter((j) => j.status === "running" || j.status === "queued" || j.status === "stopping").length || 0;
+  const waiting = jobs?.filter((j) => j.status === "queued").length || 0;
   const families = system?.families || [];
 
   if (!auth) return null;
@@ -76,48 +69,19 @@ export default function App() {
 
   return (
     <div className="app">
-      <aside className="sidebar">
-        <div className="brand">
-          <img src="/logo.png" alt="" />
-          <div className="brand-name">Dainamo<span>Trainer</span></div>
-        </div>
-        <nav className="nav">
-          {TABS.map((t) => (
-            <button key={t.id} className={(route.tab === "edit" ? "queue" : route.tab) === t.id ? "active" : ""} onClick={() => go(t.id)}>
-              <t.icon /> <span>{t.label}</span>
-              {t.id === "queue" && active > 0 && <span className="count">{active}</span>}
-            </button>
-          ))}
-        </nav>
-        <div className="sidebar-foot">
-          {system?.gpus.map((g) => (
-            <div className="gpu-card" key={g.index}>
-              <div className="name">GPU {g.index} · {g.name.replace("NVIDIA GeForce ", "")}</div>
-              <div className="row" style={{ marginTop: 3 }}>
-                <span>{(g.mem_used / 1024).toFixed(1)} / {(g.mem_total / 1024).toFixed(0)} GB</span>
-                <span>{g.util}% · {g.temp}°</span>
-              </div>
-              <div className="bar"><div style={{ width: `${(100 * g.mem_used) / g.mem_total}%` }} /></div>
-            </div>
-          ))}
-          <nav className="nav">
-            <button className={route.tab === "settings" ? "active" : ""} onClick={() => go("settings")}>
-              <IconSettings /> <span>Settings</span>
-            </button>
-          </nav>
-        </div>
-      </aside>
+      <TopBar tab={route.tab} arg={route.arg} jobs={jobs} gpus={system?.gpus || []} waiting={waiting} />
       <main className="main">
         <PageError key={route.tab}>
           {route.tab === "create" && <CreateJob families={families} />}
           {route.tab === "edit" && <EditJob key={route.arg} id={route.arg} families={families} />}
-          {route.tab === "queue" && <Queue jobId={route.arg} />}
+          {route.tab === "queue" && <Queue jobId={route.arg} view={route.view} />}
           {route.tab === "sandbox" && <Sandbox families={families} workflows={system?.workflows || []} gpus={system?.gpus || []} ram={system?.ram} />}
           {route.tab === "datasets" && <Datasets datasetId={route.arg} families={families} />}
           {route.tab === "profiles" && <Profiles families={families} />}
           {route.tab === "settings" && <SettingsPage gpus={system?.gpus || []} auth={auth} onSignOut={() => setAuth({ required: true, signed_in: false })} />}
         </PageError>
       </main>
+      <TabBar tab={route.tab} waiting={waiting} />
     </div>
   );
 }

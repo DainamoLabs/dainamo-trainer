@@ -53,6 +53,7 @@ def _job_summary(j: dict) -> dict:
     j["datasets"] = [d.get("name") for d in cfg.get("datasets", [])]
     j["slider"] = bool(cfg.get("settings", {}).get("slider_enabled"))
     j["refmod"] = bool(cfg.get("settings", {}).get("refmod_enabled"))
+    j["extract"] = bool(cfg.get("settings", {}).get("extract_enabled"))  # a LoRA extracted from a finetune
     j["network"] = "full" if cfg.get("settings", {}).get("finetune_enabled") else \
         cfg.get("settings", {}).get("network_type") or "lora"
     made = st.get("refmod") or {}
@@ -218,6 +219,8 @@ def edit_job(jid: str, body: JobEdit):
     from its last save with the changes (noted in its log), unless one is something it can't carry on with
     (``_restart_reasons``): then it starts again from step 0, which ``restart`` has to confirm (else 409). A RefMod
     job that's been made is queued to be made again with the changes."""
+    if job_or_404(jid)["config"]["settings"].get("extract_enabled"):
+        raise HTTPException(400, "An extracted LoRA isn't edited: extract it again from its finetune's checkpoints")
     new = _job_config(body)
     with scheduler.paused():  # so the queue doesn't start the job meanwhile
         j = job_or_404(jid)
@@ -404,8 +407,8 @@ def job_action(jid: str, body: ActionIn):
     elif a == "resume":
         scheduler.requeue(jid)
     elif a == "extend":  # train a finished (or stopped) job on to a new total, from where it got to
-        if j["config"]["settings"].get("refmod_enabled"):
-            raise HTTPException(400, "A RefMod job trains nothing to continue")
+        if j["config"]["settings"].get("refmod_enabled") or j["config"]["settings"].get("extract_enabled"):
+            raise HTTPException(400, "This job trains nothing to continue")
         if j["status"] in ("queued", "running", "stopping"):
             raise HTTPException(400, "Wait for the job to finish, or stop it, first")
         if "evaluate" in j["config"]:
@@ -643,6 +646,8 @@ def evaluate_job(jid: str, body: EvaluateIn):
         raise HTTPException(400, "A RefMod has no checkpoints to evaluate")
     if j["config"]["settings"].get("finetune_enabled"):
         raise HTTPException(400, "A finetune's checkpoints are whole models; a checkpoint evaluation scores LoRAs")
+    if j["config"]["settings"].get("extract_enabled"):
+        raise HTTPException(400, "An extracted LoRA has one file and no datasets to score it on")
     if j["status"] in ("queued", "running", "stopping"):
         raise HTTPException(400, "Wait for the job to finish, or stop it, first")
     st = read_status(jid)
@@ -672,6 +677,69 @@ def evaluate_job(jid: str, body: EvaluateIn):
                        "phase": st.get("phase"), "message": st.get("message", ""), "requested": db.now()}
     db.execute("UPDATE jobs SET status='queued', position=?, config=? WHERE id=?", (db.now(), json.dumps(cfg), jid))
     return job_or_404(jid)
+
+
+def _finetune_checkpoint(j: dict, file: str) -> tuple[str, dict]:
+    """(path, checkpoint entry) of one of a finetune job's saved checkpoints."""
+    if not j["config"]["settings"].get("finetune_enabled"):
+        raise HTTPException(400, "Only a finetune's checkpoints are whole models to extract a LoRA from")
+    c = next((c for c in read_status(j["id"]).get("checkpoints") or [] if c.get("file") == file), None)
+    path = os.path.join(job_dir(j["id"]), "output", os.path.basename(file))
+    if c is None or not os.path.isfile(path):
+        not_found(f"{file} isn't one of this job's saved checkpoints")
+    return path, c
+
+
+@router.get("/jobs/{jid}/extract")
+def extract_sizes(jid: str, file: str):
+    """For the Extract LoRA form: about how big a LoRA extracted from one of a finetune's checkpoints is at each rank
+    it offers, and the model it was finetuned from (the job's profile's), which the LoRA is the change from."""
+    from ...engine.extract import sizes
+
+    j = job_or_404(jid)
+    path, _ = _finetune_checkpoint(j, file)
+    base = j["config"]["profile"].get("diffusion_model") or ""
+    return {"sizes": {str(r): n for r, n in sizes(path).items()}, "base": base, "base_found": os.path.isfile(base)}
+
+
+class ExtractIn(BaseModel):
+    file: str  # the checkpoint, in the finetune job's output
+    rank: int = 128
+    name: str = ""
+    gpu: str = "auto"
+
+
+@router.post("/jobs/{jid}/extract")
+def extract_lora(jid: str, body: ExtractIn):
+    """Queue a job that extracts a LoRA from one of a finetune's checkpoints (``Trainer.run_extract``): what the
+    finetune changed from the model it started from, the job's profile's. It's a job of its own, so its LoRA is
+    listed with it (in the Sandbox too) and the finetune's checkpoints are left as they are."""
+    from ...engine.extract import MAX_RANK
+
+    j = job_or_404(jid)
+    path, c = _finetune_checkpoint(j, body.file)
+    cfg = j["config"]
+    base = cfg["profile"].get("diffusion_model") or ""
+    if not os.path.isfile(base):
+        raise HTTPException(400, f"The model it was finetuned from, {base or 'its profile’s diffusion model'}, "
+                                 "isn't there any more, and the LoRA is the change from it")
+    if not 1 <= body.rank <= MAX_RANK:
+        raise HTTPException(400, f"The rank must be 1–{MAX_RANK}")
+    if body.gpu not in ("auto", "") and not body.gpu.isdigit():
+        raise HTTPException(400, f"Invalid GPU {body.gpu!r}")
+    name = body.name.strip() or f"{os.path.splitext(body.file)[0]}_r{body.rank}"
+    trigger = ", ".join(d["trigger"] for d in cfg.get("datasets") or [] if d.get("trigger"))
+    settings = {"steps": 0, "extract_enabled": True, "extract_rank": int(body.rank), "extract_source": path,
+                "extract_base": base, "extract_from": {"job_id": jid, "job_name": j["name"], "file": body.file,
+                                                       "step": int(c.get("step") or 0), "trigger": trigger}}
+    new = db.new_id()
+    config = {"id": new, "name": name, "output_name": name, "family": cfg["family"],
+              "profile_name": cfg["profile_name"], "profile": cfg["profile"], "datasets": [],
+              "validation_datasets": [], "settings": settings}
+    db.execute("INSERT INTO jobs (id, name, status, family, profile_name, gpu, position, created, config) "
+               "VALUES (?,?,?,?,?,?,?,?,?)", (new, name, "queued", cfg["family"], cfg["profile_name"], body.gpu or "auto",
+                                              db.now(), db.now(), json.dumps(config)))
+    return job_or_404(new)
 
 
 @router.delete("/jobs/{jid}")

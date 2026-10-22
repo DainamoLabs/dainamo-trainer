@@ -17,7 +17,8 @@ A job.json with ``evaluate`` set is a checkpoint evaluation of a finished job in
 ``run_evaluation``): the job's saved checkpoints are scored, and nothing is trained. Settings with
 ``slider_enabled`` train a concept slider (``engine.slider``) instead of learning the datasets, and with
 ``refmod_enabled`` the job makes a RefMod of them instead (``run_refmod``): nothing is trained. With
-``finetune_enabled`` every weight of the diffusion model trains (``engine.finetune``) in place of a LoRA.
+``finetune_enabled`` every weight of the diffusion model trains (``engine.finetune``) in place of a LoRA, and with
+``extract_enabled`` the job extracts a LoRA from a finetune's checkpoint (``run_extract``), training nothing.
 
 Everything model-specific goes through the family driver: which conditions an item trains with
 (caption, or caption plus conditioning images), how an item is VAE-encoded, the loss, sampling and
@@ -851,6 +852,72 @@ class Trainer:
 
     def _refmod_done(self, made: dict) -> str:
         self.status["refmod"] = made
+        self.status["phase"] = "completed"
+        self.log(f"Done in {(time.time() - self.status['started_at']) / 60:.1f} min")
+        return "completed"
+
+    def extract_source(self) -> str:
+        """The finetuned model a LoRA is extracted from: the source job's checkpoint at the step it was chosen at
+        (a final one is renamed when that job trains on), else the file as it was named then."""
+        src = self.s.get("extract_from") or {}
+        if src.get("job_id"):
+            jobs = os.path.dirname(os.path.abspath(self.job_dir))
+            try:
+                with open(os.path.join(jobs, src["job_id"], "status.json")) as f:
+                    ckpts = json.load(f).get("checkpoints") or []
+                c = next((c for c in ckpts if c.get("step") == src.get("step")), None)
+                if c:
+                    return os.path.join(jobs, src["job_id"], "output", c["file"])
+            except (OSError, json.JSONDecodeError):
+                pass
+        return self.s["extract_source"]
+
+    def run_extract(self) -> str:
+        """Extract a LoRA from a finetune (``engine.extract``): the change from ``extract_base`` (the model it was
+        finetuned from, the profile's) to the finetuned model (``extract_source``), as output/<name>.safetensors.
+        Nothing is trained and no model is loaded: the two files are compared a block at a time on the GPU.
+        status["extract"] describes what it saved."""
+        from . import extract
+
+        s = self.s
+        Family = get_family(self.job["family"])
+        source = self.extract_source()
+        base = s.get("extract_base") or self.job["profile"]["diffusion_model"]
+        for what, path in (("finetuned model", source), ("model it was finetuned from", base)):
+            if not os.path.isfile(path):
+                raise RuntimeError(f"The {what}, {path}, is gone")
+        with contextlib.suppress(Exception):
+            from safetensors import safe_open
+
+            with safe_open(source, "pt") as f:
+                was = (f.metadata() or {}).get("dainamo.base")
+            if was and was != os.path.basename(base):
+                self.log(f"Warning: {os.path.basename(source)} was finetuned from {was}, not {os.path.basename(base)}")
+        rank = int(s["extract_rank"])
+        src = s.get("extract_from") or {}
+        fname = self.lora_file(0, final=True)
+        meta = {**Family.lora_metadata, "dainamo.job": self.job["name"], "dainamo.network": "lora",
+                "dainamo.step": str(src.get("step", 0)), "dainamo.trigger": src.get("trigger", ""),
+                "dainamo.extracted_from": os.path.basename(source), "dainamo.base": os.path.basename(base),
+                "ss_network_dim": str(rank), "ss_network_alpha": str(rank)}
+        self.phase("extracting", f"Extracting a rank {rank} LoRA: what {os.path.basename(source)} changed from "
+                                 f"{os.path.basename(base)}")
+
+        def progress(done: int, total: int):
+            self.status.update(step=done, total_steps=total, message=f"Compared {done} of {total} parts")
+            self.progress(self.status["message"], keep=done == total)
+            self.write_status()
+
+        made = extract.extract(base, source, os.path.join(self.job_dir, "output", fname), rank, Family.block_list,
+                               self.device, meta, log=self.log, progress=progress,
+                               check=self.check_control_during_prep)
+        self.log(f"Saved {fname}: {made['layers']} layers as rank {rank} LoRAs and {made['whole']} changes kept whole "
+                 f"({made['unchanged']} tensors unchanged), {made['bytes'] / 1e6:.0f} MB. It keeps {made['kept']:.1%} "
+                 f"of the change, which moved the weights by {made['change']:.2%}.")
+        self.status.update(step=0, total_steps=0)
+        self.status["checkpoints"] = [{"step": int(src.get("step", 0)), "file": fname, "final": True}]
+        self.status["extract"] = {"file": fname, **made, "source": os.path.basename(source),
+                                  "base": os.path.basename(base)}
         self.status["phase"] = "completed"
         self.log(f"Done in {(time.time() - self.status['started_at']) / 60:.1f} min")
         return "completed"
