@@ -1,5 +1,6 @@
 # Ported from ai-toolkit (Ostris, LLC — MIT License),
-# extensions_built_in/diffusion_models/minimax_h3/src/packing.py. Changes for Dainamo: none (verbatim).
+# extensions_built_in/diffusion_models/minimax_h3/src/packing.py. Changes for Dainamo: ``build_packed_sequence``
+# also takes standalone audio references (``(0, 0, 0, a)`` blocks), laid out as the released ref2va pipeline does.
 # MiniMax-H3 itself (weights and the architecture this code implements) is distributed by MiniMax under the
 # MiniMax H3 Community License; see THIRD_PARTY_NOTICES.md and NOTICE.
 """Packed-sequence geometry for MiniMax-H3.
@@ -311,7 +312,9 @@ def build_packed_sequence(
     for images. References keep their OWN aspect on their own
     aspect-normalized grid; an image block advances the shared media clock by
     1.0, a video block by its temporal span, and the target streams start
-    after the cumulative advance)."""
+    after the cumulative advance). ``(0, 0, 0, a)`` is a standalone audio
+    reference: ``a`` latents of clean audio rows, width pinned to the TARGET
+    grid's extremes, advancing the clock by ``a``."""
     if keyframe_anchors and ref_blocks:
         raise ValueError("keyframe_anchors and ref_blocks are mutually exclusive")
     _, ph, pw = patch_size
@@ -335,6 +338,8 @@ def build_packed_sequence(
     video_start = audio_start + num_audio_rows
 
     def _block_advance(t, a):
+        if not t:  # standalone audio
+            return float(a)
         span = 1.0 if t == 1 else _temporal_position_span(t)
         return max(span, float(a)) if a else span
 
@@ -381,6 +386,22 @@ def build_packed_sequence(
         cond_video_idx.append(torch.arange(cond_start, audio_start))
         ref_cursor = audio_start
     for i, (ref_t, ref_h, ref_w, ref_a) in enumerate(ref_blocks):
+        if not ref_t:
+            # standalone audio reference: channel-major rows on the shared
+            # clock, width pinned to the target grid's extremes
+            a_time = ref_clock + torch.arange(ref_a, dtype=torch.float64)
+            rows = slice(ref_cursor, ref_cursor + ref_aud_rows[i])
+            position_ids[rows, 0] = a_time.repeat(AUDIO_CHANNELS)
+            position_ids[rows, 2] = torch.cat(
+                [
+                    torch.full((ref_a,), float(width_grid[0]), dtype=torch.float64),
+                    torch.full((ref_a,), float(width_grid[-1]), dtype=torch.float64),
+                ]
+            )
+            cond_audio_idx.append(torch.arange(rows.start, rows.stop))
+            ref_cursor += ref_aud_rows[i]
+            ref_clock += float(ref_a)
+            continue
         # each reference on its own aspect-normalized grid (area-matched to
         # the target, so the grids span comparable ranges)
         ref_sqrt_area = math.sqrt(ref_h * ref_w)

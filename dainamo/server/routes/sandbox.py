@@ -42,7 +42,10 @@ class SandboxIn(BaseModel):
     seed: int = -1
     count: int = 1
     loras: list[dict] = []
+    model: str = ""  # a finetuned diffusion model (a finetune job's checkpoint) in place of the profile's
     images: list[str] = []
+    refmods: list[dict] = []  # [{path, strength 0-1}]: RefMods as references (workflows with ``refmods``)
+    audio: list[str] = []  # reference sound files (workflows with ``audio``, for a video)
     compare_base: bool = False
     gpu: int | None = None
     offload: float | None = None  # % of the diffusion model's blocks streamed from RAM (None: family default)
@@ -54,6 +57,71 @@ class SandboxIn(BaseModel):
 
 
 MAX_GRID = 64  # images in one run of a grid (all seeds)
+MAX_REFMODS = 4
+
+
+def check_refmods(raw: list[dict], audio_ok: bool) -> tuple[list[dict], list[str]]:
+    """RefMods for a generation: each a RefMod file at a strength 0–1 (an audio-only one if ``audio_ok``) ->
+    (the ones used, the kinds of their references in order: "image", "video" or "audio")."""
+    from ...engine import refmod
+
+    if len(raw) > MAX_REFMODS:
+        raise HTTPException(400, f"Up to {MAX_REFMODS} RefMods at once")
+    out, kinds = [], []
+    for r in raw:
+        path = os.path.expanduser(str(r.get("path") or "").strip())
+        if not path:
+            continue
+        name = os.path.basename(path)
+        if not (os.path.isfile(path) and path.endswith(".safetensors")):
+            raise HTTPException(400, f"RefMod not found (or not .safetensors): {path}")
+        meta = refmod.read_meta(path)
+        if meta is None:
+            raise HTTPException(400, f"{name} isn't a RefMod")
+        held = refmod.member_kinds(meta)
+        if not held:
+            raise HTTPException(400, f"{name} holds no references")
+        if not audio_ok and all(k == "audio" for k in held):
+            raise HTTPException(400, f"{name} only holds audio, which this workflow doesn't take")
+        try:
+            strength = float(r.get("strength", 1.0))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "RefMod strength must be a number")
+        if not 0 <= strength <= 1:
+            raise HTTPException(400, "RefMod strength must be between 0 and 1")
+        if strength > 0:  # at 0 it's left out
+            out.append({"path": path, "strength": strength})
+            kinds += held
+    return out, kinds
+
+
+def check_audio_refs(wf, raw: list[str], ref_kinds: list[str], visual: int, frames: int) -> list[str]:
+    """A generation's reference sound files: each a file with sound in it, for a video, at most ``wf.audio["max"]``
+    with the RefMods' audio references, beside at least one visual reference (``visual``: images and visual
+    RefMod references), as the released ref2va pipeline asks."""
+    from ...engine import dataset as ds
+    from ...engine.families.base import WORKFLOWS
+
+    paths = [os.path.expanduser(p.strip()) for p in raw if p and p.strip()]
+    if paths and wf.audio is None:
+        raise HTTPException(400, f"{WORKFLOWS[wf.id]['label']} takes no reference audio")
+    if frames <= 1:
+        if paths or (ref_kinds and all(k == "audio" for k in ref_kinds)):
+            raise HTTPException(400, "Audio references need a video: set more than one frame")
+        return []  # a bundle's audio sits out an image
+    for p in paths:
+        if not os.path.isfile(p):
+            raise HTTPException(400, f"Audio not found: {p}")
+        try:
+            ds.probe_audio(p)
+        except ValueError:
+            raise HTTPException(400, f"{os.path.basename(p)} has no sound in it")
+    n = len(paths) + ref_kinds.count("audio")
+    if wf.audio and n > int(wf.audio["max"]):
+        raise HTTPException(400, f"Up to {wf.audio['max']} audio references at once (audio RefMods count too)")
+    if n and not visual:
+        raise HTTPException(400, "An audio reference needs a reference image or a visual RefMod beside it")
+    return paths
 
 
 def check_grid(raw: dict, count: int) -> dict:
@@ -88,6 +156,21 @@ def check_grid(raw: dict, count: int) -> dict:
             "strengths": strengths, "base": base}
 
 
+def check_model(F, profile: dict, raw: str) -> str | None:
+    """A finetuned diffusion model to generate with in place of the profile's: a file of the profile's model, such as
+    a finetune job's checkpoint (None: the profile's own)."""
+    path = os.path.expanduser(raw.strip())
+    if not path:
+        return None
+    if not (os.path.isfile(path) and path.endswith(".safetensors")):
+        raise HTTPException(400, f"Finetuned model not found (or not .safetensors): {path}")
+    check = next(r for r in F.validate_profile({**profile["data"], "diffusion_model": path})
+                 if r["field"] == "diffusion_model")
+    if check["level"] == "error":
+        raise HTTPException(400, f"{os.path.basename(path)}: {check['message']}")
+    return path
+
+
 def _workflow_for(F, profile: dict, workflow_id: str):
     variant = str(profile["data"].get("variant") or "")
     return next((w for w in F.info.workflows if w.id == workflow_id and (not w.variants or variant in w.variants)),
@@ -114,8 +197,14 @@ def check_sandbox(body: SandboxIn) -> tuple[dict, dict, int]:
     images = [os.path.expanduser(p.strip()) for p in body.images if p and p.strip()]
     if wf.images is None and images:
         raise HTTPException(400, f"{WORKFLOWS[wf.id]['label']} takes no images")
+    if body.refmods and not wf.refmods:
+        raise HTTPException(400, f"{WORKFLOWS[wf.id]['label']} takes no RefMods")
+    refmods, ref_kinds = check_refmods(body.refmods, wf.audio is not None) if wf.refmods else ([], [])
+    visual = sum(k != "audio" for k in ref_kinds)
     if wf.images is not None:
         lo, hi = int(wf.images["min"]), int(wf.images["max"])
+        if visual:  # visual RefMods are references too
+            lo = 0
         if not lo <= len(images) <= hi:
             want = f"{lo}" if lo == hi else f"{lo}–{hi}"
             raise HTTPException(400, f"{WORKFLOWS[wf.id]['label']} needs {want} {wf.images['label'].lower()}")
@@ -135,6 +224,7 @@ def check_sandbox(body: SandboxIn) -> tuple[dict, dict, int]:
     frames = int(body.frames) if video else 1
     if video and not 1 <= frames <= MAX_FRAMES:
         raise HTTPException(400, f"Frames must be 1–{MAX_FRAMES}")
+    audio_refs = check_audio_refs(wf, body.audio, ref_kinds, len(images) + visual, frames)
     if not 1 <= body.steps <= 200:
         raise HTTPException(400, "Steps must be 1–200")
     if not 0 <= body.cfg <= 30:
@@ -176,10 +266,12 @@ def check_sandbox(body: SandboxIn) -> tuple[dict, dict, int]:
     else:
         gpu = 0
     grid = check_grid(body.grid, int(body.count)) if body.grid else None
+    model = check_model(F, profile, body.model)
     params = {"workflow": wf.id, "prompt": prompt, "negative": body.negative, "width": width, "height": height,
               "frames": frames, "steps": int(body.steps), "cfg": float(body.cfg), "sampler": sampler,
               "scheduler": scheduler, "shift": body.shift, "seed": int(seed), "count": int(body.count),
-              "loras": loras, "images": images, "compare_base": bool(body.compare_base and loras and not grid),
+              "loras": loras, "model": model, "images": images, "refmods": refmods, "audio": audio_refs,
+              "compare_base": bool(body.compare_base and loras and not grid),
               "offload": offload, "low_vram": bool(body.low_vram and F.info.streams_text_encoder), "grid": grid}
     if audio:
         params.update(seconds=int(body.seconds), lyrics=body.lyrics.strip())
@@ -284,7 +376,11 @@ def sandbox_defaults(profile_id: str):
 def sandbox_loras(family: str):
     """Checkpoints of this family's jobs, newest job first; the picker's recommendation is marked."""
     out = []
-    for j in db.query("SELECT id, name, status, created FROM jobs WHERE family=? ORDER BY created DESC", (family,)):
+    for j in db.query("SELECT id, name, status, created, config FROM jobs WHERE family=? ORDER BY created DESC",
+                      (family,)):
+        s = (j["config"] or {}).get("settings", {})
+        if s.get("refmod_enabled") or s.get("finetune_enabled"):
+            continue  # its file is a RefMod (``sandbox_refmods``) or a whole model (``sandbox_models``)
         st = read_status(j["id"])
         # a checkpoint evaluation's recommendation, else training's
         rec = ((st.get("evaluation") or {}).get("recommended") or st.get("recommended") or {}).get("file")
@@ -294,6 +390,37 @@ def sandbox_loras(family: str):
                 out.append({"job_id": j["id"], "job_name": j["name"], "job_status": j["status"], "file": c["file"],
                             "path": path, "step": c.get("step"), "final": bool(c.get("final")),
                             "recommended": c["file"] == rec})
+    return out
+
+
+@router.get("/models")
+def sandbox_models(family: str):
+    """The finetuned models this family's finetune jobs saved, newest job first, its last checkpoint first."""
+    out = []
+    for j in db.query("SELECT id, name, status, config FROM jobs WHERE family=? ORDER BY created DESC", (family,)):
+        if not (j["config"] or {}).get("settings", {}).get("finetune_enabled"):
+            continue
+        for c in sorted(read_status(j["id"]).get("checkpoints") or [],
+                        key=lambda c: (c.get("final", False), c.get("step", 0)), reverse=True):
+            path = os.path.join(job_dir(j["id"]), "output", c["file"])
+            if os.path.exists(path):
+                out.append({"job_id": j["id"], "job_name": j["name"], "job_status": j["status"], "file": c["file"],
+                            "path": path, "step": c.get("step"), "final": bool(c.get("final"))})
+    return out
+
+
+@router.get("/refmods")
+def sandbox_refmods(family: str):
+    """The RefMods this family's jobs made, newest first."""
+    out = []
+    for j in db.query("SELECT id, name, config FROM jobs WHERE family=? ORDER BY created DESC", (family,)):
+        if not (j["config"] or {}).get("settings", {}).get("refmod_enabled"):
+            continue
+        made = read_status(j["id"]).get("refmod") or {}
+        path = os.path.join(job_dir(j["id"]), "output", made.get("file") or "")
+        if made.get("file") and os.path.exists(path):
+            out.append({"job_id": j["id"], "job_name": j["name"], "file": made["file"], "path": path,
+                        **{k: made.get(k) for k in ("kind", "mode", "frames", "seconds", "tokens", "references")}})
     return out
 
 

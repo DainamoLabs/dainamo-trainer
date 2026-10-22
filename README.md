@@ -86,6 +86,9 @@ the warning.
   the **Low VRAM** switch under it. Image
   models can also train a **slider** instead of a LoRA of the datasets (see
   Sliders below). **Network** under Training trains a LoRA or a LoKr (see LoKr
+  below). MOSS-Image can also be **finetuned**: every weight of the model
+  trains, instead of an adapter (see Full finetuning below). MiniMax H3 can
+  also make a **RefMod** of the datasets, which trains nothing (see RefMods
   below).
 - **Queue**: running, queued and finished jobs, under live cards for each
   GPU (use, VRAM and temperature), the CPU (use and temperature) and system
@@ -106,8 +109,8 @@ the warning.
   setting can change. Once it has, it carries on from its last save with the
   changes, which its log notes: its datasets, clip length, resolution, batch
   size, learning rate and schedule, steps, samples and memory settings can all
-  change mid-run. Its model, network (LoRA or LoKr, rank, alpha), optimizer
-  and slider can't, since the saved state wouldn't fit them, and while the
+  change mid-run. Its model, network (LoRA or LoKr, rank, alpha, or a
+  finetune), optimizer and slider can't, since the saved state wouldn't fit them, and while the
   checkpoint picker or concept bleed check is on, neither can what it scores
   (for the picker, that includes the datasets, resolution, clip length and
   seed), since earlier scores wouldn't compare. Changing one of these starts the
@@ -165,9 +168,14 @@ the warning.
   while no job is running or queued, and a job that's ready to start makes it
   unload after the current generation. It has the same layer offloading
   slider and Low VRAM switch as Create Job, with the projected VRAM of a
-  generation.
+  generation. Reference-to-Video also takes RefMods and reference audio (see
+  RefMods below). For a model that can be finetuned, **Diffusion model**
+  chooses the profile's or a finetune job's checkpoint in its place (see Full
+  finetuning below).
 - **Datasets**: link an existing folder or upload files. Captions are stored
-  as a `.txt` file next to each image or video. **Auto-Caption** sends each
+  as a `.txt` file next to each image or video. Click a file to view it full
+  size, with its size in pixels, its aspect ratio, its megapixels (a video's
+  length), its file size and its caption below it. **Auto-Caption** sends each
   file to a vision LLM (a `llama-server` or a model's own text encoder that
   Dainamo runs for you, or any OpenAI-compatible endpoint you run; see
   [Caption provider](#caption-provider)) and can
@@ -503,6 +511,129 @@ checkpoint, a lower strength or a lower guidance strength.
 The samples above are from an earlier smile slider at the same settings,
 trained without preservation. By step 400 the +1 samples change the clothes
 as well as the expression.
+
+## Full finetuning (MOSS-Image)
+
+A finetune trains every weight of the diffusion model on the datasets, instead
+of an adapter beside it. It can learn more than a LoRA, which matters most when
+one model should learn many concepts at once or from a lot of data. Training
+several concepts together, each with its own trigger, also avoids the
+interference of stacking separately trained LoRAs. Choose **Finetune** under
+Train in Create Job (MOSS-Image profiles). It starts at a tenth of a LoRA's
+learning rate (1e-5), with Adafactor, keeping the last 2 saves.
+
+Each save is a whole diffusion model: a new `.safetensors` file in bf16, laid
+out like the profile's (the same key prefix and other tensors, such as
+MOSS-Image's `rope.bands`), with a quantized source's scales and markers
+left out. ComfyUI loads it from `models/diffusion_models` in place of the
+original. A MOSS-Image save is about 10.2 GB, so keep few of them: the Saving
+section shows what the kept saves take. The Sandbox's **Diffusion model**
+lists a finetune job's checkpoints, and a training sample opened in the
+Sandbox uses the checkpoint it came from. Switching it reloads only the
+diffusion model.
+
+The whole model's gradients and an AdamW's fp32 state wouldn't fit beside the
+model on a 24 GB GPU, so Dainamo updates each weight as soon as backward has
+its gradient (PyTorch's "optimizer step in backward" recipe) and drops the
+gradient right away; only a few gradients exist at a time. Each update runs on
+an fp32 copy of that one weight and is written back to bf16 with stochastic
+rounding. At a finetune's learning rate an update is far smaller than bf16's
+spacing near the weight, so rounding to nearest would lose almost all of them;
+stochastic rounding keeps each one on average. The optimizer is Adafactor,
+whose state is a row and a column per matrix (about 10 MB for MOSS-Image), or
+AdamW 8-bit, which keeps 2 bytes a weight (another 10.2 GB, about 24 GB
+projected in all at 1024: too much for a 24 GB card). Because weights update
+during backward, a finetune has no gradient accumulation and no overall
+gradient clipping (Adafactor caps its own updates), and nothing is offloaded:
+the whole model stays on the GPU in bf16. Concept bleed, the strength sweep and
+Evaluate checkpoints don't apply; the checkpoint picker's validation loss does.
+A profile's training adapter isn't used.
+
+On an RTX 3090, a MOSS-Image finetune from the int8_convrot file at 1024×1024
+(batch 1, Adafactor, gradient checkpointing on) took 4.6 s a step and peaked at
+13.1 GB, against 13.9 GB projected (measured with stand-in latents and
+captions, which cost the same as real ones).
+
+A quantized model file (MOSS-Image's int8_convrot, say) is expanded to bf16 to
+train, which works, but trains its rounding in; the bf16 release is the better
+starting point. Stopping saves the model, and resuming or **Continue
+training** loads the latest save and the optimizer state in `state/`, rather
+than the profile's file.
+
+## RefMods (MiniMax H3)
+
+A RefMod is a set of references saved as a file: the video VAE's encodes of
+images and clips of one subject or style, which MiniMax H3's
+reference-to-video model (ref2va) takes as it takes reference images, without
+encoding them again; or the audio VAE's encode of a sound (a voice, singing,
+music), which it takes as reference audio. The file format is
+[ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod)'s,
+so a RefMod made here loads there (copy it into `models/refmods`), and one made
+there loads in the Sandbox.
+
+Choose **RefMod** under Make in Create Job (MiniMax H3 profiles, fl2va or
+ref2va: only a VAE is used), then what it's **Of**: *Pictures* or *Sound*.
+For pictures, every image and clip in the chosen datasets is a reference, in
+order; captions, repeats and the `_refs` folders aren't used. Nothing is
+trained: the job loads only the video VAE and takes a few minutes.
+
+- **Encoding:** *Compressed* (the default) averages each reference's encode
+  down to a small grid, **Grid** cells along its long edge (16; the short edge
+  keeps the first reference's shape), then refines the grid over **Refinement
+  steps** (500) so that, scaled back up, it matches the full encode. Only the
+  grid is adjusted; no model is involved. *Full* keeps each encode as it is,
+  every reference cropped to the first one's shape: the most detail, and the
+  most tokens.
+- **Size:** the short edge references are scaled down to before encoding
+  (1024; never enlarged).
+- **Frames per clip:** a clip's first frames at 24 fps, snapped down to
+  17n + 5 (22 frames are 7 latent frames). A clip under 5 frames is its first
+  frame.
+- **Merge into one reference** (compressed): one grid refined against every
+  reference at once, instead of a grid per reference.
+- **Token cap:** the most reference tokens it may hold (5120; 0 for no cap).
+  A latent frame is one token per 2×2 cells, so a 1024×1024 image in full is
+  1024 tokens and a 16-cell grid is 64. Over the cap, near-duplicate frames
+  go first, then the rest are spread evenly.
+- **Concept** and **Description:** kept in the file, where the pack's nodes
+  show them.
+- **Save a copy to:** a folder the finished file is copied to, such as
+  ComfyUI's `models/refmods`.
+
+For sound, the job loads only the audio VAE (seconds). It takes the datasets'
+sound files and the clips that have sound, in order, each from its start,
+until there are **Length** seconds (10; up to 60) in all, and encodes them as
+one sound: 40 latents a second, each in both stereo channels, so 80 tokens a
+second. A mono sound goes into both channels at its own level. The **Token
+cap** cuts the end. Its **Concept** is a voice, singing, a music style, a
+sound effect, ambience or generic.
+
+The job page shows the file (with a download link), its shape and tokens, and
+a preview of up to 12 of its latent frames, each decoded on its own (so frames
+within a clip look rougher than its first, and a compressed RefMod shows its
+coarse grid); for a sound, the sound decoded back to listen to. Editing a
+RefMod job that has been made makes it again with the changes, as does **Make
+again**.
+
+In the Sandbox, Reference to Video with a ref2va profile takes up to 4
+RefMods, from RefMod jobs or any file, beside the reference images or instead
+of them. Each has a strength from 0 to 1: below 1, the reference is blended
+toward a blurred copy of itself (a sound, along time), so it guides the video
+less. As with the pack's Apply node, the text encoder doesn't see picture
+RefMods (reference images still go through it).
+
+### Reference audio
+
+For a video (more than one frame), Reference to Video also takes reference
+audio, as the released ref2va pipeline does: up to 3 sound files (or videos,
+for their soundtrack) under **Reference audio**, counting sound RefMods and
+the sound members of bundles among the 3. Each is cut to the video's length
+from its start and goes in as clean audio ahead of the video's own, after the
+reference images and RefMods, in that order; the prompt is presented with an
+`<Audio 1>: `, `<Audio 2>: `, … label for each, after the pictures' labels. The
+model takes a sound reference only beside a picture one (a reference image or
+a picture RefMod). The ComfyUI pack reports that a voice doesn't carry over
+reliably and music has done better, so expect to try a few seeds.
 
 ## Music (YuE2)
 
@@ -860,6 +991,8 @@ dainamo/
                           activations (Low VRAM), and parking models and optimizer state in RAM
     memory.py             VRAM and system RAM projection from file headers
     lora.py               LoRA and LoKr networks + frozen adapters, ComfyUI key formats
+    finetune.py           full finetuning: each weight's optimizer step in backward, bf16 stochastic rounding,
+                          whole models saved in their source file's layout
     dataset.py            discovery, aspect buckets, caption/trigger handling
     trainer.py            family-agnostic training loop
     slider.py             concept sliders: their settings and training step
@@ -961,7 +1094,12 @@ eq. (4).
 `tests/test_minimax.py` checks how the MiniMax H3 driver builds packed
 sequences: per-row timesteps, first-frame and reference condition rows, the
 audio and no-audio cases, and that the sampler lands on the clean latent when
-given the true velocity. `tests/test_offload.py` checks that block swapping
+given the true velocity. `tests/test_refmod.py` checks RefMod files against the
+pack's format (standalone, older, audio and bundle files), the grid refinement, the
+token cap and strength, making one from images and a clip (or from sound files
+and soundtracks) with a stand-in VAE, how a standalone audio reference packs
+and is labelled in the prompt, generating with RefMods and reference audio,
+and RefMod jobs of pictures and of sound end to end. `tests/test_offload.py` checks that block swapping
 gives exactly the same outputs and LoRA gradients as a model held entirely on
 the GPU, with and without gradient checkpointing, and that a streamed text
 encoder (Low VRAM) gives the same outputs, keeps its layers in pinned RAM, and
@@ -973,6 +1111,16 @@ with the saved activations in RAM (Low VRAM) gives exactly the same loss and
 LoRA gradients, with blocks swapped and gradient accumulation, frees the GPU of
 every saved block input except the first (and of inputs shared by every block,
 which stay), and reuses the same pinned RAM each step.
+
+`tests/test_finetune.py` checks that stepping each weight in backward gives
+the same update as an optimizer stepping them all after it, that stochastic
+rounding is unbiased and keeps updates far smaller than bf16's spacing, that
+the optimizer state saves and loads, that a saved model is laid out like its
+source (prefix, other tensors and metadata kept; a quantized layer's scales
+dropped) and loads like any diffusion model, and that the VRAM projection
+counts the expanded model. It runs a finetune job end to end on a tiny model
+loaded from an int8 file, continues it from its saved model, and checks the
+server's rules for finetune jobs and the Sandbox's finetuned model.
 
 `tests/test_ltx2.py` runs the LTX 2.5 driver on a tiny random DiT: the training
 loss with and without audio, on images, deterministic for validation, and with

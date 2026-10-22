@@ -244,6 +244,42 @@ factors and the `lokr_w1` / `lokr_w2` key layout follow LyCORIS. Training both f
 follows ai-toolkit's default for LoKr (MIT License, above). The code is written from these descriptions;
 none of it is copied.
 
+## ComfyUI-MiniMaxH3Mod (Luisa) — MIT License
+
+Upstream: https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod
+
+`dainamo/engine/refmod.py` reads and writes RefMods in this pack's file format (the `refmod_meta`
+header, format 4 standalone files and format 5 bundles, audio ones included), and makes them by its
+methods: references encoded to a short edge in multiples of 32, compressed grids pooled to the first
+reference's aspect and refined with Adam against the full encode, merging, the token cap's
+near-duplicate pass and even spread, audio as the normalized (1, 32, 2, T) posterior mean, and
+strength as a blend toward a blurred copy (an eighth of the size, or of the length for audio). The code
+is Dainamo's own, written to match them.
+
+```
+MIT License
+
+Copyright (c) 2026 Luisa (luisacaotica)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ## Libraries used (not vendored)
 
 - Hugging Face `diffusers` (Apache-2.0) — `AutoencoderKLQwenImage` and

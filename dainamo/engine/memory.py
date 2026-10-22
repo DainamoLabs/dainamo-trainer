@@ -19,6 +19,9 @@ the projection assumes it hasn't). Training steps keep the blocks' saved activat
 Each phase also lists the system RAM it holds (``ram_totals``): its ``ram`` parts, plus the diffusion
 model's streamed blocks (``model_ram`` "streamed", the default for a phase with the model) or all of it
 ("all": parked while samples decode), plus the process itself.
+
+A full finetune (``engine.finetune``) holds the whole model in bf16, quantized layers expanded, with nothing
+offloaded; its optimizer state is the trained part beside it.
 """
 
 from __future__ import annotations
@@ -183,8 +186,9 @@ def adapter_bytes(path: str) -> int | None:
     return sum(_numel(shape) * 2 for k, (_, shape) in tensors(local).items() if k.endswith(".weight"))
 
 
-def model_weights(driver_cls, path: str):
-    """(resident bytes outside the blocks, [bytes per block], {key: (dtype, shape)} without prefix)."""
+def model_weights(driver_cls, path: str, expand: bool = False):
+    """(resident bytes outside the blocks, [bytes per block], {key: (dtype, shape)} without prefix). ``expand``: as a
+    finetune loads it, every weight in bf16 (or its wider dtype) and no quantization scales."""
     raw = tensors(path)
     full = any(k.startswith("model.diffusion_model.") for k in raw)
     shapes = {k.removeprefix("model.diffusion_model."): v for k, v in raw.items()
@@ -197,13 +201,38 @@ def model_weights(driver_cls, path: str):
         if k.startswith(driver_cls.text_encoder_parts):  # loaded with the text encoder
             continue
         wide = probe.transformer_dtype_for(k)
-        b = gpu_bytes(k, dt, shape, float_bytes=4 if wide is not None and "32" in str(wide) else 2)
+        width = 4 if wide is not None and "32" in str(wide) else 2
+        if expand:
+            b = 0 if k.endswith(DROPPED_SUFFIXES + SCALE_SUFFIXES) else _numel(shape) * (2 if dt == "U8" else 1) * width
+        else:
+            b = gpu_bytes(k, dt, shape, float_bytes=width)
         if k.startswith(head):
             i = block_index(k, driver_cls.block_list)
             blocks[i] = blocks.get(i, 0) + b
         else:
             resident += b
     return resident, [blocks[i] for i in sorted(blocks)], shapes
+
+
+def finetune_parts(shapes: dict, optimizer: str) -> tuple[int, int, int]:
+    """(trainable weights, optimizer-state bytes, bytes of one weight's update) of a finetune of the model with these
+    {key: (dtype, shape)}. Adafactor keeps a row and a column per matrix (all of a vector), AdamW 8-bit 2 bytes a
+    weight; a weight's update holds its fp32 copy and gradient, its bf16 gradient and the rounding's temporaries."""
+    params, state, largest = 0, 0, 0
+    for k, (dt, shape) in shapes.items():
+        if k.endswith(DROPPED_SUFFIXES + SCALE_SUFFIXES):
+            continue
+        shape = list(shape)
+        if dt == "U8" and len(shape) == 2:
+            shape[-1] *= 2  # nvfp4: two codes per byte
+        n = _numel(shape)
+        params += n
+        largest = max(largest, n)
+        if optimizer == "adafactor":
+            state += 4 * (_numel(shape[:-1]) + _numel(shape[:-2] + shape[-1:]) if len(shape) >= 2 else n)
+        else:
+            state += 2 * n
+    return params, state, largest * 18
 
 
 def _vae_work(spec: tuple[float, float], pixels: int, cap: int | None = None) -> float:
@@ -230,7 +259,8 @@ def project(driver_cls, profile: dict, settings: dict, kind: str = "train") -> d
     """VRAM projection for a training job (``kind="train"``, ``settings`` as the job's) or a Sandbox
     generation (``kind="sample"``: width, height, frames, loras). Sizes are in GB."""
     mem = driver_cls.memory
-    resident, blocks, shapes = model_weights(driver_cls, profile["diffusion_model"])
+    finetune = kind == "train" and bool(settings.get("finetune_enabled"))
+    resident, blocks, shapes = model_weights(driver_cls, profile["diffusion_model"], expand=finetune)
     vae = vae_bytes(driver_cls, profile)
     te = file_gpu_bytes(profile.get("text_encoder", ""), skip=driver_cls.text_encoder_skip,
                         fp32=driver_cls.text_encoder_fp32)
@@ -279,12 +309,21 @@ def project(driver_cls, profile: dict, settings: dict, kind: str = "train") -> d
         batch = int(settings.get("batch_size", 1) or 1)
         rank = int(settings.get("rank", 32) or 32)
         net = settings.get("network_type") or "lora"
-        params = lora_params(shapes, driver_cls.lora_targets, rank, net, int(settings.get("lokr_factor", -1) or -1))
-        name = "LoKr" if net == "lokr" else "LoRA"
-        optimizer = OPTIMIZER_BYTES.get(settings.get("optimizer", "adamw8bit"), 8)
-        lora = params * 8 + adapter  # fp32 weights and gradients, plus the adapter
-        weights = params * 4 + adapter  # while sampling: no gradients
-        opt = params * optimizer
+        if finetune:  # the trained weights are the model's, counted with it; no adapter
+            model = {k: v for k, v in shapes.items() if not k.startswith(driver_cls.text_encoder_parts or ("\0",))}
+            params, opt, update = finetune_parts(model, settings.get("optimizer", "adafactor"))
+            name, lora, weights = "Weight updates", update, 0
+            notes.append(f"A finetune trains every weight, in bf16 on the GPU (nothing offloaded), and saves the "
+                         f"whole model each time: about {params * 2 / 1e9:.1f} GB a file.")
+            if any(dt in QUANT_DTYPES for k, (dt, _) in model.items() if not k.endswith(DROPPED_SUFFIXES)):
+                notes.append("The model file is quantized: its layers are expanded to bf16 to train, so its rounding "
+                             "is trained in. The bf16 release trains better.")
+        else:
+            params = lora_params(shapes, driver_cls.lora_targets, rank, net, int(settings.get("lokr_factor", -1) or -1))
+            name = "LoKr" if net == "lokr" else "LoRA"
+            lora = params * 8 + adapter  # fp32 weights and gradients, plus the adapter
+            weights = params * 4 + adapter  # while sampling: no gradients
+            opt = params * OPTIMIZER_BYTES.get(settings.get("optimizer", "adamw8bit"), 8)
         n_tok = max(tokens(r, r, f) for r, f in sizes) * batch
         saved = n_tok * len(blocks) * mem.saved if offload_saved and mem is not None else 0
         phases.append({"id": "training", "label": "Training step", "model": True, "parts": [
@@ -298,21 +337,22 @@ def project(driver_cls, profile: dict, settings: dict, kind: str = "train") -> d
         if mem is not None:
             decode = _vae_work(mem.vae_decode, sw * sh * sf, mem.decode_tile_pixels)
             infer = activations(tokens(sw, sh, sf), False)
+            held = [] if finetune else [[name, weights / GB]]  # a finetune's are the model's
             if low_vram:  # denoise with the optimizer state in RAM, then decode with the model and LoRA there too
                 # sample cards with images (a first frame, references) have the VAE encode them while sampling
                 cards = [c for c in settings.get("sample_prompts") or [] if isinstance(c, dict)]
                 with_vae = [["VAE", vae / GB]] if any(c.get("images") for c in cards) else []
                 phases.append({"id": "sampling", "label": "Sampling", "model": True, "parts": [
-                    [name, weights / GB], *with_vae, ["Working memory", infer / GB]], "ram": [["Optimizer", opt / GB]]})
+                    *held, *with_vae, ["Working memory", infer / GB]], "ram": [["Optimizer", opt / GB]]})
                 # a training adapter (if any) stays on the GPU while the LoRA and its optimizer state wait in RAM
                 phases.append({"id": "decoding", "label": "Decoding samples", "model": False, "model_ram": "all",
                                "parts": [["Training adapter", adapter / GB], ["VAE", vae / GB],
                                          ["Working memory", decode / GB]],
-                               "ram": [[name, params * 4 / GB], ["Optimizer", opt / GB]]})
+                               "ram": [*([] if finetune else [[name, params * 4 / GB]]), ["Optimizer", opt / GB]]})
             else:
                 phases.append({"id": "sampling", "label": "Sampling", "model": True, "parts": [
-                    [f"{name} + optimizer", (lora + opt) / GB], ["VAE", vae / GB],
-                    ["Working memory", max(infer, decode) / GB]]})
+                    ["Optimizer" if finetune else f"{name} + optimizer", (opt if finetune else lora + opt) / GB],
+                    ["VAE", vae / GB], ["Working memory", max(infer, decode) / GB]]})
             phases.append({"id": "latents", "label": "Encoding images", "model": False, "parts": [
                 ["VAE", vae / GB], ["Working memory", _vae_work(mem.vae_encode, max(r * r * f for r, f in sizes)) / GB]]})
         if not checkpointing:

@@ -87,9 +87,13 @@ class Workflow:
     # _refs folder, and the sample cards of a job use the same input
     images: dict | None = None
     variants: list[str] | None = None  # profile variants it applies to (None: every variant)
+    refmods: bool = False  # takes RefMods (``engine.refmod``) as references, as well as or instead of images
+    # reference sound files it takes, for videos: {"label", "max", "help"}; with audio RefMods, at most "max" in all
+    audio: dict | None = None
 
     def to_json(self) -> dict:
-        return {"id": self.id, **WORKFLOWS[self.id], "images": self.images, "variants": self.variants}
+        return {"id": self.id, **WORKFLOWS[self.id], "images": self.images, "variants": self.variants,
+                "refmods": self.refmods, "audio": self.audio}
 
 
 @dataclass
@@ -105,12 +109,17 @@ class FamilyInfo:
     workflows: list[Workflow] = field(default_factory=lambda: [Workflow("t2i")])
     frame_rule: str = ""  # video families: the clip lengths the VAE takes, e.g. "8n + 1 (9, 17, 25, …)"
     sliders: bool = False  # trains concept sliders (``engine.slider``) through slider_batch / slider_velocity
+    # makes RefMods (``engine.refmod``): saved reference latents, through ``encode_reference``
+    refmods: bool = False
     # the strength its LoRAs are meant to be used at; training samples, the Sandbox and the strength sweep start
     # there (YuE2's train without the composer's tokens, so they act at about half strength with them)
     lora_strength: float = 1.0
     # "Low VRAM" streams the text encoder's layers from system RAM (``FamilyDriver.stream_text_encoder``);
     # off for YuE2, whose composer writes songs a token at a time, far too often to stream
     streams_text_encoder: bool = True
+    # trains as a full finetune (``engine.finetune``) as well as adapters: the settings a finetune starts from
+    # (its learning rate and optimizer, how many saves to keep), or None
+    finetune: dict[str, Any] | None = None
 
     def to_json(self) -> dict:
         return {
@@ -123,8 +132,10 @@ class FamilyInfo:
             "workflows": [w.to_json() for w in self.workflows],
             "frame_rule": self.frame_rule,
             "sliders": self.sliders,
+            "refmods": self.refmods,
             "lora_strength": self.lora_strength,
             "streams_text_encoder": self.streams_text_encoder,
+            "finetune": self.finetune,
         }
 
 
@@ -237,10 +248,11 @@ class FamilyDriver:
         # halves round up, as in the web UI (Python's round() would round them to even)
         return max(0, min(num_blocks, math.floor(float(self.offload or 0) * num_blocks + 0.5)))
 
-    def load_transformer(self) -> nn.Module:
+    def load_transformer(self, trainable: bool = False) -> nn.Module:
         """Load the diffusion model, keeping quantized layers quantized. With ``offload`` set, the
         last blocks are read to system RAM and streamed in as they run (``self.swapper``);
-        everything else is read straight to the GPU, so the whole model never sits in RAM at once."""
+        everything else is read straight to the GPU, so the whole model never sits in RAM at once.
+        ``trainable`` (a full finetune): quantized layers are expanded to bf16 instead, and nothing is streamed."""
         import gc
 
         from .. import comfy_io
@@ -253,7 +265,7 @@ class FamilyDriver:
         model = self.build_transformer(shapes)
         blocks = model.get_submodule(self.block_list)
         n = len(blocks)
-        k = self.streamed_blocks(n)
+        k = 0 if trainable else self.streamed_blocks(n)
         streamed = tuple(f"{self.block_list}.{i}." for i in range(n - k, n))
         opts = {"strip_prefix": prefix or None, "only_prefixed": bool(prefix),
                 "cast_to": lambda key: self.transformer_dtype_for(key) or self.dtype}
@@ -267,12 +279,18 @@ class FamilyDriver:
         self.check_transformer_state(path, loaded)
         kinds = sorted({q.label for q in loaded.quant.values()})
         n_quant = len(loaded.quant)
-        materialize(model, loaded, self.dtype, keep_fp8=True, device=None, dtype_for=self.transformer_dtype_for)
+        materialize(model, loaded, self.dtype, keep_fp8=not trainable, device=None, dtype_for=self.transformer_dtype_for)
         del loaded
         gc.collect()
         assert_materialized(model)
-        self.log(f"  {n} blocks; " + (f"{n_quant} layers kept quantized ({', '.join(kinds)})" if n_quant
-                                      else "bf16 weights"))
+        if trainable and torch.cuda.is_available():
+            torch.cuda.empty_cache()  # what expanding the quantized layers took, which training would otherwise keep
+        if trainable and n_quant:
+            self.log(f"  {n} blocks; {n_quant} quantized layers ({', '.join(kinds)}) expanded to bf16 to train. "
+                     "Training from the bf16 release is better: a quantized file's rounding is trained in.")
+        else:
+            self.log(f"  {n} blocks; " + (f"{n_quant} layers kept quantized ({', '.join(kinds)})" if n_quant
+                                          else "bf16 weights"))
         self.swapper = BlockSwapper(blocks, k, self.device, self.log) if k else None
         return model
 

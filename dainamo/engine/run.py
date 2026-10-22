@@ -1,5 +1,5 @@
-"""Subprocess entry point: ``python -m dainamo.engine.run <job_dir>`` (training, or a checkpoint
-evaluation of a finished job).
+"""Subprocess entry point: ``python -m dainamo.engine.run <job_dir>`` (training, a checkpoint evaluation of a
+finished job, or making a RefMod).
 
 Exit codes: 0 completed, 3 stopped by user, 1 failed.
 """
@@ -27,13 +27,14 @@ def main():
     trainer = None
     try:
         trainer = Trainer(job_dir)
-        result = trainer.run_evaluation() if trainer.evaluating else trainer.run()
+        result = (trainer.run_evaluation() if trainer.evaluating
+                  else trainer.run_refmod() if trainer.s.get("refmod_enabled") else trainer.run())
         trainer.write_status(force=True)
         sys.exit(3 if result == "stopped" else 0)
     except StopRequested:
         if trainer:
             trainer.status["phase"] = "stopped"
-            trainer.log("Stopped before training began")
+            trainer.log("Stopped" if trainer.s.get("refmod_enabled") else "Stopped before training began")
         sys.exit(3)
     except Exception as e:  # report the failure to the UI, then exit non-zero
         traceback.print_exc()

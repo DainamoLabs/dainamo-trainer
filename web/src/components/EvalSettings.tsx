@@ -26,9 +26,10 @@ const EVAL_KEYS = Object.keys(EVAL_DEFAULTS);
  * (``picker`` false) have no picker: they aren't trained to reproduce their images. Music (``bleed`` false)
  * has no concept bleed, which compares images.
  */
-export function EvalSettings({ s, set, datasets, triggers, holdout, heldOut = 0, imageCount = 0, trainedOn = [], picker = true, bleed = true }: {
+export function EvalSettings({ s, set, datasets, triggers, holdout, heldOut = 0, imageCount = 0, trainedOn = [], picker = true, bleed = true, sweep = true }: {
   s: S; set: (k: string) => (v: any) => void; datasets: Dataset[] | null; triggers: string[];
   holdout: "choose" | "fixed" | "none"; heldOut?: number; imageCount?: number; trainedOn?: string[]; picker?: boolean; bleed?: boolean;
+  sweep?: boolean; // the strength sweep (not for a finetune, which has no strength)
 }) {
   const probes: string[] = s.bleed_prompts || [];
   const setProbes = (p: string[]) => set("bleed_prompts")(p);
@@ -75,11 +76,13 @@ export function EvalSettings({ s, set, datasets, triggers, holdout, heldOut = 0,
             <div className="grid cols-2">
               <Num label="Timesteps per image" v={s.val_timesteps} on={set("val_timesteps")} min={1} help="More is smoother but slower." />
             </div>
-            <label className="check"><input type="checkbox" checked={s.sweep_enabled} onChange={(e) => set("sweep_enabled")(e.target.checked)} />
-              At the end, render the recommended checkpoint at strengths</label>
-            {s.sweep_enabled && (
-              <input value={s.sweep_strengths} onChange={(e) => set("sweep_strengths")(e.target.value)} placeholder="0.6, 0.8, 1.0, 1.2" style={{ maxWidth: 320 }} />
-            )}
+            {sweep && <>
+              <label className="check"><input type="checkbox" checked={s.sweep_enabled} onChange={(e) => set("sweep_enabled")(e.target.checked)} />
+                At the end, render the recommended checkpoint at strengths</label>
+              {s.sweep_enabled && (
+                <input value={s.sweep_strengths} onChange={(e) => set("sweep_strengths")(e.target.value)} placeholder="0.6, 0.8, 1.0, 1.2" style={{ maxWidth: 320 }} />
+              )}
+            </>}
           </div>
         )}
       </div>}

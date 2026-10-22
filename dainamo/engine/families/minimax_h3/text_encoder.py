@@ -1,5 +1,6 @@
 # Ported from ai-toolkit (Ostris, LLC — MIT License),
-# extensions_built_in/diffusion_models/minimax_h3/src/text_encoder.py. Changes for Dainamo: none (verbatim).
+# extensions_built_in/diffusion_models/minimax_h3/src/text_encoder.py. Changes for Dainamo: ``AudioRef``, a
+# standalone audio reference's ``"<Audio j>: "`` label (as the released ref2va pipeline presents one).
 # MiniMax-H3 itself (weights and the architecture this code implements) is distributed by MiniMax under the
 # MiniMax H3 Community License; see THIRD_PARTY_NOTICES.md and NOTICE.
 """Qwen3-VL conditioning for MiniMax-H3.
@@ -43,6 +44,13 @@ class VideoRef:
     # "<Audio j>: " label emitted BEFORE the "<Video k>: " block (audio itself
     # never enters Qwen)
     has_audio: bool = False
+
+
+@dataclass(frozen=True)
+class AudioRef:
+    """A standalone audio reference in the presentation: its ``"<Audio j>: "``
+    label alone (the waveform never enters Qwen), numbered with the video
+    soundtracks in reference order."""
 
 
 def video_has_audio(path) -> bool:
@@ -152,7 +160,7 @@ def encode_minimax_h3_prompt(
     token_ids: List[int] = []
     token_tags: List[int] = []
     if keyframes:
-        images = [k for k in keyframes if not isinstance(k, VideoRef)]
+        images = [k for k in keyframes if not isinstance(k, (VideoRef, AudioRef))]
         videos = [k for k in keyframes if isinstance(k, VideoRef)]
         merge = processor.image_processor.merge_size**2
         vision_start = tokenizer.convert_tokens_to_ids("<|vision_start|>")
@@ -179,7 +187,14 @@ def encode_minimax_h3_prompt(
 
         pic_idx, vid_idx, aud_idx = 0, 0, 0
         for k in keyframes:
-            if isinstance(k, VideoRef):
+            if isinstance(k, AudioRef):
+                aud_idx += 1
+                label_ids = tokenizer(
+                    f"<Audio {aud_idx}>: ", add_special_tokens=False
+                )["input_ids"]
+                token_ids += label_ids
+                token_tags += [TEXT_TAG] * len(label_ids)
+            elif isinstance(k, VideoRef):
                 grid = video_grid_thw[vid_idx]
                 per_pair = int(grid[1] * grid[2]) // merge
                 label_ids = []

@@ -123,6 +123,8 @@ class MossImageDriver(FamilyDriver):
             ("uniform", "Uniform"),
         ],
         sliders=True,
+        # 5.1B weights: 10.2 GB in bf16, with Adafactor's factored state beside them
+        finetune={"learning_rate": 1e-5, "optimizer": "adafactor", "keep_last": 2},
     )
     bucket_divisibility = 16  # VAE /8, then 2x2 packing
     caption_tokens = MAX_TEXT_TOKENS

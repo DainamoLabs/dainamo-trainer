@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  api, fmtClock, fmtDuration, fmtTime, type Family, type Gpu, type LoraOption, type Profile, type SandboxDefaults,
+  api, fmtClock, fmtDuration, fmtTime, type Family, type Gpu, type LoraOption, type ModelOption, type Profile, type RefModOption, type SandboxDefaults,
   type SandboxOutput, type SandboxParams, type SandboxProgress, type SandboxRun, type SandboxStatus, type SystemRam,
   type Workflow,
 } from "../api";
@@ -19,6 +19,9 @@ type Form = {
   seconds: number; lyrics: string; // music
   steps: number; cfg: number; sampler: string; scheduler: string; shift: string; seed: number; random_seed: boolean;
   count: number; loras: LoraRow[]; images: string; compare_base: boolean; gpu: number | null;
+  model: string; model_custom: boolean; // a finetuned diffusion model in place of the profile's ("": the profile's)
+  refmods: LoraRow[]; // RefMods as references (workflows that take them), each at a strength 0–1
+  audio: string[]; // reference sound files (workflows that take them, for a video)
   offload: number | null; // % of the diffusion model's blocks in system RAM (null: the model's default)
   low_vram: boolean; // the text encoder's layers streamed from system RAM too
   size_mode: SizeMode; shape: string; mp: number; // width/height are used as typed only in "custom"
@@ -33,6 +36,7 @@ type Preset = {
   profile_id: string; workflow: string; prompt: string; negative: string; width: number; height: number; frames: number;
   steps: number; cfg: number; seed: number; loras: { path: string; strength: number }[]; images: string[];
   offload: number | null; low_vram?: boolean; notes: string[]; job_name: string; step: number; seconds?: number; lyrics?: string;
+  model?: string | null; // a finetune's checkpoint
 };
 
 function readPreset(): Preset | null {
@@ -52,14 +56,15 @@ function presetForm(base: Form, p: Preset, video: boolean): Form {
     ...(p.seconds != null ? { seconds: p.seconds, lyrics: p.lyrics || "" } : {}),
     sampler: "euler", scheduler: "default", shift: "", seed: p.seed, random_seed: false, count: 1, compare_base: false,
     loras: p.loras.map((l) => ({ ...l, custom: false })), images: p.images.join(", "), offload: p.offload ?? null,
-    low_vram: !!p.low_vram, enhance: false, enhanced: null,
+    low_vram: !!p.low_vram, enhance: false, enhanced: null, refmods: [], audio: [], model: p.model || "", model_custom: false,
   };
 }
 const BLANK: Form = {
   profile_id: "", workflow: "t2i", prompt: "", negative: "", width: 1024, height: 1024, frames: 1, seconds: 30, lyrics: "",
   steps: 20, cfg: 1,
   sampler: "euler", scheduler: "default", shift: "", seed: 42, random_seed: true, count: 1, loras: [], images: "",
-  compare_base: false, gpu: null, offload: null, low_vram: false, size_mode: "shape", shape: "1:1", mp: 1, enhance: false, enhanced: null,
+  refmods: [], audio: [], compare_base: false, gpu: null, offload: null, low_vram: false, size_mode: "shape", shape: "1:1", mp: 1, enhance: false, enhanced: null,
+  model: "", model_custom: false,
   grid: { on: false, job_id: "", checkpoints: [], strengths: "1.0", base: false },
 };
 
@@ -114,14 +119,20 @@ function saveForm(f: Form) {
 const fileUrl = (run: SandboxRun, name: string) => `/api/sandbox/file/${run.id}/${encodeURIComponent(name)}`;
 const base = (p: string) => p.split("/").pop() || p;
 
+// reference audio: sound files, or videos for their soundtrack
+const AUDIO_EXTS = ".mp3,.wav,.flac,.ogg,.m4a,.opus,.aac,.mp4,.mov,.mkv,.webm";
+
 // what the "i" beside a setting says, for the ones whose name doesn't
 const INFO = {
   profile: "The model files to generate with (the model, its text encoder and VAE), set up on the Profiles page.",
   workflow: "What to make: from a prompt alone, an edit of an input image, a video from a first frame, and so on. Only the ones this profile's model supports can be chosen.",
   enhance: "Before generating, the caption provider set in Settings rewrites your prompt into a more detailed one, with an instruction for this workflow. The rewrite is kept and used again while the prompt, seed and inputs stay the same.",
+  model: "The diffusion model to generate with: the profile's, or a finetune job's checkpoint (a whole model trained from it) in its place, with the profile's text encoder and VAE. Switching reloads only the diffusion model.",
   loras: "LoRAs applied while generating, each at its own strength: 1 is full strength, 0 is off, and a negative strength pushes the other way (as with a slider). Pick a job's checkpoint (★ is the one the checkpoint picker recommended) or any LoRA file.",
   megapixels: "How big to make it, at the shape chosen above. A megapixel is 1024×1024 pixels, and each side is rounded to a multiple of 64. Bigger takes more VRAM and time.",
   compareBase: "Also renders each seed without the LoRAs, beside the images with them, to show what the LoRAs change.",
+  refmods: "References saved by a RefMod job (or made in ComfyUI with ComfyUI-MiniMaxH3Mod), put in after the reference images without encoding anything again. Strength 1 is the reference as it is; lower blends it toward a blurred copy of itself, so it guides the video less. The text encoder doesn't see picture ones, as with the ComfyUI pack's Apply node. Sound ones go in as reference audio (for a video, beside a reference image or a picture RefMod), labelled <Audio 1>, <Audio 2>, … in the prompt as the released pipeline does.",
+  audio: "Each goes in as clean audio ahead of the video's own, after the reference images and RefMods, and is labelled <Audio 1>, <Audio 2>, … ahead of the prompt (after any sound RefMods' labels), as the released pipeline presents them. A video file's soundtrack works too. The ComfyUI pack reports that a voice doesn't carry over reliably; music has done better.",
   strengths: "Each checkpoint renders at each of these LoRA strengths, comma-separated: one row of the grid per strength.",
   cfg: "How strongly the image follows the prompt and steers away from the negative prompt. Above 1 runs the model twice a step, so it's about twice as slow; distilled (turbo) models are made for 1.",
   tokenCfg: "How strongly the composer follows the style and lyrics as it writes the song, token by token. 1 turns it off; the model's release uses 1.01.",
@@ -266,6 +277,8 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
   const profile = profiles?.find((p) => p.id === form.profile_id);
   const family = families.find((f) => f.id === profile?.family);
   const [loraOptions] = usePoll<LoraOption[]>(family ? `/api/sandbox/loras?family=${family.id}` : null, 0, [family?.id]);
+  const [refmodOptions] = usePoll<RefModOption[]>(family?.refmods ? `/api/sandbox/refmods?family=${family.id}` : null, 0, [family?.id]);
+  const [modelOptions] = usePoll<ModelOption[]>(family?.finetune ? `/api/sandbox/models?family=${family.id}` : null, 0, [family?.id]);
 
   // pick a profile, then load its defaults; switching profiles applies them (and a workflow it supports)
   useEffect(() => {
@@ -284,7 +297,8 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
         const keep = d.workflows.some((w) => w.id === form.workflow);
         const workflow = keep ? form.workflow : d.workflows[0]?.id || "t2i";
         setForm({
-          steps: d.steps, cfg: d.cfg, negative: d.negative, frames: d.frames, seconds: d.seconds ?? 30, workflow, loras: [], images: "",
+          steps: d.steps, cfg: d.cfg, negative: d.negative, frames: d.frames, seconds: d.seconds ?? 30, workflow, loras: [], images: "", refmods: [], audio: [],
+          model: "", model_custom: false,
           sampler: "euler", scheduler: "default", shift: "", offload: d.offload,
           ...sizeState(d.width, d.height, d.workflows.find((w) => w.id === workflow)?.output === "video"),
         });
@@ -312,6 +326,13 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
   // size: a shape (or the input image's) at some megapixels, or typed in
   const shapes = video ? VIDEO_SHAPES : IMAGE_SHAPES;
   const images = wf?.images ? imageList(form.images) : [];
+  const formRefmods = form.refmods || [];
+  const setRefmod = (i: number, patch: Partial<LoraRow>) => setForm({ refmods: formRefmods.map((l, j) => (j === i ? { ...l, ...patch } : l)) });
+  // the RefMods that go in: chosen, at a strength above 0
+  const refmods = wf?.refmods ? formRefmods.filter((l) => l.path.trim() && l.strength > 0) : [];
+  // reference sound files: for a video only
+  const formAudio = form.audio || [];
+  const audioRefs = wf?.audio && video && form.frames > 1 ? formAudio.map((a) => a.trim()).filter(Boolean) : [];
   const mode: SizeMode = form.size_mode === "match" && !wf?.images ? "shape" : form.size_mode;
   useEffect(() => {
     const path = images[0];
@@ -332,6 +353,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
   const gridImages = grid.on ? (grid.checkpoints.length * gridStrengths.length + (grid.base ? 1 : 0)) * form.count : 0;
   const vram = useVramProjection(form.profile_id || undefined, {
     width, height, frames: video ? form.frames : 1, ...(music ? { seconds: form.seconds } : {}),
+    ...(form.model.trim() ? { model: form.model.trim() } : {}), // a finetuned model is bf16: often bigger than the profile's
     // a grid applies one of its checkpoints at a time, next to the LoRAs
     loras: [...form.loras.map((l) => l.path.trim()), ...(grid.on ? grid.checkpoints.slice(0, 1) : [])].filter(Boolean),
     low_vram: lowVram,
@@ -373,7 +395,9 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
         sampler: form.sampler, scheduler: form.scheduler, shift: form.shift.trim() === "" ? null : Number(form.shift),
         seed, count: form.count, compare_base: form.compare_base && !grid.on,
         loras: form.loras.filter((l) => l.path.trim()).map((l) => ({ path: l.path, strength: l.strength })),
-        images, gpu, offload, low_vram: lowVram,
+        model: form.model.trim(), images, gpu, offload, low_vram: lowVram,
+        ...(wf?.refmods ? { refmods: refmods.map((l) => ({ path: l.path, strength: l.strength })) } : {}),
+        ...(wf?.audio ? { audio: audioRefs } : {}),
         grid: grid.on ? { job_id: grid.job_id, checkpoints: grid.checkpoints, strengths: gridStrengths, base: grid.base } : null,
       };
       const run = await api.post<SandboxRun>("/api/sandbox/generate", body);
@@ -400,6 +424,9 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
       shift: p.shift == null ? "" : String(p.shift), seed: p.seed, random_seed: false, count: p.count,
       compare_base: p.compare_base, images: p.images.join(", "), offload: p.offload ?? null, low_vram: !!p.low_vram,
       loras: p.loras.map((l) => ({ ...l, custom: !(loraOptions || []).some((o) => o.path === l.path) })),
+      model: p.model || "", model_custom: !!p.model && !(modelOptions || []).some((o) => o.path === p.model),
+      refmods: (p.refmods || []).map((l) => ({ ...l, custom: !(refmodOptions || []).some((o) => o.path === l.path) })),
+      audio: p.audio || [],
       // an enhanced run comes back with its rewrite, so generating again reuses it
       enhance: !!src,
       enhanced: src ? { prompt: src.trim(), seed: p.seed, workflow: p.workflow, images: p.images.join(", "), text: p.prompt } : null,
@@ -415,6 +442,11 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
     for (const o of loraOptions || []) m.set(o.job_name, [...(m.get(o.job_name) || []), o]);
     return [...m.entries()];
   }, [loraOptions]);
+  const modelJobs = useMemo(() => {
+    const m = new Map<string, ModelOption[]>();
+    for (const o of modelOptions || []) m.set(o.job_name, [...(m.get(o.job_name) || []), o]);
+    return [...m.entries()];
+  }, [modelOptions]);
   // a job's checkpoints for the grid, oldest first (the final one last)
   const gridJobs = useMemo(() => {
     const m = new Map<string, { name: string; opts: LoraOption[] }>();
@@ -506,10 +538,86 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
 
           {wf?.images && (
             <label className="field" onClick={(e) => e.preventDefault()}>
-              <span>{wf.images.label} <span className="faint">· {wf.images.min === wf.images.max ? wf.images.min : `${wf.images.min}–${wf.images.max}`}</span></span>
+              <span>{wf.images.label} <span className="faint">· {refmods.length ? `0–${wf.images.max} with RefMods`
+                : wf.images.min === wf.images.max ? wf.images.min : `${wf.images.min}–${wf.images.max}`}</span></span>
               <ImagesInput value={form.images} onChange={(v) => setForm({ images: v })} multiple={wf.images.max > 1}
                 placeholder={wf.images.max > 1 ? "comma-separated image paths" : "image path"} />
             </label>
+          )}
+
+          {wf?.refmods && (
+            <div className="field">
+              <span>RefMods <span className="faint">· optional</span><Info text={INFO.refmods} /></span>
+              <div className="stack" style={{ gap: 8 }}>
+                {formRefmods.map((l, i) => (
+                  <div key={i} className="sbx-lora">
+                    {l.custom || (l.path && refmodOptions && !refmodOptions.some((o) => o.path === l.path)) ? (
+                      <PathInput value={l.path} onChange={(v) => setRefmod(i, { path: v })} exts=".safetensors" placeholder="/path/to/refmod.safetensors" />
+                    ) : (
+                      <select value={l.path} onChange={(e) => e.target.value === "__custom" ? setRefmod(i, { custom: true, path: "" }) : setRefmod(i, { path: e.target.value })}>
+                        <option value="">Choose a RefMod…</option>
+                        {(refmodOptions || []).map((o) => (
+                          <option key={o.path} value={o.path}>{o.job_name} · {o.kind === "audio" ? `sound, ${o.seconds} s` : o.mode} · {o.tokens.toLocaleString()} tokens</option>
+                        ))}
+                        <option value="__custom">Other file…</option>
+                      </select>
+                    )}
+                    <input type="number" step={0.05} min={0} max={1} value={l.strength} title="Strength (0–1)"
+                      onChange={(e) => setRefmod(i, { strength: Math.min(1, Math.max(0, Number(e.target.value) || 0)) })} />
+                    <button className="btn ghost icon" title="Remove" onClick={() => setForm({ refmods: formRefmods.filter((_, j) => j !== i) })}><IconX /></button>
+                  </div>
+                ))}
+                <div className="row">
+                  <button className="btn" onClick={() => setForm({ refmods: [...formRefmods, { path: "", strength: 1, custom: false }] })} disabled={formRefmods.length >= 4}>
+                    <IconPlus /> Add RefMod
+                  </button>
+                  {refmodOptions && refmodOptions.length === 0 && <span className="faint small">None made yet: make one on Create Job (Make: RefMod).</span>}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {wf?.audio && video && (
+            <div className="field">
+              <span>{wf.audio.label} <span className="faint">· optional, up to {wf.audio.max} with sound RefMods</span><Info text={`${wf.audio.help} ${INFO.audio}`} /></span>
+              <div className="stack" style={{ gap: 8 }}>
+                {formAudio.map((a, i) => (
+                  <div key={i} className="sbx-lora no-strength">
+                    <PathInput value={a} onChange={(v) => setForm({ audio: formAudio.map((x, j) => (j === i ? v : x)) })}
+                      exts={AUDIO_EXTS} placeholder="/path/to/voice.wav (or a video, for its sound)" />
+                    <button className="btn ghost icon" title="Remove" onClick={() => setForm({ audio: formAudio.filter((_, j) => j !== i) })}><IconX /></button>
+                  </div>
+                ))}
+                <div className="row">
+                  <button className="btn" onClick={() => setForm({ audio: [...formAudio, ""] })} disabled={formAudio.length >= wf.audio.max}>
+                    <IconPlus /> Add audio
+                  </button>
+                  {formAudio.length > 0 && form.frames <= 1 && <span className="faint small">Reference audio needs a video: set more than one frame.</span>}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {(family?.finetune || form.model) && (
+            <div className="field">
+              <span>Diffusion model<Info text={INFO.model} /></span>
+              {form.model_custom || (form.model && modelOptions && !modelOptions.some((o) => o.path === form.model)) ? (
+                <div className="sbx-lora no-strength">
+                  <PathInput value={form.model} onChange={(v) => setForm({ model: v })} exts=".safetensors" placeholder="/path/to/finetuned_model.safetensors" />
+                  <button className="btn ghost icon" title="Use the profile's" onClick={() => setForm({ model: "", model_custom: false })}><IconX /></button>
+                </div>
+              ) : (
+                <select value={form.model} onChange={(e) => e.target.value === "__custom" ? setForm({ model: "", model_custom: true }) : setForm({ model: e.target.value })}>
+                  <option value="">The profile's · {base(String(profile?.data?.diffusion_model || ""))}</option>
+                  {modelJobs.map(([name, opts]) => (
+                    <optgroup key={name} label={`${name} · finetune`}>
+                      {opts.map((o) => <option key={o.path} value={o.path}>{o.final ? "final" : `step ${o.step}`} · {o.file}</option>)}
+                    </optgroup>
+                  ))}
+                  <option value="__custom">Other file…</option>
+                </select>
+              )}
+            </div>
           )}
 
           <div className="field">
@@ -761,6 +869,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
                 {current.params.frames > 1 ? ` · ${current.params.frames}f` : ""} · {current.params.steps} steps · {status?.samplers[current.params.sampler] || current.params.sampler}
                 {current.params.scheduler !== "default" ? ` · ${status?.schedulers[current.params.scheduler]}` : ""}
                 {current.params.shift != null ? ` · shift ${current.params.shift}` : ""}{current.params.cfg !== 1 ? ` · CFG ${current.params.cfg}` : ""}
+                {current.params.model ? ` · ${base(current.params.model)}` : ""}
                 {current.params.loras.map((l) => ` · ${base(l.path)} @ ${l.strength}`).join("")}
                 {current.params.grid ? ` · ${current.params.grid.job_name || "checkpoints"}: ${current.params.grid.checkpoints.length} × ${current.params.grid.strengths.length} strength${current.params.grid.strengths.length === 1 ? "" : "s"}` : ""}
                 {current.elapsed ? ` · ${fmtDuration(current.elapsed)}` : ""}
@@ -773,6 +882,12 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
               )}
               {current.params.images.length > 0 && (
                 <div className="muted small" style={{ marginBottom: 12 }}>Images: <span className="mono">{current.params.images.map(base).join(", ")}</span></div>
+              )}
+              {(current.params.refmods || []).length > 0 && (
+                <div className="muted small" style={{ marginBottom: 12 }}>RefMods: <span className="mono">{current.params.refmods!.map((r) => `${base(r.path)}${r.strength !== 1 ? ` @ ${r.strength}` : ""}`).join(", ")}</span></div>
+              )}
+              {(current.params.audio || []).length > 0 && (
+                <div className="muted small" style={{ marginBottom: 12 }}>Reference audio: <span className="mono">{current.params.audio!.map(base).join(", ")}</span></div>
               )}
               {current.status === "failed" && <div className="error-box">{current.message}</div>}
               {current.report?.loras?.some((l) => l.matched < l.total) && (

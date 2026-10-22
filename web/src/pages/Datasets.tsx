@@ -3,7 +3,7 @@ import { go } from "../App";
 import { api, fmtTime, q, type Dataset, type Family, type Gpu, type MediaItem, type Profile, type Settings, type WhisperModel } from "../api";
 import { CheckIssues, useDatasetCheck } from "../components/DatasetCheck";
 import { IconDownload, IconEdit, IconImages, IconPlus, IconScissors, IconSparkle, IconTrash, IconUpload, IconX } from "../components/icons";
-import { ConfirmDialog, Info, Lightbox, Modal, PathInput, usePoll, useToast } from "../components/ui";
+import { ConfirmDialog, Info, Lightbox, Modal, PathInput, fmtSize, usePoll, useToast } from "../components/ui";
 
 type SplitStatus = {
   running: boolean; total: number; done: number; clips: number; current?: string; message?: string; errors: string[];
@@ -374,7 +374,11 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
       </div>
 
       {light && <Lightbox src={`/api/media?path=${q(light.path)}`} video={light.kind === "video"} onClose={() => setLight(null)}
-        audio={light.kind === "audio" ? { poster: `/api/thumb?size=1024&path=${q(light.path)}`, title: light.name } : undefined} />}
+        audio={light.kind === "audio" ? { poster: `/api/thumb?size=1024&path=${q(light.path)}` } : undefined}
+        info={{ name: light.name, caption: light.caption, details: [
+          ...(light.size != null ? [fmtSize(light.size)] : []),
+          ...(light.cut_from ? [`cut from ${light.cut_from.source} at ${fmtClock(light.cut_from.start)}`] : []),
+        ] }} />}
       {confirmRemove && d && (
         <ConfirmDialog title="Remove dataset" danger confirmLabel="Remove" onClose={() => setConfirmRemove(false)} onConfirm={removeDataset}
           message={d.managed ? <>Remove <strong style={{ color: "var(--text)" }}>{d.name}</strong> from Dainamo?</>

@@ -217,6 +217,7 @@ def test_dataset_list_and_check_count_videos(client, tmp_path):
     assert d["videos"] == 3 and d["video_sources"] == 2 and d["images"] == 1
     items = {it["name"]: it for it in client.get(f"/api/datasets/{did}/items").json()}
     assert items["a_002.mp4"]["cut_from"] == {"source": "a.mp4", "start": 0} and items["still.png"]["cut_from"] is None
+    assert items["still.png"]["size"] == os.path.getsize(os.path.join(root, "still.png"))  # for the viewer's details
     check = client.get(f"/api/datasets/{did}/check", params={"family": "minimax_h3", "resolution": "256", "frames": 22}).json()
     note = next(i for i in check["issues"] if i["id"] == "split_clips")
     assert note["title"] == "3 clips cut from 2 videos"

@@ -4,7 +4,7 @@ A job directory holds ``job.json`` (written by the server). The trainer writes:
   status.json    latest progress snapshot (atomically replaced)
   metrics.jsonl  one line per step: step, loss, lr
   samples/       samples generated during training (PNG, or MP4 + poster for video families)
-  output/        LoRA checkpoints (ComfyUI-compatible .safetensors)
+  output/        LoRA checkpoints (ComfyUI-compatible .safetensors); a finetune's are whole diffusion models
   state/         resumable optimizer state
   cache.json     the files of the encoding cache it uses (``engine.cache``), so they're kept while it runs
 and polls ``control.json`` for stop / sample-now / save-now requests. SIGTERM is
@@ -15,7 +15,9 @@ Encoded items and captions go to the cache that jobs share, ``job.json``'s ``cac
 
 A job.json with ``evaluate`` set is a checkpoint evaluation of a finished job instead (see
 ``run_evaluation``): the job's saved checkpoints are scored, and nothing is trained. Settings with
-``slider_enabled`` train a concept slider (``engine.slider``) instead of learning the datasets.
+``slider_enabled`` train a concept slider (``engine.slider``) instead of learning the datasets, and with
+``refmod_enabled`` the job makes a RefMod of them instead (``run_refmod``): nothing is trained. With
+``finetune_enabled`` every weight of the diffusion model trains (``engine.finetune``) in place of a LoRA.
 
 Everything model-specific goes through the family driver: which conditions an item trains with
 (caption, or caption plus conditioning images), how an item is VAE-encoded, the loss, sampling and
@@ -38,6 +40,7 @@ from ..fsutil import replace
 from . import cache
 from . import dataset as ds
 from . import evaluation
+from . import refmod
 from .families import get_family
 from .hf_assets import resolve_path
 from .lora import LoRANetwork
@@ -45,6 +48,9 @@ from .media import save_media
 from .memory import decode_bytes
 from .offload import ActivationOffload, make_room, park_optimizer, unpark
 from .slider import Slider, slider_loss
+
+
+PREVIEW_FRAMES = 12  # a RefMod's frames decoded for its job page
 
 
 class StopRequested(Exception):
@@ -62,11 +68,15 @@ def request_stop() -> None:
 
 def cond_key(prompt: str, images: list | None) -> str:
     """Cache key for a text condition. Plain prompts key on the prompt itself (so existing caches
-    stay valid); conditions with images add a fingerprint of the prepared images."""
+    stay valid); conditions with images add a fingerprint of the prepared images (and of any non-image
+    marker among them, such as MiniMax H3's audio reference label)."""
     if not images:
         return prompt
     h = hashlib.sha1()
     for im in images:
+        if not hasattr(im, "tobytes"):
+            h.update(repr(im).encode())
+            continue
         h.update(f"{im.size}{im.mode}".encode())
         h.update(im.tobytes())
     return f"{prompt}\x00img:{h.hexdigest()}"
@@ -98,6 +108,7 @@ class Trainer:
         self.validator: evaluation.Validator | None = None
         self.probe: evaluation.BleedProbe | None = None
         self.slider = Slider.from_settings(self.s)
+        self.finetune = bool(self.s.get("finetune_enabled"))  # the whole model trains, not a LoRA
         self._last_status_write = 0.0
         self._progress_open = False
         old = self.read_status()
@@ -268,6 +279,9 @@ class Trainer:
         name = self.s.get("optimizer", "adamw8bit")
         lr = float(self.s["learning_rate"])
         wd = float(self.s.get("weight_decay", 0.0))
+        if self.finetune:  # each weight steps as backward reaches it
+            from .finetune import FusedOptimizer
+            return FusedOptimizer(params, name, lr, wd)
         if name == "adamw8bit":
             import bitsandbytes as bnb
             return bnb.optim.AdamW8bit(params, lr=lr, weight_decay=wd, betas=(0.9, 0.999))
@@ -322,15 +336,19 @@ class Trainer:
             for k in ("recommended", "sweep"):
                 if (results.get(k) or {}).get("file") == old:
                     results[k]["file"] = new
-        self.log(f"Continuing past step {final['step']}: its LoRA is kept as {new}")
+        self.log(f"Continuing past step {final['step']}: its {'model' if self.finetune else 'LoRA'} is kept as {new}")
 
     def save_lora(self, network: LoRANetwork, step: int, final: bool = False):
         fname = self.lora_file(step, final)
         path = os.path.join(self.job_dir, "output", fname)
-        meta = dict(self.driver.lora_metadata)
+        meta = {} if network.kind == "full" else dict(self.driver.lora_metadata)
         meta.update({"dainamo.job": self.job["name"], "dainamo.step": str(step), "dainamo.network": network.kind,
                      "dainamo.trigger": ", ".join(d.get("trigger", "") for d in self.job["datasets"] if d.get("trigger"))})
-        if network.kind == "lokr":  # as LyCORIS's kohya-style trainers record it
+        if network.kind == "full":  # a whole diffusion model, finetuned from the profile's
+            meta.update({"dainamo.family": self.job["family"],
+                         "dainamo.base": os.path.basename(self.job["profile"]["diffusion_model"])})
+            self.log(f"Saving the finetuned model at step {step}")
+        elif network.kind == "lokr":  # as LyCORIS's kohya-style trainers record it
             args = {"algo": "lokr", "factor": str(network.factor), "full_matrix": "True"}
             meta.update({"ss_network_module": "lycoris.kohya", "ss_network_args": json.dumps(args)})
         else:
@@ -357,9 +375,14 @@ class Trainer:
         return fname
 
     def save_state(self, network, opt, sched, step):
-        torch.save({"step": step, "lora": network.state_dict(torch.float32), "opt": opt.state_dict(),
-                    "sched": sched.state_dict(), "status": self.status},
-                   os.path.join(self.job_dir, "state", "last.pt"))
+        """The optimizer and schedule, and the LoRA's weights; a finetune's weights are the checkpoint just saved,
+        which ``weights`` names (the whole model would double the save)."""
+        if network.kind == "full":
+            weights = {"weights": next(c["file"] for c in reversed(self.status["checkpoints"]) if c["step"] == step)}
+        else:
+            weights = {"lora": network.state_dict(torch.float32)}
+        torch.save({"step": step, **weights, "opt": opt.state_dict(), "sched": sched.state_dict(),
+                    "status": self.status}, os.path.join(self.job_dir, "state", "last.pt"))
 
     def sample_specs(self) -> list[dict]:
         """The sample prompt cards with blank fields filled from the Sampling defaults.
@@ -511,7 +534,7 @@ class Trainer:
         """Render the recommended checkpoint at several LoRA strengths for each sample prompt."""
         s = self.s
         rec = self.ev.get("recommended")
-        if not (s.get("picker_enabled") and s.get("sweep_enabled") and rec):
+        if not (s.get("picker_enabled") and s.get("sweep_enabled") and rec) or s.get("finetune_enabled"):
             return
         raw = s.get("sweep_strengths") or []  # the form's text ("0.6, 0.8") when the picker was off
         strengths = [float(x) for x in (raw.replace(",", " ").split() if isinstance(raw, str) else raw)]
@@ -632,8 +655,14 @@ class Trainer:
         val_payload_files = self.cache_items(driver, val_items) if val_items else []
         return items, item_keys, payload_files, val_keys, val_payload_files, bleed_prompts
 
-    def load_model(self, driver):
+    def load_model(self, driver, path: str | None = None):
+        """The diffusion model, from the profile's file or (a finetune carrying on) the checkpoint at ``path``."""
         self.phase("loading", "Loading diffusion model")
+        if self.finetune:  # trained whole, in bf16 on the GPU
+            if path:
+                driver.profile["diffusion_model"] = path
+            driver.offload = 0.0
+            return driver.load_transformer(trainable=True)
         driver.offload = float(self.s.get("offload", driver.info.training_defaults.get("offload", 0)) or 0) / 100
         return driver.load_transformer()
 
@@ -684,6 +713,20 @@ class Trainer:
             self.log(f"  adapter applied to {n} layers")
         return network
 
+    def make_full(self, driver, model):
+        """A finetune's stand-in for the LoRA: the model's own weights (``finetune.FullModel``)."""
+        from .finetune import FullModel
+
+        # saves are laid out like the profile's file (or, if it's gone, the checkpoint it carries on from)
+        source = self.job["profile"]["diffusion_model"]
+        network = FullModel(model, source if os.path.exists(source) else driver.profile["diffusion_model"])
+        n = network.num_parameters()
+        self.log(f"Full finetune: every weight trains, " + (f"{n / 1e9:.2f}B" if n >= 1e9 else f"{n / 1e6:.1f}M")
+                 + f" params ({self.s.get('optimizer')}, each weight updated as backward reaches it)")
+        if (self.job["profile"].get("training_adapter") or "").strip():
+            self.log("Note: the profile's training adapter isn't used in a finetune")
+        return network
+
     def make_evaluators(self, driver, model, network, items, val_keys, val_payload_files, bleed_prompts,
                         prefix: str = "bleed"):
         """The checkpoint picker's validator and the concept-bleed probe, as the settings ask."""
@@ -705,6 +748,8 @@ class Trainer:
         and the strength sweep if it's on. Results go to status["evaluation"], apart from any the job made
         while training; the job's own phase is put back at the end."""
         ev = self.job["evaluate"]
+        if self.finetune:
+            raise RuntimeError("A finetune's checkpoints are whole models, which a checkpoint evaluation doesn't load")
         self.s = s = {**self.s, **ev["settings"]}
         out = os.path.join(self.job_dir, "output")
         ckpts = sorted((c for c in self.status["checkpoints"] if os.path.exists(os.path.join(out, c["file"]))),
@@ -739,6 +784,77 @@ class Trainer:
         self.end_evaluation("completed")
         return "completed"
 
+    def run_refmod(self) -> str:
+        """Make a RefMod (``engine.refmod``) of the datasets' images and clips with only the video VAE loaded, or
+        (``refmod_kind`` audio) of their sound with only the audio VAE: output/<name>.safetensors, copied to
+        ``refmod_copy_to`` if set, and a preview in samples/ (each reference, up to ``PREVIEW_FRAMES`` latent
+        frames decoded one at a time; or the sound, decoded). status["refmod"] describes it."""
+        s = self.s
+        driver = self.driver = self.make_driver()
+        if not driver.info.refmods:
+            raise RuntimeError(f"{driver.info.label} doesn't make RefMods")
+        sound = s.get("refmod_kind") == "audio"
+        paths = (refmod.audio_sources if sound else refmod.sources)(self.job["datasets"])
+        if not paths:
+            raise RuntimeError("No sound files or clips with sound found in the selected datasets" if sound
+                               else "No images or clips found in the selected datasets")
+        self.phase("loading", "Loading the audio VAE" if sound else "Loading the video VAE")
+        driver.load_vae(audio=sound, video=not sound)
+        mode = "full" if sound or s["refmod_mode"] == "full" else "compressed"
+        self.phase("encoding", f"Making an audio RefMod of up to {s['refmod_seconds']:g} s of sound" if sound
+                   else f"Making a {mode} RefMod of {len(paths)} reference(s)")
+        make = refmod.make_audio if sound else refmod.make
+        latent, meta = make(driver, paths, s, log=self.log, check=self.check_control_during_prep)
+        fname = self.lora_file(0, final=True)
+        meta["name"] = fname[: -len(".safetensors")]
+        out = refmod.save(os.path.join(self.job_dir, "output", fname), latent, meta)
+        if sound:
+            self.log(f"Saved {fname}: {latent.shape[-1] / refmod.AUDIO_PER_SECOND:.1f} s of sound, "
+                     f"{refmod.tokens(latent)} tokens, {os.path.getsize(out) / 1e6:.1f} MB")
+        else:
+            t, h, w = latent.shape[2:]
+            self.log(f"Saved {fname}: {t} latent frame(s) of {h}×{w}, {refmod.tokens(latent)} tokens, "
+                     f"{os.path.getsize(out) / 1e6:.1f} MB")
+        copy_to = str(s.get("refmod_copy_to") or "").strip()
+        if copy_to:
+            import shutil
+
+            try:
+                os.makedirs(os.path.expanduser(copy_to), exist_ok=True)
+                shutil.copyfile(out, os.path.join(os.path.expanduser(copy_to), fname))
+                self.log(f"Copied to {copy_to}")
+            except OSError as e:
+                self.log(f"Warning: couldn't copy it to {copy_to}: {e}")
+        self.status["checkpoints"] = [{"step": 0, "file": fname, "final": True}]
+        made = {"file": fname, "kind": meta["kind"], "mode": mode, "references": len(paths),
+                "tokens": refmod.tokens(latent), "bytes": os.path.getsize(out), "copied_to": copy_to or None}
+        if sound:
+            self.phase("encoding", "Decoding the sound to listen to")
+            with torch.no_grad():
+                wav = driver.audio_vae.decode(latent[0].permute(1, 0, 2).to(self.device))[:, 0]  # (2, samples)
+            made.update(seconds=round(latent.shape[-1] / refmod.AUDIO_PER_SECOND, 2), concept=meta["concept_type"],
+                        audio=save_media({"audio": wav.float().cpu().numpy(), "sample_rate": refmod.AUDIO_RATE},
+                                         os.path.join(self.job_dir, "samples"), "refmod_audio"),
+                        frames=0, height=0, width=0, preview=[])
+            return self._refmod_done(made)
+        preview = []
+        idx = torch.linspace(0, t - 1, min(t, PREVIEW_FRAMES)).round().long().unique().tolist()
+        self.phase("encoding", f"Decoding a preview of {len(idx)} frame(s)")
+        for n, j in enumerate(idx):
+            self.check_control_during_prep()
+            img = driver.to_media({"video": latent[:, :, j:j + 1].to(self.device), "frames": 1})[0]
+            stem = f"refmod_{n:02d}"
+            img.save(os.path.join(self.job_dir, "samples", stem + ".png"))
+            preview.append({"file": stem + ".png", "frame": j})
+        made.update(frames=int(t), height=int(h), width=int(w), preview=preview)
+        return self._refmod_done(made)
+
+    def _refmod_done(self, made: dict) -> str:
+        self.status["refmod"] = made
+        self.status["phase"] = "completed"
+        self.log(f"Done in {(time.time() - self.status['started_at']) / 60:.1f} min")
+        return "completed"
+
     def end_evaluation(self, state: str, message: str = ""):
         """Record how a checkpoint evaluation ended, and give the job back the phase and message it had."""
         self.ev.update(state=state, message=message, finished_at=time.time())
@@ -757,7 +873,19 @@ class Trainer:
         items, item_keys, payload_files, val_keys, val_payload_files, bleed_prompts = self.prepare(
             driver, self.job.get("validation_datasets") or [])
 
-        model = self.load_model(driver)
+        state_path = os.path.join(self.job_dir, "state", "last.pt")
+        # a finetune's saved state is small beside its model (on the CPU until the optimizer takes it)
+        st = torch.load(state_path, weights_only=False, map_location="cpu" if self.finetune else None) \
+            if os.path.exists(state_path) else None
+        resume_from = None
+        if st is not None and self.finetune:
+            if not st.get("weights"):
+                raise RuntimeError("This job's saved state isn't a finetune's; restart it from step 0")
+            resume_from = os.path.join(self.job_dir, "output", st["weights"])
+            if not os.path.exists(resume_from):
+                raise RuntimeError(f"The checkpoint this finetune carries on from, {st['weights']}, is gone; "
+                                   "restart it from step 0")
+        model = self.load_model(driver, resume_from)
         if driver.swapper is not None and not s.get("gradient_checkpointing", True):
             self.log("Note: layer offloading saves little VRAM in training without gradient checkpointing, "
                      "since every block's weights stay saved for the backward pass")
@@ -766,7 +894,7 @@ class Trainer:
                 model.enable_gradient_checkpointing(True)
             else:
                 model.gradient_checkpointing = True
-        network = self.make_network(driver, model)
+        network = self.make_full(driver, model) if self.finetune else self.make_network(driver, model)
 
         params = list(network.parameters())
         for p in params:
@@ -779,10 +907,9 @@ class Trainer:
         sched = self.make_scheduler(opt)
 
         start = 0
-        state_path = os.path.join(self.job_dir, "state", "last.pt")
-        if os.path.exists(state_path):
-            st = torch.load(state_path, weights_only=False)
-            network.load_state_dict(st["lora"])
+        if st is not None:
+            if not self.finetune:  # a finetune's weights were loaded with the model
+                network.load_state_dict(st["lora"])
             opt.load_state_dict(st["opt"])
             sched.load_state_dict(st["sched"])
             # the learning rate and weight decay as the job has them now (an edit may have changed them), which the
@@ -799,6 +926,7 @@ class Trainer:
             self.log(f"Resumed from step {start}")
             if start < int(s["steps"]):
                 self.keep_final()  # a finished job given more steps
+            del st
 
         if not items:  # a slider job without datasets renders its training images first
             items, payload_files = self.render_slider_images(driver, model, network)
@@ -813,8 +941,9 @@ class Trainer:
 
         total = int(s["steps"])
         bs = int(s.get("batch_size", 1))
-        accum = max(1, int(s.get("grad_accum", 1)))
-        max_norm = float(s.get("max_grad_norm", 1.0))
+        # a finetune's weights update during backward: one batch per step, and no global clipping
+        accum = 1 if self.finetune else max(1, int(s.get("grad_accum", 1)))
+        max_norm = 0.0 if self.finetune else float(s.get("max_grad_norm", 1.0))
         save_every = int(s.get("save_every", 0))
         sample_every = int(s.get("sample_every", 0))
         metrics = open(os.path.join(self.job_dir, "metrics.jsonl"), "a")
@@ -908,8 +1037,9 @@ class Trainer:
                     self.make_samples(model, network, step)
         except StopRequested:
             if step > start:  # nothing new to save if no step ran in this session
+                if not any(c["step"] == step for c in self.status["checkpoints"]):  # (else just saved)
+                    self.save_lora(network, step)
                 self.save_state(network, opt, sched, step)
-                self.save_lora(network, step)
             self.status["phase"] = "stopped"
             self.log(f"Stopped at step {step}" + ("; state saved for resume" if step > start else ""))
             return "stopped"

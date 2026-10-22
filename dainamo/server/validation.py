@@ -58,9 +58,90 @@ def check_settings(s: dict, div: int, audio: bool = False) -> dict:
         raise HTTPException(400, f"Unknown optimizer {s.get('optimizer')!r}")
     check_network(s)
     s["sample_prompts"] = check_sample_prompts(s.get("sample_prompts", []), div, audio)
+    check_refmod(s)  # first: a RefMod turns the slider, checkpoint picker and concept bleed off
+    check_finetune(s)
     check_evaluation(s, div, audio)
     check_slider(s)
     return s
+
+
+def check_finetune(s: dict) -> None:
+    """A full finetune (``engine.finetune``): every weight trains, with an optimizer whose state fits beside the
+    model. Its weights update during backward, so there's one batch a step and no offloading; it's the whole
+    model at full strength, so there's no slider, concept bleed or strength sweep (the checkpoint picker's
+    validation loss still applies)."""
+    from ..engine.finetune import OPTIMIZERS
+
+    s["finetune_enabled"] = bool(s.get("finetune_enabled", False))
+    if not s["finetune_enabled"]:
+        return
+    if s.get("refmod_enabled"):
+        raise HTTPException(400, "A job makes a RefMod or trains; not both")
+    if s.get("slider_enabled"):
+        raise HTTPException(400, "A slider trains as a LoRA, not a finetune")
+    if s.get("optimizer") not in OPTIMIZERS:
+        raise HTTPException(400, "A finetune uses Adafactor or AdamW 8-bit, whose state fits beside the model "
+                                 "(AdamW and Prodigy keep 8 bytes or more a weight)")
+    if s.get("bleed_enabled"):
+        raise HTTPException(400, "Concept bleed compares the LoRA on and off, so it doesn't apply to a finetune")
+    s.update(grad_accum=1, offload=0, sweep_enabled=False)
+
+
+REFMOD_DEFAULTS = {"refmod_kind": "visual", "refmod_mode": "compressed", "refmod_size": 1024, "refmod_frames": 22,
+                   "refmod_grid": 16, "refmod_refine": 500, "refmod_merge": False, "refmod_max_tokens": 5120,
+                   "refmod_seconds": 10, "refmod_concept": "generic", "refmod_description": "", "refmod_copy_to": ""}
+MAX_REFMOD_SECONDS = 60
+
+
+def check_refmod(s: dict) -> None:
+    """A RefMod job (``engine.refmod``): pictures (``refmod_kind`` visual) or sound (audio), how they're encoded, and
+    an optional folder for a copy. It trains nothing, so the slider, checkpoint picker and concept bleed don't
+    apply."""
+    from ..engine.refmod import AUDIO_CONCEPTS, CONCEPTS
+
+    s["refmod_enabled"] = bool(s.get("refmod_enabled", False))
+    if not s["refmod_enabled"]:
+        return
+    for k, v in REFMOD_DEFAULTS.items():
+        s.setdefault(k, v)
+    if s["refmod_kind"] not in ("visual", "audio"):
+        raise HTTPException(400, "A RefMod is of pictures (visual) or of sound (audio)")
+    if s["refmod_mode"] not in ("full", "compressed"):
+        raise HTTPException(400, "A RefMod is full or compressed")
+    for key, label, lo, hi in (("refmod_size", "Size", 256, 2048), ("refmod_frames", "Frames per clip", 1, MAX_FRAMES),
+                               ("refmod_grid", "Grid", 2, 64), ("refmod_refine", "Refinement steps", 0, 5000),
+                               ("refmod_max_tokens", "Token cap", 0, 1_000_000)):
+        try:
+            v = int(s[key])
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"{label} must be a whole number")
+        if not lo <= v <= hi:
+            raise HTTPException(400, f"{label} must be {lo}–{hi}")
+        s[key] = v
+    if s["refmod_grid"] % 2:
+        raise HTTPException(400, "Grid must be even (the model takes 2×2 cells at a time)")
+    try:
+        s["refmod_seconds"] = float(s["refmod_seconds"])
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Length must be a number of seconds")
+    if not 1 <= s["refmod_seconds"] <= MAX_REFMOD_SECONDS:
+        raise HTTPException(400, f"Length must be 1–{MAX_REFMOD_SECONDS} seconds")
+    s["refmod_merge"] = bool(s["refmod_merge"])
+    if s["refmod_concept"] not in (AUDIO_CONCEPTS if s["refmod_kind"] == "audio" else CONCEPTS):
+        raise HTTPException(400, f"Unknown concept type {s['refmod_concept']!r}"
+                                 + (" for a sound" if s["refmod_kind"] == "audio" else ""))
+    s["refmod_description"] = str(s["refmod_description"] or "").strip()
+    if len(s["refmod_description"]) > 2000:
+        raise HTTPException(400, "The description is limited to 2000 characters")
+    copy_to = str(s["refmod_copy_to"] or "").strip()
+    if copy_to:
+        folder = os.path.expanduser(copy_to)
+        if not os.path.isabs(folder):
+            raise HTTPException(400, "Save a copy to: give the folder's full path")
+        if not os.path.isdir(folder) and not os.path.isdir(os.path.dirname(folder.rstrip("/\\"))):
+            raise HTTPException(400, f"Save a copy to: no folder {copy_to} (or the folder it would go in)")
+    s["refmod_copy_to"] = copy_to
+    s.update(slider_enabled=False, picker_enabled=False, bleed_enabled=False)
 
 
 def check_network(s: dict) -> None:

@@ -15,6 +15,12 @@ Clips with a soundtrack train audio jointly; silent clips and images carry noise
 no audio loss. fl2va trains with the clip's own first frame as a keyframe on a share of steps
 (and plain text otherwise); ref2va trains with reference images from ``<dataset>/_refs``.
 Conditioning images also enter the Qwen3-VL presentation (``<Picture i>:`` + vision block).
+
+It also makes RefMods (``engine.refmod``), references encoded once and saved; ref2va sampling takes them as
+references beside or instead of images (the text encoder doesn't see visual ones, as with the ComfyUI pack's Apply).
+ref2va sampling also takes audio references (sound files, and audio RefMods) as the released pipeline does: clean
+audio rows ahead of the generated audio, each cut to the generated length and labelled ``<Audio j>:`` in the
+prompt, beside at least one image or visual RefMod.
 """
 
 from __future__ import annotations
@@ -29,12 +35,13 @@ from PIL import Image, ImageOps
 
 from ... import comfy_io
 from ... import dataset as ds
+from ... import refmod
 from ...fp8_linear import assert_materialized, materialize
 from ...hf_assets import minimax_assets
 from ..base import FamilyDriver, FamilyInfo, MemoryProfile, ProfileField, Workflow
 from . import packing as P
 from .audio_vae import MiniMaxH3AudioVAE
-from .text_encoder import TEXT_ENCODER_LAYER, encode_minimax_h3_prompt, trim_caption_tokens
+from .text_encoder import TEXT_ENCODER_LAYER, AudioRef, encode_minimax_h3_prompt, trim_caption_tokens
 from .transformer import MiniMaxH3Transformer
 from .vae import MiniMaxH3VideoVAE, RotaryEmbedding3d, IMAGENET_MEAN, IMAGENET_STD
 
@@ -94,7 +101,10 @@ class MinimaxH3Driver(FamilyDriver):
             Workflow("r2v", images={"label": "Reference images", "min": 1, "max": 4,
                                     "help": "Reference images per clip go in a _refs folder inside the dataset, "
                                             "named after the clip: _refs/clip.png, _refs/clip_1.png, …"},
-                     variants=["ref2va"]),
+                     variants=["ref2va"], refmods=True,
+                     audio={"label": "Reference audio", "max": 3,
+                            "help": "A voice, music or a sound for the video to take after, beside at least one "
+                                    "reference image or visual RefMod. Each is cut to the video's length."}),
         ],
         timestep_modes=[
             ("shift", "Shift 12 (released schedule)"),
@@ -102,6 +112,7 @@ class MinimaxH3Driver(FamilyDriver):
             ("uniform", "Uniform"),
         ],
         frame_rule="17n + 5 (22, 39, 56, …)",
+        refmods=True,
     )
     bucket_divisibility = 32  # 16x VAE, 2x2 patch
     caption_tokens = MAX_TEXT_TOKENS
@@ -193,8 +204,18 @@ class MinimaxH3Driver(FamilyDriver):
             return [P.prepare_keyframe_image(_to_pil(paths[0]), spec["height"], spec["width"], stretch=True)]
         return [P.prepare_reference_image(_to_pil(p), spec["height"], spec["width"]) for p in paths]
 
+    def _audio_refs(self, spec: dict) -> int:
+        """How many audio references a ref2va render takes (the audio RefMods' members and the sound files)."""
+        if self.variant != "ref2va" or int(spec.get("frames") or 1) <= 1:
+            return 0
+        n = len(spec.get("audio") or [])
+        for r in spec.get("refmods") or []:
+            n += refmod.member_kinds(refmod.read_meta(r["path"]) or {}).count("audio")
+        return n
+
     def sample_condition(self, spec: dict):
-        return spec["prompt"], self._sample_images(spec) or None
+        # each audio reference's "<Audio j>: " label, after the pictures' (the order they pack in)
+        return spec["prompt"], (self._sample_images(spec) + [AudioRef()] * self._audio_refs(spec)) or None
 
     # --- vae --------------------------------------------------------------
     def cache_inputs(self, kind: str, settings: dict) -> dict:
@@ -204,7 +225,17 @@ class MinimaxH3Driver(FamilyDriver):
         return {"files": [self.profile["vae"], self.profile.get("audio_vae")], "variant": self.variant,
                 "train_audio": bool(settings.get("train_audio", True))}
 
-    def load_vae(self):
+    def load_vae(self, audio: bool = True, video: bool = True):
+        """The video VAE unless ``video`` is off, and the audio VAE unless ``audio`` is (a RefMod needs one)."""
+        if video:
+            self._load_video_vae()
+        if audio:
+            apath = self.profile["audio_vae"]
+            self.log(f"Loading audio VAE {apath}")
+            sd = comfy_io.dequantize_all(comfy_io.load_state_dict(apath), torch.float32)
+            self.audio_vae = MiniMaxH3AudioVAE.load_from_state_dict(sd).to(self.device)
+
+    def _load_video_vae(self):
         path = self.profile["vae"]
         self.log(f"Loading video VAE {path}")
         loaded = comfy_io.load_state_dict(path, device=self.device)
@@ -222,10 +253,6 @@ class MinimaxH3Driver(FamilyDriver):
         dec.rope = RotaryEmbedding3d(int(head_dim * 0.75), theta=100.0).to(self.device)
         assert_materialized(vae)
         self.video_vae = vae.eval().requires_grad_(False)
-        apath = self.profile["audio_vae"]
-        self.log(f"Loading audio VAE {apath}")
-        sd = comfy_io.dequantize_all(comfy_io.load_state_dict(apath), torch.float32)
-        self.audio_vae = MiniMaxH3AudioVAE.load_from_state_dict(sd).to(self.device)
 
     def unload_vae(self):
         self.video_vae = self.audio_vae = None
@@ -238,6 +265,11 @@ class MinimaxH3Driver(FamilyDriver):
         sample with seed 42, rounded through fp16 before normalisation)."""
         g = torch.Generator(device="cpu").manual_seed(P.KEYFRAME_ENCODE_SEED)
         return self.video_vae.encode(pixels.to(self.device), sample=True, generator=g, fp16_round=True).float()
+
+    def encode_reference(self, pixels: torch.Tensor) -> torch.Tensor:
+        """(1, 3, T, H, W) in [-1, 1] (an image, or a 17n+5-frame clip) -> (1, 24, t, h, w): a RefMod's reference,
+        encoded as conditioning images are."""
+        return self._encode_keyframe(pixels)
 
     @torch.no_grad()
     def encode_item(self, item, settings: dict) -> dict:
@@ -300,25 +332,30 @@ class MinimaxH3Driver(FamilyDriver):
 
     def _forward(self, model, video_rows, audio_rows, embeds, tags, latent_shape, a_lat, row_t_fn,
                  anchors=(), ref_blocks=()):
-        """Pack, run the DiT, and return (video velocity rows for the target, audio rows, layout info)."""
+        """Pack, run the DiT, and return the velocity rows of the target video and audio. ``audio_rows`` starts
+        with any reference audio rows (``(0, 0, 0, a)`` and soundtrack blocks), which ride clean (t = 1)."""
         t_lat, h_lat, w_lat = latent_shape
         layouts = [P.build_packed_sequence(text_token_tags=t.to(torch.long), num_latent_frames=t_lat,
                                            latent_height=h_lat, latent_width=w_lat, num_audio_latents=a_lat,
                                            keyframe_anchors=anchors, ref_blocks=ref_blocks) for t in tags]
         position_ids, token_tags, video_idx, audio_idx, text_idx, _ = P.pad_layouts_to_batch(layouts)
         num_cond = layouts[0].num_condition_video_rows
+        num_cond_audio = layouts[0].num_condition_audio_rows
         b = len(embeds)
         text_batch = torch.zeros(b, int(text_idx.shape[0]), embeds[0].shape[-1], device=self.device, dtype=self.dtype)
         for i, e in enumerate(embeds):
             text_batch[i, : e.shape[0]] = e.to(self.device, self.dtype)
-        row_t = row_t_fn(token_tags.shape[1], video_idx, audio_idx, num_cond).to(self.device)
+        row_t = row_t_fn(token_tags.shape[1], video_idx, audio_idx, num_cond)
+        if num_cond_audio:
+            row_t[:, audio_idx[:num_cond_audio].to(row_t.device)] = 1.0
+        row_t = row_t.to(self.device)
         d = self.device
         video_pred, audio_pred = model(
             hidden_states=video_rows.to(self.dtype), audio_hidden_states=audio_rows.to(self.dtype),
             encoder_hidden_states=text_batch, row_timesteps=row_t, token_tags=token_tags.to(d),
             position_ids=position_ids.to(d), video_indices=video_idx.to(d), audio_indices=audio_idx.to(d),
             text_indices=text_idx.to(d))
-        return video_pred[:, num_cond:], audio_pred
+        return video_pred[:, num_cond:], audio_pred[:, num_cond_audio:]
 
     def training_loss(self, model, payloads, conds, settings, rng=None, sigma=None, generator=None,
                       deterministic=False):
@@ -399,7 +436,11 @@ class MinimaxH3Driver(FamilyDriver):
 
     @torch.no_grad()
     def sample(self, model, cond, uncond, width, height, steps, cfg, seed, frames=1, images=None, sampler="euler",
-               scheduler="default", shift=None, callback=None):
+               scheduler="default", shift=None, callback=None, refmods=None, audio=None):
+        """``refmods`` (ref2va): [{"path", "strength"}], each RefMod's references put in after the images, at
+        their strength (``refmod.weaken``). ``audio`` (ref2va, a video): sound files, audio references after
+        those. Audio references (these and audio RefMods) are cut to the generated length, and need ``cond``
+        encoded with their labels (``sample_condition``)."""
         d = self.device
         g = torch.Generator(device="cpu").manual_seed(int(seed))
 
@@ -418,17 +459,47 @@ class MinimaxH3Driver(FamilyDriver):
 
         # conditioning rows (draw order as released: condition noise, video, audio)
         anchors, ref_blocks, cond_rows = (), (), None
+        parts, blocks, audio_parts = [], [], []
+        max_audio = refmod.audio_latents(frames / self.fps)
+
+        def add(lat):  # a reference's latent (1, 24, t, h, w), noise-augmented as released
+            cond_noise = randn(lat.shape)
+            parts.append(P.patchify_video_latents(P.KEYFRAME_NOISE_AUG_T * lat.to(d, torch.float32)
+                                                  + (1 - P.KEYFRAME_NOISE_AUG_T) * cond_noise))
+            blocks.append(tuple(int(x) for x in lat.shape[2:]))
+
+        def add_audio(lat):  # an audio reference's (1, 32, 2, T), cut to the generated length: clean rows
+            lat = lat[..., :max_audio]
+            audio_parts.append(refmod.audio_rows(lat).to(d, torch.float32))
+            blocks.append((0, 0, 0, int(lat.shape[-1])))
+
         if pil:
-            vae = self.video_vae
-            if vae is None:
+            if self.video_vae is None:
                 raise RuntimeError("video VAE must be loaded to encode conditioning images")
-            parts, blocks = [], []
             for img in pil:
-                cond_noise = randn((1, 24, 1, img.size[1] // 16, img.size[0] // 16))
-                lat = self._encode_keyframe(self._pil_to_px(img))
-                parts.append(P.patchify_video_latents(P.KEYFRAME_NOISE_AUG_T * lat
-                                                      + (1 - P.KEYFRAME_NOISE_AUG_T) * cond_noise))
-                blocks.append((1, img.size[1] // 16, img.size[0] // 16))
+                add(self._encode_keyframe(self._pil_to_px(img)))
+        if refmods:
+            if self.variant != "ref2va":
+                raise ValueError("RefMods need the ref2va model")
+            for r in refmods:
+                strength = float(r.get("strength", 1.0))
+                for ref in refmod.load(r["path"]):
+                    if ref["kind"] != "audio":
+                        add(refmod.weaken(ref["latent"], strength))
+                    elif frames > 1:  # an image takes no sound
+                        add_audio(refmod.weaken(ref["latent"][..., :max_audio], strength))
+        if audio and frames > 1:
+            if self.variant != "ref2va":
+                raise ValueError("Audio references need the ref2va model")
+            if self.audio_vae is None:
+                raise RuntimeError("audio VAE must be loaded to encode reference audio")
+            for path in audio:
+                info = ds.probe_audio(path)
+                wav = refmod.read_sound(path, min(frames / self.fps, info["duration"]), info)
+                add_audio(refmod.encode_audio(self.audio_vae, wav, d))
+        if audio_parts and not parts:
+            raise ValueError("An audio reference needs an image or a visual RefMod beside it")
+        if parts:
             cond_rows = torch.cat(parts, dim=1)
             if self.variant == "fl2va":
                 anchors, cond_rows = ("first",), parts[0]
@@ -437,6 +508,7 @@ class MinimaxH3Driver(FamilyDriver):
 
         video_rows = P.patchify_video_latents(randn((1, 24, t_lat, h_lat, w_lat)))
         audio_rows = P.pack_audio_latents(randn((1, P.AUDIO_CHANNELS, 32, a_lat)))
+        cond_audio = torch.cat(audio_parts, dim=0)[None] if audio_parts else None
         sigmas_v = P.build_sigma_schedule(int(steps), P.VIDEO_SIGMA_SHIFT).to(d)
         sigmas_a = P.remap_sigma(sigmas_v, P.VIDEO_SIGMA_SHIFT, P.AUDIO_SIGMA_SHIFT)
         for i in range(sigmas_v.shape[0] - 1):
@@ -451,7 +523,8 @@ class MinimaxH3Driver(FamilyDriver):
                 return row_t
 
             video_in = video_rows if cond_rows is None else torch.cat([cond_rows, video_rows], dim=1)
-            v_video, v_audio = self._forward(model, video_in, audio_rows, embeds, tags, (t_lat, h_lat, w_lat),
+            audio_in = audio_rows if cond_audio is None else torch.cat([cond_audio, audio_rows], dim=1)
+            v_video, v_audio = self._forward(model, video_in, audio_in, embeds, tags, (t_lat, h_lat, w_lat),
                                              a_lat, row_t_fn, anchors, ref_blocks)
             denoised_v = video_rows + sv * v_video.float()
             ratio_v = sv_next / sv

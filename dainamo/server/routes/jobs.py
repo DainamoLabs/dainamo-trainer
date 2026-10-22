@@ -52,7 +52,14 @@ def _job_summary(j: dict) -> dict:
     j["evaluating"] = "evaluate" in cfg
     j["datasets"] = [d.get("name") for d in cfg.get("datasets", [])]
     j["slider"] = bool(cfg.get("settings", {}).get("slider_enabled"))
-    j["network"] = cfg.get("settings", {}).get("network_type") or "lora"
+    j["refmod"] = bool(cfg.get("settings", {}).get("refmod_enabled"))
+    j["network"] = "full" if cfg.get("settings", {}).get("finetune_enabled") else \
+        cfg.get("settings", {}).get("network_type") or "lora"
+    made = st.get("refmod") or {}
+    if made.get("preview") and not j["last_sample"]:  # a RefMod's thumbnail: its first frame, decoded
+        j["last_sample"] = {"file": made["preview"][0]["file"], "kind": "image"}
+    elif made.get("audio") and not j["last_sample"]:  # an audio one's: its sound's spectrogram
+        j["last_sample"] = {"file": made["audio"]["poster"], "kind": "image"}
     try:
         j["media"] = get_family(j["family"]).info.media  # what its samples are: images, clips or songs
     except KeyError:
@@ -73,6 +80,10 @@ def _job_config(body: JobIn) -> dict:
     settings = check_settings({**Family.info.training_defaults, **body.settings}, Family.bucket_divisibility, audio)
     if settings["slider_enabled"] and not Family.info.sliders:
         raise HTTPException(400, f"{Family.info.label} can't train sliders yet")
+    if settings["refmod_enabled"] and not Family.info.refmods:
+        raise HTTPException(400, f"{Family.info.label} doesn't make RefMods (MiniMax H3 does)")
+    if settings["finetune_enabled"] and not Family.info.finetune:
+        raise HTTPException(400, f"{Family.info.label} can't be finetuned yet")
     if not body.datasets and not settings["slider_enabled"]:  # a slider renders its own images without one
         raise HTTPException(400, "Select at least one dataset")
     dsets = []
@@ -147,9 +158,14 @@ def _restart_reasons(old: dict, new: dict) -> list[str]:
     ``old`` doesn't have, from before they existed, aren't compared)."""
     o, n = old.get("settings", {}), new["settings"]
     reasons = ["the model"] if old.get("profile_name") != new["profile_name"] else []
+    if bool(o.get("refmod_enabled")) != bool(n.get("refmod_enabled")):
+        reasons.append("what it makes (a LoRA or a RefMod)")
+    if bool(o.get("finetune_enabled")) != bool(n.get("finetune_enabled")):
+        reasons.append("what it trains (a LoRA or the whole model)")
+    full = bool(n.get("finetune_enabled"))  # a finetune has no LoRA settings to keep
     for k, v in o.items():
         why = _restart_reason(k)
-        if why and v != n.get(k) and why not in reasons:
+        if why and v != n.get(k) and why not in reasons and not (full and why.startswith("the network")):
             reasons.append(why)
 
     def changed(keys):
@@ -200,7 +216,8 @@ def _clear_progress(jid: str):
 def edit_job(jid: str, body: JobEdit):
     """Change a job that isn't running. One that hasn't trained yet takes any change. One that has carries on
     from its last save with the changes (noted in its log), unless one is something it can't carry on with
-    (``_restart_reasons``): then it starts again from step 0, which ``restart`` has to confirm (else 409)."""
+    (``_restart_reasons``): then it starts again from step 0, which ``restart`` has to confirm (else 409). A RefMod
+    job that's been made is queued to be made again with the changes."""
     new = _job_config(body)
     with scheduler.paused():  # so the queue doesn't start the job meanwhile
         j = job_or_404(jid)
@@ -228,7 +245,10 @@ def edit_job(jid: str, body: JobEdit):
         config = {"id": jid, **new}
         db.execute("UPDATE jobs SET name=?, family=?, profile_name=?, gpu=?, config=? WHERE id=?",
                    (config["name"], config["family"], config["profile_name"], body.gpu, json.dumps(config), jid))
-        if restart:
+        # a RefMod is quick to make, so one that's been made (or failed) is made again with any change
+        remake = (bool(old["settings"].get("refmod_enabled")) and j["status"] != "queued"
+                  and {k: v for k, v in old.items() if k != "id"} != new)
+        if restart or remake:
             _clear_progress(jid)
             db.execute("UPDATE jobs SET status='queued', position=?, exit_code=NULL WHERE id=?", (db.now(), jid))
         elif changed:  # its log says where the run changed
@@ -253,6 +273,9 @@ def estimate(body: EstimateIn):
     F = get_family(profile["family"])
     data = dict(profile["data"])
     path = os.path.expanduser(str(data.get("diffusion_model") or "").strip())
+    model = os.path.expanduser(str(body.settings.get("model") or "").strip())  # a Sandbox's finetuned model
+    if body.kind == "sample" and model and os.path.isfile(model):
+        path = model
     if not os.path.isfile(path):
         return {"error": "The profile's diffusion model file wasn't found, so VRAM can't be projected."}
     try:
@@ -381,6 +404,8 @@ def job_action(jid: str, body: ActionIn):
     elif a == "resume":
         scheduler.requeue(jid)
     elif a == "extend":  # train a finished (or stopped) job on to a new total, from where it got to
+        if j["config"]["settings"].get("refmod_enabled"):
+            raise HTTPException(400, "A RefMod job trains nothing to continue")
         if j["status"] in ("queued", "running", "stopping"):
             raise HTTPException(400, "Wait for the job to finish, or stop it, first")
         if "evaluate" in j["config"]:
@@ -420,7 +445,8 @@ def job_action(jid: str, body: ActionIn):
 def sample_in_sandbox(jid: str, step: int, index: int):
     """Sandbox settings that re-create one of the job's training samples: its profile, prompt, seed, size and
     LoRA strength, the sampler training samples use (the profile's steps and CFG, Euler, the default
-    schedule), and the checkpoint saved at that step, or the nearest one. ``notes`` says what differs."""
+    schedule), and the checkpoint saved at that step, or the nearest one (a finetune's as the ``model``, in place
+    of the profile's diffusion model). ``notes`` says what differs."""
     import torch
 
     j = job_or_404(jid)
@@ -447,25 +473,30 @@ def sample_in_sandbox(jid: str, step: int, index: int):
     workflows = [w for w in F.info.workflows if not w.variants or variant in w.variants]
     images = list(sample.get("images") or [])
     wf = next((w for w in workflows if bool(w.images) == bool(images)), workflows[0])
-    loras = []
+    loras, finetuned = [], None
+    full = bool(cfg["settings"].get("finetune_enabled"))
     if step == 0:
-        notes.append("Step 0 is the base model before training, so there's no LoRA.")
+        notes.append("Step 0 is the base model before training" + ("." if full else ", so there's no LoRA."))
     else:
         out = os.path.join(job_dir(jid), "output")
         saved = [c for c in st.get("checkpoints") or [] if os.path.exists(os.path.join(out, c["file"]))]
         best = min(saved, key=lambda c: (abs(c["step"] - step), -c["step"]), default=None)
         if best is None:
-            notes.append("None of this job's checkpoints are left on disk, so there's no LoRA.")
+            notes.append("None of this job's checkpoints are left on disk, so " + (
+                "this uses the base model." if full else "there's no LoRA."))
         else:
             if best["step"] != step:
                 notes.append(f"No checkpoint was saved at step {step}; this uses step {best['step']}, the nearest.")
-            loras.append({"path": os.path.join(out, best["file"]), "strength": float(sample.get("lora_scale", 1.0))})
+            if full:
+                finetuned = os.path.join(out, best["file"])
+            else:
+                loras.append({"path": os.path.join(out, best["file"]), "strength": float(sample.get("lora_scale", 1.0))})
     d = F(snapshot, torch.device("cpu"))
     return {"profile_id": profile["id"], "workflow": wf.id, "prompt": sample["prompt"],
             "negative": str(snapshot.get("sample_negative") or ""), "width": sample["width"], "height": sample["height"],
             "frames": int(sample.get("frames") or 1), "steps": d.sample_steps(),
             "cfg": d.cfg_scale(F.profile_value(snapshot, "sample_cfg")), "seed": int(sample["seed"]),
-            "loras": loras, "images": images, "offload": cfg["settings"].get("offload"),
+            "loras": loras, "model": finetuned, "images": images, "offload": cfg["settings"].get("offload"),
             "low_vram": bool(cfg["settings"].get("low_vram")), "notes": notes,
             "job_name": j["name"], "step": step,
             **({"seconds": sample["seconds"], "lyrics": sample.get("lyrics") or ""} if "seconds" in sample else {})}
@@ -608,6 +639,10 @@ def evaluate_job(jid: str, body: EvaluateIn):
     """Queue a checkpoint evaluation of a finished job: the base model and each saved checkpoint scored
     with the checkpoint picker and/or the concept bleed detector (``Trainer.run_evaluation``)."""
     j = job_or_404(jid)
+    if j["config"]["settings"].get("refmod_enabled"):
+        raise HTTPException(400, "A RefMod has no checkpoints to evaluate")
+    if j["config"]["settings"].get("finetune_enabled"):
+        raise HTTPException(400, "A finetune's checkpoints are whole models; a checkpoint evaluation scores LoRAs")
     if j["status"] in ("queued", "running", "stopping"):
         raise HTTPException(400, "Wait for the job to finish, or stop it, first")
     st = read_status(jid)

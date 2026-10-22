@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { go } from "../App";
-import { api, fmtDuration, fmtTime, type DiskUse, type Job, type JobDetail, type JobDiskUse } from "../api";
+import { api, fmtDuration, fmtTime, type DiskUse, type Job, type JobDetail, type JobDiskUse, type RefModMade } from "../api";
 import { EvalPanel } from "../components/EvalPanel";
 import { EvaluateDialog } from "../components/EvalSettings";
 import { HardwareCards } from "../components/Hardware";
 import { LossChart } from "../components/LossChart";
 import { IconCamera, IconCopy, IconDown, IconDownload, IconEdit, IconImages, IconPlay, IconRefresh, IconSave, IconStop, IconTarget, IconTrash, IconUp } from "../components/icons";
-import { ConfirmDialog, Lightbox, Modal, StatusPill, fmtSize, usePoll, useToast } from "../components/ui";
+import { AudioCard, ConfirmDialog, Lightbox, Modal, StatusPill, fmtSize, usePoll, useToast } from "../components/ui";
 import { SamplesPanel } from "../components/Samples";
 import { Terminal } from "../components/Terminal";
 import { CLONE_KEY, formOf } from "./CreateJob";
@@ -14,15 +14,18 @@ import { CLONE_KEY, formOf } from "./CreateJob";
 const PHASES: Record<string, string> = {
   starting: "Starting", preparing: "Scanning datasets", caching_text: "Encoding captions", caching_latents: "Encoding training files",
   loading: "Loading model", rendering: "Rendering training images", training: "Training", sampling: "Sampling", evaluating: "Evaluating checkpoint", completed: "Completed", stopped: "Stopped", failed: "Failed",
+  encoding: "Making the RefMod",
 };
 
 function useJobAction() {
   const toast = useToast();
-  return async (job: { id: string; name: string; evaluating?: boolean }, action: string, after?: () => void) => {
-    if (action === "restart" && !confirm(`Restart "${job.name}" from step 0? Its checkpoints and samples will be deleted.`)) return;
+  // a RefMod job (``refmod``) is made again from the start: "restart" asks about the file it made
+  return async (job: { id: string; name: string; evaluating?: boolean; refmod?: boolean }, action: string, after?: () => void) => {
+    if (action === "restart" && !confirm(job.refmod ? `Make "${job.name}" again? The RefMod it made and its preview will be deleted.`
+      : `Restart "${job.name}" from step 0? Its checkpoints and samples will be deleted.`)) return;
     try {
       await api.post(`/api/jobs/${job.id}/action`, { action });
-      const msg: Record<string, string> = { stop: "evaluating" in job && job.evaluating ? "Stopping the checkpoint evaluation" : "Stopping — saving state…", sample: "Sampling requested", save: "Checkpoint requested", resume: "Re-queued (resumes from last save)", restart: "Restarted" };
+      const msg: Record<string, string> = { stop: job.evaluating ? "Stopping the checkpoint evaluation" : job.refmod ? "Stopping" : "Stopping — saving state…", sample: "Sampling requested", save: "Checkpoint requested", resume: job.refmod ? "Queued to be made again" : "Re-queued (resumes from last save)", restart: job.refmod ? "Queued to be made again" : "Restarted" };
       if (msg[action]) toast(msg[action]);
       after?.();
     } catch (e: any) {
@@ -48,6 +51,8 @@ function DiskCard({ job }: { job: JobDetail }) {
   const [confirm, setConfirm] = useState<"cache" | "state" | null>(null);
   if (!disk) return null;
   const finished = FINISHED.includes(job.status) && !job.config?.evaluate;
+  const refmod = !!job.config?.settings?.refmod_enabled;
+  const finetune = !!job.config?.settings?.finetune_enabled;
   const clean = async (part: "cache" | "state") => {
     try {
       const r = await api.post<{ freed: number; kept: string[] }>("/api/disk/clean", { parts: [part], jobs: [job.id] });
@@ -58,13 +63,13 @@ function DiskCard({ job }: { job: JobDetail }) {
     }
   };
   const rows: [string, number, React.ReactNode][] = [
-    ["LoRA checkpoints", disk.output, null],
-    ["Samples", disk.samples, null],
+    [refmod ? "RefMod" : finetune ? "Finetuned models" : "LoRA checkpoints", disk.output, null],
+    [refmod ? "Preview" : "Samples", disk.samples, null],
     // a job's own cache is from before caches were shared between jobs
     ...(disk.cache > 0 ? [["Cached captions and latents (its own, from before they were shared)", disk.cache,
       finished && <button className="btn sm" onClick={() => setConfirm("cache")}>Clear</button>] as [string, number, React.ReactNode]] : []),
-    ["Training state (to resume or continue)", disk.state,
-      job.status === "completed" && finished && disk.state > 0 && <button className="btn sm" onClick={() => setConfirm("state")}>Delete</button>],
+    ...(refmod && !disk.state ? [] : [["Training state (to resume or continue)", disk.state,
+      job.status === "completed" && finished && disk.state > 0 && <button className="btn sm" onClick={() => setConfirm("state")}>Delete</button>] as [string, number, React.ReactNode]]),
     ["Log, metrics and status", disk.other, null],
   ];
   return (
@@ -114,7 +119,9 @@ function JobRow({ j, reload, queuedIndex, queuedCount, size }: { j: Job; reload:
         <div className="job-meta">
           <span>{j.profile_name}</span>
           {j.slider && <span>slider</span>}
-          {j.network === "lokr" && <span>LoKr</span>}
+          {j.refmod && <span>RefMod</span>}
+          {j.network === "lokr" && !j.refmod && <span>LoKr</span>}
+          {j.network === "full" && <span>finetune</span>}
           {j.datasets.length > 0 && <span>{j.datasets.join(", ")}</span>}
           {j.assigned_gpu != null && active && <span>GPU {j.assigned_gpu}</span>}
           {j.gpu !== "auto" && !active && <span>pinned GPU {j.gpu}</span>}
@@ -151,14 +158,15 @@ function JobRow({ j, reload, queuedIndex, queuedCount, size }: { j: Job; reload:
         </>}
         {(j.status === "running" || j.status === "queued") && <button className="btn" onClick={() => act(j, "stop", reload)}><IconStop /> {j.status === "queued" ? "Cancel" : "Stop"}</button>}
         {j.status === "stopping" && <button className="btn danger" onClick={() => act(j, "stop", reload)}>Force stop</button>}
-        {["stopped", "failed", "interrupted"].includes(j.status) && <button className="btn primary" onClick={() => act(j, "resume", reload)}><IconPlay /> Resume</button>}
+        {["stopped", "failed", "interrupted"].includes(j.status) && <button className="btn primary" onClick={() => act(j, "resume", reload)}><IconPlay /> {j.refmod ? "Make again" : "Resume"}</button>}
         {!active && j.status !== "queued" && <button className="btn icon" title="Duplicate settings into a new job" onClick={() => cloneJob(j.id)}><IconCopy /></button>}
         {!active && <button className="btn icon danger" title="Delete" onClick={() => setConfirmDel(true)}><IconTrash /></button>}
       </div>
       {confirmDel && (
         <ConfirmDialog title="Delete job" danger confirmLabel="Delete job" onClose={() => setConfirmDel(false)} onConfirm={remove}
           message={<>Remove <strong style={{ color: "var(--text)" }}>{j.name}</strong> from the queue?</>}
-          checkbox="Also delete its LoRA checkpoints and samples from disk" />
+          checkbox={j.refmod ? "Also delete its RefMod and preview from disk" : j.network === "full" ? "Also delete its finetuned models and samples from disk"
+            : "Also delete its LoRA checkpoints and samples from disk"} />
       )}
     </div>
   );
@@ -204,13 +212,79 @@ function ContinueDialog({ job, onClose, onQueued }: { job: JobDetail; onClose: (
           <span className="help">{steps > done ? `${steps - done} more steps, ` : ""}from step {done} with the same settings, optimizer state and cached captions and images. Samples, saves and any checkpoint picker carry on at the same intervals.</span>
         </label>
         {final && (
-          <div className="muted small">The current final LoRA is kept as <span className="mono">{kept}</span>, and "keep last N" never deletes it. The new end saves as <span className="mono">{final.file}</span>.</div>
+          <div className="muted small">The current final {job.config?.settings?.finetune_enabled ? "model" : "LoRA"} is kept as <span className="mono">{kept}</span>, and "keep last N" never deletes it. The new end saves as <span className="mono">{final.file}</span>.</div>
         )}
         {schedule && (
           <div className="validation warning">The {schedule} learning-rate schedule stretches to the new length, so the learning rate picks up a little from where it ended before decaying again.</div>
         )}
       </div>
     </Modal>
+  );
+}
+
+const CONCEPT_LABELS: Record<string, string> = {
+  generic: "generic", identity: "identity", pose_motion: "pose & motion", clothing: "clothing", background: "background", style: "style",
+  voice: "voice", singing: "singing", music_style: "music style", sound_fx: "sound effect", ambience: "ambience",
+};
+
+/** What a RefMod job made: its file and shape, where it was copied, and a preview of some of its frames (or, for
+ * an audio one, its sound decoded). */
+function RefModCard({ job, made, onOpen }: { job: JobDetail; made?: RefModMade; onOpen: (src: string) => void }) {
+  const s = job.config?.settings || {};
+  // the preview's files keep their names when it's made again
+  const v = `?v=${(job.status_detail as any)?.started_at || ""}`;
+  const url = (f: string) => `/api/jobs/${job.id}/file/samples/${f}${v}`;
+  return (
+    <div className="card card-pad" style={{ marginBottom: 16 }}>
+      <h2>RefMod</h2>
+      {!made ? (
+        <div className="muted small">{job.status === "queued" ? "Not made yet." : job.status === "running" ? "Being made…" : "Not made."}</div>
+      ) : <>
+        <div className="kv">
+          <span className="mono ellipsis">{made.file}</span>
+          <span className="row" style={{ gap: 8 }}>
+            <span className="faint small">{fmtSize(made.bytes)}</span>
+            <a className="btn sm" href={`/api/jobs/${job.id}/file/output/${made.file}`} download><IconDownload /></a>
+          </span>
+        </div>
+        {made.kind === "audio" ? <>
+          <div className="kv"><span>Of</span><span>sound{s.refmod_concept && s.refmod_concept !== "generic" ? ` · ${CONCEPT_LABELS[s.refmod_concept] || s.refmod_concept}` : ""}</span></div>
+          <div className="kv"><span>Sources</span><span>{made.references}</span></div>
+          <div className="kv"><span>Length</span><span>{made.seconds} s</span></div>
+        </> : <>
+          <div className="kv"><span>Encoding</span><span>{made.mode}{s.refmod_merge && made.mode === "compressed" && made.references > 1 ? ", merged" : ""}{s.refmod_concept && s.refmod_concept !== "generic" ? ` · ${CONCEPT_LABELS[s.refmod_concept] || s.refmod_concept}` : ""}</span></div>
+          <div className="kv"><span>References</span><span>{made.references}</span></div>
+          <div className="kv"><span>Latent</span><span>{made.frames} frame{made.frames === 1 ? "" : "s"} of {made.width} × {made.height} cells ({made.width * 16} × {made.height * 16} px)</span></div>
+        </>}
+        <div className="kv"><span>Reference tokens</span><span>{made.tokens.toLocaleString()}</span></div>
+        {made.copied_to && <div className="kv"><span>Copied to</span><span className="mono ellipsis">{made.copied_to}</span></div>}
+        {made.audio && <>
+          <div className="section-title" style={{ marginTop: 16, marginBottom: 10 }}>Listen</div>
+          <AudioCard src={url(made.audio.file)} poster={url(made.audio.poster)} />
+          <div className="help" style={{ marginTop: 8 }}>Its latents decoded by the audio VAE: what the model is given to take after.</div>
+        </>}
+        {made.preview.length > 0 && <>
+          <div className="section-title" style={{ marginTop: 16, marginBottom: 10 }}>Preview</div>
+          <div className="samples-grid">
+            {made.preview.map((p) => (
+              <figure key={p.file}>
+                <img src={url(p.file)} alt={`Frame ${p.frame + 1}`} loading="lazy" onClick={() => onOpen(url(p.file))} />
+                <figcaption>frame {p.frame + 1} of {made.frames}</figcaption>
+              </figure>
+            ))}
+          </div>
+          <div className="help" style={{ marginTop: 8 }}>
+            {made.mode === "compressed" ? "Each frame decoded from its grid, so it shows the coarse picture the model gets, not the detail of the references. " : ""}
+            {made.frames > 1 ? "Frames are decoded one at a time, so those within a clip look rougher than its first." : ""}
+          </div>
+        </>}
+      </>}
+      <div className="help" style={{ marginTop: 10 }}>
+        Saved in <span className="mono">{job.dir}/output/</span>. Use it in the Sandbox's Reference to video with a ref2va profile
+        {made?.kind === "audio" ? " (beside a reference image or a visual RefMod)" : ""}, or in
+        ComfyUI: copy it into <span className="mono">models/refmods</span> and load it with the ComfyUI-MiniMaxH3Mod nodes.
+      </div>
+    </div>
   );
 }
 
@@ -253,6 +327,9 @@ function JobDetailView({ id }: { id: string }) {
   const running = job.status === "running";
   const evaluating = !!job.config?.evaluate; // queued or running for a checkpoint evaluation
   const slider = !!job.config?.settings?.slider_enabled;
+  const refmod = !!job.config?.settings?.refmod_enabled; // makes a RefMod: nothing is trained
+  const finetune = !!job.config?.settings?.finetune_enabled; // trains the whole model: each checkpoint is one
+  const made = st.refmod;
   const jobPath = `${job.dir}/output/`;
 
   return (
@@ -261,27 +338,31 @@ function JobDetailView({ id }: { id: string }) {
         <div style={{ minWidth: 0 }}>
           <div className="small"><a href="#/queue">Queue</a> <span className="faint">/</span></div>
           <div className="row"><h1 className="ellipsis">{job.name}</h1><StatusPill status={job.status} /></div>
-          <p>{[job.config?.profile_name, slider && `slider: ${job.config?.settings?.slider_target}`,
-            job.config?.settings?.network_type === "lokr" && "LoKr",
+          <p>{[job.config?.profile_name, slider && `slider: ${job.config?.settings?.slider_target}`, refmod && "RefMod",
+            !refmod && !finetune && job.config?.settings?.network_type === "lokr" && "LoKr", finetune && "finetune",
             job.config?.datasets?.map((d: any) => d.name).join(", ")].filter(Boolean).join(" · ")} {job.assigned_gpu != null && `· GPU ${job.assigned_gpu}`}</p>
         </div>
         <div className="row">
           {running && !evaluating && <>
-            <button className="btn" onClick={() => act(job, "sample")}><IconCamera /> Sample now</button>
-            <button className="btn" onClick={() => act(job, "save")}><IconSave /> Save now</button>
-            <button className="btn" onClick={() => act(job, "stop", reload)}><IconStop /> Stop</button>
+            {!refmod && <>
+              <button className="btn" onClick={() => act(job, "sample")}><IconCamera /> Sample now</button>
+              <button className="btn" onClick={() => act(job, "save")}><IconSave /> Save now</button>
+            </>}
+            <button className="btn" onClick={() => act({ ...job, refmod }, "stop", reload)}><IconStop /> Stop</button>
           </>}
           {evaluating && ["queued", "running"].includes(job.status) && (
             <button className="btn" onClick={() => act({ ...job, evaluating }, "stop", reload)}><IconStop /> {job.status === "queued" ? "Cancel evaluation" : "Stop evaluation"}</button>
           )}
-          {["stopped", "failed", "interrupted"].includes(job.status) && <button className="btn primary" onClick={() => act(job, "resume", reload)}><IconPlay /> Resume</button>}
-          {job.status === "completed" && !evaluating && job.resumable && (
+          {!refmod && ["stopped", "failed", "interrupted"].includes(job.status) && <button className="btn primary" onClick={() => act(job, "resume", reload)}><IconPlay /> Resume</button>}
+          {!refmod && job.status === "completed" && !evaluating && job.resumable && (
             <button className="btn" title="Train this job on for more steps, from where it finished" onClick={() => setExtend(true)}><IconPlay /> Continue training</button>
           )}
-          {!running && !evaluating && !["queued", "stopping"].includes(job.status) && (st.checkpoints || []).length > 0 && (
+          {!refmod && !finetune && !running && !evaluating && !["queued", "stopping"].includes(job.status) && (st.checkpoints || []).length > 0 && (
             <button className="btn" title="Score the saved checkpoints with the checkpoint picker and/or concept bleed, and recommend one" onClick={() => setEvaluate(true)}><IconTarget /> Evaluate checkpoints</button>
           )}
-          {!running && job.status !== "queued" && job.status !== "stopping" && <button className="btn" onClick={() => act(job, "restart", reload)}><IconRefresh /> Restart</button>}
+          {!running && job.status !== "queued" && job.status !== "stopping" && (refmod
+            ? <button className={`btn${job.status === "completed" ? "" : " primary"}`} onClick={() => act({ ...job, refmod }, "restart", reload)}><IconRefresh /> Make again</button>
+            : <button className="btn" onClick={() => act(job, "restart", reload)}><IconRefresh /> Restart</button>)}
           {!running && job.status !== "stopping" && !evaluating && (
             <button className="btn" title="Change this job's settings" onClick={() => go("edit", job.id)}><IconEdit /> Edit</button>
           )}
@@ -291,6 +372,24 @@ function JobDetailView({ id }: { id: string }) {
 
       {job.status === "failed" && st.message && <div className="error-box" style={{ marginBottom: 16 }}>{st.message}</div>}
 
+      {refmod ? <>
+        <div className="stats" style={{ marginBottom: 16 }}>
+          <div className="stat"><div className="k">Phase</div><div className="v" style={{ fontSize: 15 }}>{PHASES[st.phase || ""] || st.phase || "Queued"}</div></div>
+          {job.config?.settings?.refmod_kind === "audio"
+            ? <div className="stat"><div className="k">Of</div><div className="v" style={{ fontSize: 15 }}>Sound</div></div>
+            : <div className="stat"><div className="k">Encoding</div><div className="v" style={{ fontSize: 15 }}>{job.config?.settings?.refmod_mode === "full" ? "Full" : "Compressed"}</div></div>}
+          {job.config?.settings?.refmod_kind === "audio"
+            ? <div className="stat"><div className="k">Length</div><div className="v">{made?.seconds != null ? `${made.seconds} s` : "—"}</div></div>
+            : <div className="stat"><div className="k">References</div><div className="v">{made?.references ?? "—"}</div></div>}
+          <div className="stat"><div className="k">Tokens</div><div className="v">{made ? made.tokens.toLocaleString() : "—"}</div></div>
+          <div className="stat"><div className="k">File size</div><div className="v" style={{ fontSize: 15 }}>{made ? fmtSize(made.bytes) : "—"}</div></div>
+          <div className="stat"><div className="k">Peak VRAM</div><div className="v">{st.vram_gb ? `${st.vram_gb} GB` : "—"}</div></div>
+        </div>
+        {running && st.message && <div className="faint small" style={{ marginBottom: 16 }}>{st.message}</div>}
+        <RefModCard job={job} made={made} onOpen={setLight} />
+        <Terminal jobId={job.id} live={running || job.status === "stopping"}
+          alt={{ label: "Config", text: JSON.stringify(job.config, null, 2) }} />
+      </> : <>
       <div className="stats" style={{ marginBottom: 16 }}>
         <div className="stat"><div className="k">Phase</div><div className="v" style={{ fontSize: 15 }}>{PHASES[st.phase || ""] || st.phase || "Queued"}</div></div>
         <div className="stat"><div className="k">Step</div><div className="v">{st.step ?? 0}<span className="faint" style={{ fontSize: 13 }}> / {total}</span></div></div>
@@ -327,8 +426,16 @@ function JobDetailView({ id }: { id: string }) {
             </span>
           </div>
         ))}
-        <div className="help" style={{ marginTop: 10 }}>Saved in <span className="mono">{jobPath}</span> — ComfyUI-compatible; copy into <span className="mono">models/loras</span>.</div>
+        {finetune ? (
+          <div className="help" style={{ marginTop: 10 }}>Saved in <span className="mono">{jobPath}</span>. Each is a whole
+            diffusion model in bf16, laid out like <span className="mono">{String(job.config?.profile?.diffusion_model || "").split(/[\\/]/).pop()}</span>: copy
+            it into ComfyUI's <span className="mono">models/diffusion_models</span> and load it in place of the original, or try
+            it in the Sandbox (Finetuned model).</div>
+        ) : (
+          <div className="help" style={{ marginTop: 10 }}>Saved in <span className="mono">{jobPath}</span> — ComfyUI-compatible; copy into <span className="mono">models/loras</span>.</div>
+        )}
       </div>
+      </>}
 
       <DiskCard job={job} />
 

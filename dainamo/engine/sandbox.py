@@ -11,12 +11,13 @@ sampling time only. Commands arrive as JSON lines on stdin; events go out as JSO
        | output {id, item} | done {id, elapsed, loras} | error {id, message} | cancelled {id} | idle | exit
 
 Memory: the diffusion model and VAE stay on the GPU, apart from the share of the diffusion model's
-blocks that the request's ``offload`` keeps in system RAM (changing it reloads the model). The text
+blocks that the request's ``offload`` keeps in system RAM (changing it reloads the model, as does a request's
+``model``: a finetuned diffusion model in place of the profile's). The text
 encoder is loaded only to encode new prompts (encodings are cached), then parked in system RAM when
 there's room for it, else unloaded. When it doesn't fit next to the diffusion model, the diffusion
 model and VAE are parked in RAM while it runs. A request with ``low_vram`` streams the text encoder's
 layers from system RAM instead, so only the rest of it comes to the GPU, and keeps the VAE in system RAM
-while sampling (unless input images need it), moving the diffusion model there while a render decodes if
+while sampling (unless input images or reference audio need it), moving the diffusion model there while a render decodes if
 the GPU hasn't room for both. Closing stdin (the server going away) shuts the worker down.
 """
 
@@ -75,9 +76,20 @@ class Session:
         from .families import get_family
 
         self.unload_all()
-        self.driver = get_family(profile["family"])(profile["data"], self.device,
+        # its own copy: a generation may point it at a finetuned diffusion model (``use_model``)
+        self.driver = get_family(profile["family"])(dict(profile["data"]), self.device,
                                                     log=lambda m: emit("status", message=str(m).strip()))
         self.profile_key = key
+
+    def use_model(self, path: str):
+        """Generate with the diffusion model at ``path`` (the profile's, or a finetuned one in its place), reloading
+        only the diffusion model when it changes."""
+        if path == self.driver.profile["diffusion_model"]:
+            return
+        if self.model is not None:
+            emit("status", message="Switching diffusion model")
+            self.drop_model()
+        self.driver.profile["diffusion_model"] = path
 
     def drop_model(self):
         """Unload the diffusion model only (e.g. to reload it with another offload setting)."""
@@ -261,16 +273,20 @@ class Session:
         t0 = time.time()
         emit("started", id=rid)
         self.ensure_driver(msg["profile"])
+        self.use_model(p.get("model") or msg["profile"]["data"]["diffusion_model"])
         d = self.driver
         w, h = int(p["width"]), int(p["height"])
         frames = int(p.get("frames") or 1)
         if frames > 1 and d.snap_frames:
             frames = d.snap_frames(frames)
         images = list(p.get("images") or [])
+        audio = list(p.get("audio") or []) if frames > 1 else []
+        refs = {**({"refmods": p["refmods"]} if p.get("refmods") else {}), **({"audio": audio} if audio else {})}
 
         prompt, cond_images = d.sample_condition({"prompt": p["prompt"], "width": w, "height": h,
                                                   "images": images, "frames": frames,
-                                                  "lyrics": p.get("lyrics") or "", "seconds": p.get("seconds")})
+                                                  "lyrics": p.get("lyrics") or "", "seconds": p.get("seconds"),
+                                                  **refs})
         key = cond_key(prompt, cond_images)
         conds = {key: (prompt, cond_images)}
         cfg = float(p.get("cfg") or 1.0)
@@ -292,7 +308,7 @@ class Session:
             self.drop_model()
         d.offload = offload
         self.encode(conds)
-        self.ensure_models(vae=not low_vram or bool(images))
+        self.ensure_models(vae=not low_vram or bool(images or audio))
         fixed = p.get("loras") or []
         grid = p.get("grid")
         # a checkpoint grid: the base model (if asked), then each strength with each checkpoint, per seed;
@@ -353,12 +369,12 @@ class Session:
                 lat = d.sample(self.model, self.texts[key], self.texts.get(negative) if use_cfg else None,
                                w, h, steps, cfg, seed, frames=frames, images=images or None,
                                sampler=p.get("sampler") or "euler", scheduler=p.get("scheduler") or "default",
-                               shift=p.get("shift"), callback=callback)
+                               shift=p.get("shift"), callback=callback, **refs)
                 progress((n + 1) * per, "Decoding")
                 if is_cancelled():
                     raise Cancelled()
                 t = time.time()
-                media = self.decode(lat, low_vram, w, h, frames, keep_vae=bool(images))
+                media = self.decode(lat, low_vram, w, h, frames, keep_vae=bool(images or audio))
                 clock["decodes"].append(time.time() - t)
                 if variant == "grid":
                     saved = save_media(media, out_dir, f"{i}_c{c}_s{s}")

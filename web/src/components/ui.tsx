@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { api, q } from "../api";
+import { api, fmtClock, q } from "../api";
 import { IconCheck, IconFile, IconFolder, IconAlert, IconUp, IconX } from "./icons";
 
 // ---- modal ---------------------------------------------------------------
@@ -262,19 +262,52 @@ export function AudioCard({ src, poster, score, autoPlay, title }: {
   );
 }
 
-/** Full-screen view of an image, a video (``video``) or a song (``audio``: its poster and score). */
-export function Lightbox({ src, video, audio, onClose }: {
-  src: string; video?: boolean; audio?: { poster?: string; score?: string; title?: React.ReactNode }; onClose: () => void;
+// the aspect ratios worth naming, to say which one an image or video is (or is near)
+const ASPECTS = [[1, 1], [5, 4], [4, 3], [3, 2], [16, 9], [2, 1], [21, 9], [3, 1]].flatMap(([a, b]) => a === b ? [[a, b]] : [[a, b], [b, a]]);
+
+function aspect(w: number, h: number): string | null {
+  for (const [a, b] of ASPECTS) {
+    if (a * h === b * w) return `${a}:${b}`;
+    if (Math.abs((w / h) / (a / b) - 1) < 0.015) return `≈ ${a}:${b}`;
+  }
+  return null;
+}
+
+/** Full-screen view of an image, a video (``video``) or a song (``audio``: its poster and score). With ``info`` (a
+ * dataset file's), a panel at the bottom shows its name, its size in pixels and its length (as the browser reads
+ * them), ``details`` and its caption. */
+export function Lightbox({ src, video, audio, info, onClose }: {
+  src: string; video?: boolean; audio?: { poster?: string; score?: string; title?: React.ReactNode };
+  info?: { name: string; caption: string; details?: React.ReactNode[] }; onClose: () => void;
 }) {
+  const [shape, setShape] = useState<{ src: string; facts: string[] } | null>(null);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
+  const measure = (w: number, h: number, sec?: number) => {
+    if (!w || !h) return;
+    const r = aspect(w, h);
+    setShape({ src, facts: [`${w} × ${h} px`, ...(r ? [r] : []),
+      sec != null && isFinite(sec) ? fmtClock(sec) : `${((w * h) / 1e6).toFixed(2)} MP`] });
+  };
+  const media = audio ? <AudioCard src={src} autoPlay {...audio} />
+    : video ? <video src={src} controls autoPlay loop onClick={(e) => e.stopPropagation()}
+        onLoadedMetadata={(e) => measure(e.currentTarget.videoWidth, e.currentTarget.videoHeight, e.currentTarget.duration)} />
+    : <img src={src} alt="" onLoad={(e) => measure(e.currentTarget.naturalWidth, e.currentTarget.naturalHeight)} />;
+  if (!info) return <div className="lightbox" onClick={onClose}>{media}</div>;
+  const facts = [...(shape?.src === src ? shape.facts : []), ...(info.details || [])];
   return (
-    <div className="lightbox" onClick={onClose}>
-      {audio ? <AudioCard src={src} autoPlay {...audio} />
-        : video ? <video src={src} controls autoPlay loop onClick={(e) => e.stopPropagation()} /> : <img src={src} alt="" />}
+    <div className="lightbox with-info" onClick={onClose}>
+      <div className="lightbox-media">{media}</div>
+      <div className="lightbox-info" onClick={(e) => e.stopPropagation()}>
+        <div className="lightbox-facts">
+          <strong className="ellipsis" title={info.name}>{info.name}</strong>
+          {facts.map((f, i) => <span key={i}>{f}</span>)}
+        </div>
+        <div className="lightbox-caption">{info.caption || <span className="faint">No caption</span>}</div>
+      </div>
     </div>
   );
 }

@@ -102,7 +102,11 @@ def dataset_items(did: str):
     cut = split_clips(d["path"])
     for f in list_media(d["path"]):
         c = cut.get(os.path.normpath(f))
-        items.append({"path": f, "name": os.path.relpath(f, d["path"]), "kind": media_kind(f),
+        try:
+            size = os.path.getsize(f)
+        except OSError:
+            size = None
+        items.append({"path": f, "name": os.path.relpath(f, d["path"]), "kind": media_kind(f), "size": size,
                       "caption": read_caption(f), "has_caption": os.path.exists(caption_path(f)),
                       "cut_from": {"source": c["source"], "start": c.get("start", 0)} if c else None})
     return items

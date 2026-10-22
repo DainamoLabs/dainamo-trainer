@@ -351,3 +351,138 @@ def test_checkpoint_grids_are_checked_and_labelled(profiles, monkeypatch, tmp_pa
     _, p, _ = check(profile_id=profiles["krea"], workflow="t2i", grid=None)
     assert p["grid"] is None
     db.execute("DELETE FROM jobs WHERE id=?", (jid,))
+
+
+def _refmod_file(path, kind="image"):
+    import json
+
+    from safetensors.torch import save_file
+
+    if kind == "audio":
+        save_file({"latent": torch.zeros(1, 32, 2, 50)}, str(path),  # as the older H3AudioMod saved voices
+                  metadata={"audio_refmod_meta": json.dumps({"name": "voice", "kind": "audio"})})
+    else:
+        save_file({"latent": torch.zeros(1, 24, 1, 4, 4)}, str(path),
+                  metadata={"refmod_meta": json.dumps({"name": "fox", "kind": "image", "latent_t": 1})})
+    return str(path)
+
+
+def test_reference_to_video_takes_refmods(profiles, monkeypatch, tmp_path):
+    monkeypatch.setattr(sbx, "gpu_count", lambda: 2)
+    fox = _refmod_file(tmp_path / "fox.safetensors")
+    img = tmp_path / "ref.png"
+    img.write_bytes(b"x")
+    r2v = {"profile_id": profiles["ref2va"], "workflow": "r2v"}
+    # a RefMod stands in for the reference images, or goes with them
+    _, p, _ = check(**r2v, refmods=[{"path": fox, "strength": 0.6}])
+    assert p["refmods"] == [{"path": fox, "strength": 0.6}] and p["images"] == []
+    _, p, _ = check(**r2v, images=[str(img)], refmods=[{"path": fox}, {"path": "  "}])
+    assert p["refmods"] == [{"path": fox, "strength": 1.0}]
+    # at strength 0 it's left out, so the images are needed again
+    with pytest.raises(HTTPException, match="needs 1–4"):
+        check(**r2v, refmods=[{"path": fox, "strength": 0}])
+    lora = tmp_path / "lora.safetensors"
+    from safetensors.torch import save_file
+    save_file({"w": torch.zeros(1)}, str(lora))
+    for bad, words in (([{"path": str(lora)}], "isn't a RefMod"), ([{"path": "/nope.safetensors"}], "not found"),
+                       ([{"path": fox, "strength": 1.5}], "between 0 and 1"), ([{"path": fox}] * 5, "Up to 4")):
+        with pytest.raises(HTTPException, match=words):
+            check(**r2v, refmods=bad)
+    assert check(profile_id=profiles["ref2va"], workflow="t2v")[1]["refmods"] == []
+    with pytest.raises(HTTPException, match="takes no RefMods"):
+        check(profile_id=profiles["ref2va"], workflow="t2v", refmods=[{"path": fox}])
+
+
+def test_reference_to_video_takes_reference_audio(profiles, monkeypatch, tmp_path):
+    import subprocess
+
+    monkeypatch.setattr(sbx, "gpu_count", lambda: 2)
+    fox = _refmod_file(tmp_path / "fox.safetensors")
+    voice = _refmod_file(tmp_path / "voice.safetensors", "audio")
+    hum = tmp_path / "hum.wav"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=duration=0.5", str(hum)], check=True)
+    img = tmp_path / "ref.png"
+    img.write_bytes(b"x")
+    r2v = {"profile_id": profiles["ref2va"], "workflow": "r2v", "frames": 39}
+    # sound files, and audio RefMods, beside a picture reference (an image or a visual RefMod)
+    _, p, _ = check(**r2v, refmods=[{"path": fox}, {"path": voice}], audio=[str(hum), " "])
+    assert p["audio"] == [str(hum)] and len(p["refmods"]) == 2 and p["images"] == []
+    assert check(**r2v, images=[str(img)], audio=[str(hum)])[1]["audio"] == [str(hum)]
+    assert check(**r2v, images=[str(img)])[1]["audio"] == []
+    for kw, words in (({"refmods": [{"path": voice}], "audio": [str(hum)]}, "needs 1–4"),
+                      ({"images": [str(img)], "audio": [str(hum)], "frames": 1}, "need a video"),
+                      ({"images": [str(img)], "refmods": [{"path": voice}], "frames": 1}, "need a video"),
+                      ({"images": [str(img)], "refmods": [{"path": voice}], "audio": [str(hum)] * 3}, "Up to 3"),
+                      ({"images": [str(img)], "audio": ["/nope.wav"]}, "Audio not found"),
+                      ({"images": [str(img)], "audio": [str(img)]}, "has no sound")):
+        with pytest.raises(HTTPException, match=words):
+            check(**{**r2v, **kw})
+    with pytest.raises(HTTPException, match="takes no reference audio"):
+        check(profile_id=profiles["ref2va"], workflow="t2v", frames=39, audio=[str(hum)])
+
+
+def test_refmod_jobs_are_checked_listed_and_made_again(client, profiles, tmp_path, clean_jobs):
+    import json
+
+    from dainamo.server.routes import jobs as jobs_routes
+
+    did = client.post("/api/datasets", json={"name": "refmod refs", "path": str(tmp_path)}).json()["id"]
+    body = {"name": "fox ref", "profile_id": profiles["ref2va"], "datasets": [{"id": did}], "gpu": "auto",
+            "settings": {"refmod_enabled": True, "slider_enabled": True, "picker_enabled": True}}
+    assert "doesn't make RefMods" in client.post("/api/jobs", json={**body, "profile_id": profiles["krea"]}).json()["detail"]
+    for bad in ({"refmod_grid": 15}, {"refmod_mode": "pooled"}, {"refmod_size": 100}, {"refmod_concept": "voice"},
+                {"refmod_copy_to": "relative/folder"}, {"refmod_copy_to": "/nope/not/here"}, {"refmod_kind": "sound"},
+                {"refmod_kind": "audio", "refmod_concept": "identity"}, {"refmod_seconds": 0}, {"refmod_seconds": 61},
+                {"refmod_seconds": "long"}):
+        r = client.post("/api/jobs", json={**body, "settings": {**body["settings"], **bad}})
+        assert r.status_code == 400, bad
+    job = client.post("/api/jobs", json=body).json()
+    s = job["config"]["settings"]
+    assert s["refmod_mode"] == "compressed" and s["refmod_grid"] == 16 and s["refmod_max_tokens"] == 5120
+    assert s["refmod_kind"] == "visual" and s["refmod_seconds"] == 10
+    assert not (s["slider_enabled"] or s["picker_enabled"] or s["bleed_enabled"])  # nothing is trained
+    jid = job["id"]
+    assert next(j for j in client.get("/api/jobs").json() if j["id"] == jid)["refmod"] is True
+
+    # once made: its file is a RefMod for the Sandbox, not a LoRA, and it has nothing to continue or evaluate
+    d = qmod.job_dir(jid)
+    os.makedirs(os.path.join(d, "output"), exist_ok=True)
+    out = _refmod_file(os.path.join(d, "output", "fox_ref.safetensors"))
+    with open(os.path.join(d, "status.json"), "w") as fh:
+        json.dump({"phase": "completed", "checkpoints": [{"step": 0, "file": "fox_ref.safetensors", "final": True}],
+                   "refmod": {"file": "fox_ref.safetensors", "kind": "image", "mode": "compressed", "references": 1,
+                              "frames": 1, "tokens": 4, "preview": [{"file": "refmod_00.png", "frame": 0}]}}, fh)
+    db.execute("UPDATE jobs SET status='completed' WHERE id=?", (jid,))
+    listed = client.get("/api/sandbox/refmods", params={"family": "minimax_h3"}).json()
+    assert {"job_id": jid, "path": out, "tokens": 4, "mode": "compressed"}.items() <= listed[0].items()
+    assert all(o["job_id"] != jid for o in client.get("/api/sandbox/loras", params={"family": "minimax_h3"}).json())
+    assert next(j for j in client.get("/api/jobs").json() if j["id"] == jid)["last_sample"]["file"] == "refmod_00.png"
+    assert client.post(f"/api/jobs/{jid}/action", json={"action": "extend", "steps": 10}).status_code == 400
+    assert "no checkpoints" in client.post(f"/api/jobs/{jid}/evaluate", json={"settings": {}}).json()["detail"]
+
+    # an edit without changes keeps it; one with changes makes it again
+    edit = {**body, "settings": job["config"]["settings"]}
+    assert client.put(f"/api/jobs/{jid}", json=edit).json()["status"] == "completed"
+    r = client.put(f"/api/jobs/{jid}", json={**edit, "settings": {**edit["settings"], "refmod_grid": 8}}).json()
+    assert r["status"] == "queued" and not os.path.exists(out) and r["config"]["settings"]["refmod_grid"] == 8
+    assert jobs_routes._restart_reasons(r["config"], {**r["config"], "settings": {**r["config"]["settings"],
+                                                                                   "refmod_enabled": False}})
+    db.execute("DELETE FROM jobs WHERE id=?", (jid,))
+
+    # a sound RefMod: listed with its length, its spectrogram the thumbnail
+    job = client.post("/api/jobs", json={**body, "settings": {**body["settings"], "refmod_kind": "audio",
+                                                              "refmod_concept": "voice", "refmod_seconds": 12.5}}).json()
+    assert job["config"]["settings"]["refmod_seconds"] == 12.5
+    jid = job["id"]
+    d = qmod.job_dir(jid)
+    os.makedirs(os.path.join(d, "output"), exist_ok=True)
+    out = _refmod_file(os.path.join(d, "output", "her_voice.safetensors"), "audio")
+    with open(os.path.join(d, "status.json"), "w") as fh:
+        json.dump({"phase": "completed", "refmod": {"file": "her_voice.safetensors", "kind": "audio", "mode": "full",
+                                                    "references": 2, "frames": 0, "seconds": 1.25, "tokens": 100,
+                                                    "preview": [], "audio": {"file": "refmod_audio.mp3",
+                                                                             "poster": "refmod_audio_poster.png"}}}, fh)
+    listed = next(o for o in client.get("/api/sandbox/refmods", params={"family": "minimax_h3"}).json() if o["job_id"] == jid)
+    assert listed["kind"] == "audio" and listed["seconds"] == 1.25 and listed["path"] == out
+    assert next(j for j in client.get("/api/jobs").json() if j["id"] == jid)["last_sample"]["file"] == "refmod_audio_poster.png"
+    db.execute("DELETE FROM jobs WHERE id=?", (jid,))

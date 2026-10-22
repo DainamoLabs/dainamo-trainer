@@ -19,15 +19,23 @@ export type Family = {
   workflows: FamilyWorkflow[];
   frame_rule: string; // video families: the clip lengths the VAE takes
   sliders: boolean; // trains concept sliders
+  refmods: boolean; // makes RefMods: references encoded once and saved (MiniMax H3)
   streams_text_encoder: boolean; // "Low VRAM" streams its text encoder from system RAM (not YuE2)
   lora_strength: number; // the strength its LoRAs are meant to be used at (YuE2: 2)
+  // trains as a full finetune too: the settings one starts from (learning rate, optimizer, saves kept); null: it can't
+  finetune: Record<string, unknown> | null;
 };
 
 export type WorkflowImages = { label: string; min: number; max: number; help: string };
 export type MediaKind = "image" | "video" | "audio";
 export type Workflow = { id: string; label: string; output: MediaKind };
 // a workflow a family supports; variants limits it to profiles with that variant (null = any)
-export type FamilyWorkflow = Workflow & { images: WorkflowImages | null; variants: string[] | null };
+// refmods: it takes RefMods as references, as well as or instead of images
+// ``audio``: reference sound files it takes for a video (with audio RefMods, at most ``max`` in all)
+export type FamilyWorkflow = Workflow & {
+  images: WorkflowImages | null; variants: string[] | null; refmods: boolean;
+  audio: { label: string; max: number; help: string } | null;
+};
 
 export type Gpu = { index: number; name: string; mem_used: number; mem_total: number; util: number; temp: number };
 export type SystemRam = { total_gb: number; available_gb: number; used_gb: number };
@@ -58,7 +66,7 @@ export type CaptionOptions = { style: string; clip_frames: number; speech: strin
 export type WhisperModel = { id: string; size: string };
 
 export type MediaItem = {
-  path: string; name: string; kind: MediaKind; caption: string; has_caption: boolean;
+  path: string; name: string; kind: MediaKind; size: number | null; caption: string; has_caption: boolean;
   cut_from: { source: string; start: number } | null; // a clip from Split into clips: its video, and where
 };
 
@@ -88,6 +96,9 @@ export type SandboxParams = {
   seconds?: number; lyrics?: string; // music
   steps: number; cfg: number; sampler: string; scheduler: string; shift: number | null; seed: number; count: number;
   loras: { path: string; strength: number }[]; images: string[]; compare_base: boolean; offload?: number;
+  model?: string | null; // a finetuned diffusion model in place of the profile's
+  refmods?: { path: string; strength: number }[];
+  audio?: string[]; // reference sound files
   low_vram?: boolean; // the text encoder streamed from system RAM
   source_prompt?: string; // what was typed, when ``prompt`` is the enhanced version
   grid?: SandboxGrid | null;
@@ -126,10 +137,17 @@ export type SandboxDefaults = {
   steps: number; cfg: number; negative: string; width: number; height: number; frames: number; seconds?: number;
   supports_samplers: boolean; divisibility: number; offload: number; workflows: FamilyWorkflow[];
 };
+// a RefMod a job made (GET /api/sandbox/refmods)
+export type RefModOption = {
+  job_id: string; job_name: string; file: string; path: string; kind: string; mode: "full" | "compressed";
+  frames: number; seconds?: number | null; tokens: number; references: number;
+};
 export type LoraOption = {
   job_id: string; job_name: string; job_status: string; file: string; path: string; step: number | null;
   final: boolean; recommended: boolean;
 };
+// a finetune job's checkpoint: a whole diffusion model (GET /api/sandbox/models)
+export type ModelOption = Omit<LoraOption, "recommended">;
 
 export type Probe = { prompt: string; file: string; bleed: number; drift?: number };
 export type Eval = { step: number; file: string | null; val_loss?: number; bleed?: number; drift?: number; probes?: Probe[] };
@@ -169,7 +187,18 @@ export type Job = {
   datasets: string[];
   evaluating: boolean; // queued or running for a checkpoint evaluation, not training
   slider: boolean; // a concept slider; without datasets it trains on images it renders
-  network: "lora" | "lokr"; // the adapter it trains
+  network: "lora" | "lokr" | "full"; // the adapter it trains, or "full": a finetune of the whole model
+  refmod: boolean; // makes a RefMod of its datasets instead of training
+};
+
+// the RefMod a job made: its file, shape (latent frames of height × width cells), the reference tokens it puts into
+// the model, and a preview of some of its frames (each decoded on its own)
+// an audio RefMod (``kind`` audio) has ``seconds`` of sound and ``audio``, its sound decoded, and no frames
+export type RefModMade = {
+  file: string; kind: "image" | "video" | "audio"; mode: "full" | "compressed"; references: number; frames: number;
+  height: number; width: number; tokens: number; bytes: number; copied_to: string | null;
+  preview: { file: string; frame: number }[];
+  seconds?: number; concept?: string; audio?: { file: string; poster: string };
 };
 
 export type JobDetail = Job & {
@@ -180,6 +209,7 @@ export type JobDetail = Job & {
     samples?: Sample[]; checkpoints?: Checkpoint[];
     evals?: Eval[]; recommended?: Recommendation | null; sweep?: Sweep | null;
     evaluation?: Evaluation | null;
+    refmod?: RefModMade;
   };
 };
 
@@ -297,5 +327,5 @@ export type VramPhase = {
 export type VramProjection = {
   blocks: number; block_gb: number[]; resident_gb: number; inflight_gb: number; context_gb: number;
   fragmentation: number; model_gb: number; process_ram_gb: number; phases: VramPhase[]; notes: string[]; error?: string;
-  adapter_params: number; // the trained LoRA's or LoKr's (training only), saved at 2 bytes each
+  adapter_params: number; // the trained LoRA's or LoKr's (a finetune's: the model's; training only), saved at 2 bytes each
 };
