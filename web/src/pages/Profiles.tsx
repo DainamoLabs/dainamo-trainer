@@ -4,6 +4,7 @@ import { go } from "../App";
 import { IconCopy, IconDownload, IconEdit, IconLayers, IconPlus, IconTrash } from "../components/icons";
 import { DownloadDialog } from "../components/ModelDownload";
 import { Modal, PathInput, usePoll, useToast } from "../components/ui";
+import MergeExtract from "./MergeExtract";
 import ModelFiles from "./ModelFiles";
 
 type Validation = { field: string; level: string; message: string };
@@ -153,6 +154,7 @@ function ProfileEditor(props: { families: Family[]; initial: Partial<Profile> | 
 }
 
 export default function Profiles({ families, view }: { families: Family[]; view: string }) {
+  view = ["files", "merge"].includes(view) ? view : "";
   const toast = useToast();
   const [profiles, reload] = usePoll<Profile[]>("/api/profiles", 0);
   const [editing, setEditing] = useState<Partial<Profile> | null | undefined>(undefined);
@@ -175,7 +177,7 @@ export default function Profiles({ families, view }: { families: Family[]; view:
       </div>
 
       <div className="view-tabs" role="tablist" aria-label="Profiles">
-        {([["", "Profiles"], ["files", "Model files"]] as const).map(([v, label]) => (
+        {([["", "Profiles"], ["files", "Model files"], ["merge", "Merge & extract"]] as const).map(([v, label]) => (
           <button key={v} role="tab" aria-selected={view === v} className={view === v ? "on" : ""} onClick={() => go("profiles", v)}>
             {label}
             {v === "" && profiles && profiles.length > 0 && <span className="count">{profiles.length}</span>}
@@ -184,8 +186,9 @@ export default function Profiles({ families, view }: { families: Family[]; view:
       </div>
 
       {view === "files" && <ModelFiles families={families} onCreate={setEditing} />}
+      {view === "merge" && <MergeExtract families={families} />}
 
-      {view !== "files" && profiles && profiles.length === 0 && (
+      {view === "" && profiles && profiles.length === 0 && (
         <div className="empty">
           <strong>No profiles yet</strong>
           Create one to point Dainamo at your model files, e.g. the ones in your ComfyUI models folder. Model files shows which
@@ -197,7 +200,7 @@ export default function Profiles({ families, view }: { families: Family[]; view:
         </div>
       )}
 
-      {view !== "files" && byFamily(profiles || [], families).map((g) => (
+      {view === "" && byFamily(profiles || [], families).map((g) => (
         <section className="pf-group" key={g.id}>
           <div className="pf-group-head">
             <h2>{g.label}</h2>

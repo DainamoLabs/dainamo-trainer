@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -31,8 +32,25 @@ CACHE_DIR = os.path.join(db.DATA_DIR, "cache")  # encoded items and captions, sh
 EXIT_CODES = {"completed": 0, "stopped": 3}
 
 
+_folders: dict[str, str] = {}  # job id -> its folder's name, which never changes
+
+
+def job_folder(name: str, job_id: str) -> str:
+    """A new job's folder name: its name, made safe for any file system, then its id (names can repeat)."""
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", name).strip("_")[:48].strip("_")
+    return f"{slug}_{job_id}" if slug else job_id
+
+
 def job_dir(job_id: str) -> str:
-    return os.path.join(JOBS_DIR, job_id)
+    """A job's folder: "<name>_<id>", named when the job was added (renaming the job doesn't move its files), or
+    "<id>" for jobs from before folders were named."""
+    folder = _folders.get(job_id)
+    if folder is None:
+        row = db.query_one("SELECT folder FROM jobs WHERE id=?", (job_id,))
+        if row is None:  # not a job (any more)
+            return os.path.join(JOBS_DIR, job_id)
+        folder = _folders[job_id] = row["folder"] or job_id
+    return os.path.join(JOBS_DIR, folder)
 
 
 def read_status(job_id: str) -> dict:

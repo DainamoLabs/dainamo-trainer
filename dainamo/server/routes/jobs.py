@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from ...engine.dataset import resolutions
 from ...engine.families import get_family
 from .. import db
-from ..queue import CACHE_DIR, job_dir, read_status, scheduler, send_control
+from ..queue import CACHE_DIR, job_dir, job_folder, read_status, scheduler, send_control
 from ..validation import check_evaluation, check_resolution, check_settings
 from .common import dataset_or_404, job_or_404, not_found, profile_or_404
 
@@ -99,6 +99,7 @@ def _job_summary(j: dict) -> dict:
     j["slider"] = bool(cfg.get("settings", {}).get("slider_enabled"))
     j["refmod"] = bool(cfg.get("settings", {}).get("refmod_enabled"))
     j["extract"] = bool(cfg.get("settings", {}).get("extract_enabled"))  # a LoRA extracted from a finetune
+    j["merge"] = bool(cfg.get("settings", {}).get("merge_enabled"))  # LoRAs merged into one
     j["network"] = "full" if cfg.get("settings", {}).get("finetune_enabled") else \
         cfg.get("settings", {}).get("network_type") or "lora"
     made = st.get("refmod") or {}
@@ -171,9 +172,10 @@ def _job_config(body: JobIn) -> dict:
 def create_job(body: JobIn):
     jid = db.new_id()
     config = {"id": jid, **_job_config(body)}
-    db.execute("INSERT INTO jobs (id, name, status, family, profile_name, gpu, position, created, config) "
-               "VALUES (?,?,?,?,?,?,?,?,?)", (jid, config["name"], "queued", config["family"], config["profile_name"],
-                                              body.gpu, db.now(), db.now(), json.dumps(config)))
+    db.execute("INSERT INTO jobs (id, name, status, family, profile_name, gpu, position, created, config, folder) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?)", (jid, config["name"], "queued", config["family"], config["profile_name"],
+                                                body.gpu, db.now(), db.now(), json.dumps(config),
+                                                job_folder(config["name"], jid)))
     return job_or_404(jid)
 
 
@@ -268,8 +270,11 @@ def edit_job(jid: str, body: JobEdit):
     from its last save with the changes (noted in its log), unless one is something it can't carry on with
     (``_restart_reasons``): then it starts again from step 0, which ``restart`` has to confirm (else 409). A RefMod
     job that's been made is queued to be made again with the changes."""
-    if job_or_404(jid)["config"]["settings"].get("extract_enabled"):
-        raise HTTPException(400, "An extracted LoRA isn't edited: extract it again from its finetune's checkpoints")
+    settings = job_or_404(jid)["config"]["settings"]
+    if settings.get("extract_enabled"):
+        raise HTTPException(400, "An extracted LoRA isn't edited: extract it again")
+    if settings.get("merge_enabled"):
+        raise HTTPException(400, "A merged LoRA isn't edited: merge again (Profiles, Merge & extract)")
     new = _job_config(body)
     with scheduler.paused():  # so the queue doesn't start the job meanwhile
         j = job_or_404(jid)
@@ -456,7 +461,7 @@ def job_action(jid: str, body: ActionIn):
     elif a == "resume":
         scheduler.requeue(jid)
     elif a == "extend":  # train a finished (or stopped) job on to a new total, from where it got to
-        if j["config"]["settings"].get("refmod_enabled") or j["config"]["settings"].get("extract_enabled"):
+        if any(j["config"]["settings"].get(k) for k in ("refmod_enabled", "extract_enabled", "merge_enabled")):
             raise HTTPException(400, "This job trains nothing to continue")
         if j["status"] in ("queued", "running", "stopping"):
             raise HTTPException(400, "Wait for the job to finish, or stop it, first")
@@ -695,8 +700,9 @@ def evaluate_job(jid: str, body: EvaluateIn):
         raise HTTPException(400, "A RefMod has no checkpoints to evaluate")
     if j["config"]["settings"].get("finetune_enabled"):
         raise HTTPException(400, "A finetune's checkpoints are whole models; a checkpoint evaluation scores LoRAs")
-    if j["config"]["settings"].get("extract_enabled"):
-        raise HTTPException(400, "An extracted LoRA has one file and no datasets to score it on")
+    if j["config"]["settings"].get("extract_enabled") or j["config"]["settings"].get("merge_enabled"):
+        raise HTTPException(400, f"An {'extracted' if j['config']['settings'].get('extract_enabled') else 'merged'} "
+                                 "LoRA has one file and no datasets to score it on")
     if j["status"] in ("queued", "running", "stopping"):
         raise HTTPException(400, "Wait for the job to finish, or stop it, first")
     st = read_status(jid)
@@ -774,20 +780,25 @@ def extract_lora(jid: str, body: ExtractIn):
                                  "isn't there any more, and the LoRA is the change from it")
     if not 1 <= body.rank <= MAX_RANK:
         raise HTTPException(400, f"The rank must be 1–{MAX_RANK}")
-    if body.gpu not in ("auto", "") and not body.gpu.isdigit():
-        raise HTTPException(400, f"Invalid GPU {body.gpu!r}")
     name = body.name.strip() or f"{os.path.splitext(body.file)[0]}_r{body.rank}"
     trigger = ", ".join(d["trigger"] for d in cfg.get("datasets") or [] if d.get("trigger"))
     settings = {"steps": 0, "extract_enabled": True, "extract_rank": int(body.rank), "extract_source": path,
                 "extract_base": base, "extract_from": {"job_id": jid, "job_name": j["name"], "file": body.file,
+                                                       "folder": os.path.basename(job_dir(jid)),
                                                        "step": int(c.get("step") or 0), "trigger": trigger}}
+    return queue_made(name, cfg["family"], cfg["profile_name"], cfg["profile"], settings, body.gpu)
+
+
+def queue_made(name: str, family: str, profile_name: str, profile: dict, settings: dict, gpu: str) -> dict:
+    """Queue a job that trains nothing but makes a file (an extracted or merged LoRA), with no datasets."""
+    if gpu not in ("auto", "") and not gpu.isdigit():
+        raise HTTPException(400, f"Invalid GPU {gpu!r}")
     new = db.new_id()
-    config = {"id": new, "name": name, "output_name": name, "family": cfg["family"],
-              "profile_name": cfg["profile_name"], "profile": cfg["profile"], "datasets": [],
-              "validation_datasets": [], "settings": settings}
-    db.execute("INSERT INTO jobs (id, name, status, family, profile_name, gpu, position, created, config) "
-               "VALUES (?,?,?,?,?,?,?,?,?)", (new, name, "queued", cfg["family"], cfg["profile_name"], body.gpu or "auto",
-                                              db.now(), db.now(), json.dumps(config)))
+    config = {"id": new, "name": name, "output_name": name, "family": family, "profile_name": profile_name,
+              "profile": profile, "datasets": [], "validation_datasets": [], "settings": settings}
+    db.execute("INSERT INTO jobs (id, name, status, family, profile_name, gpu, position, created, config, folder) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?)", (new, name, "queued", family, profile_name, gpu or "auto", db.now(),
+                                                db.now(), json.dumps(config), job_folder(name, new)))
     return job_or_404(new)
 
 

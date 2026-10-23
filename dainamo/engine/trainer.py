@@ -18,7 +18,8 @@ A job.json with ``evaluate`` set is a checkpoint evaluation of a finished job in
 ``slider_enabled`` train a concept slider (``engine.slider``) instead of learning the datasets, and with
 ``refmod_enabled`` the job makes a RefMod of them instead (``run_refmod``): nothing is trained. With
 ``finetune_enabled`` every weight of the diffusion model trains (``engine.finetune``) in place of a LoRA, and with
-``extract_enabled`` the job extracts a LoRA from a finetune's checkpoint (``run_extract``), training nothing.
+``extract_enabled`` the job extracts a LoRA from a finetune's checkpoint (``run_extract``), and with ``merge_enabled``
+it merges LoRAs into one (``run_merge``), training nothing.
 
 Everything model-specific goes through the family driver: which conditions an item trains with
 (caption, or caption plus conditioning images), how an item is VAE-encoded, the loss, sampling and
@@ -33,6 +34,7 @@ import json
 import math
 import os
 import random
+import shutil
 import time
 
 import torch
@@ -282,7 +284,10 @@ class Trainer:
         wd = float(self.s.get("weight_decay", 0.0))
         if self.finetune:  # each weight steps as backward reaches it
             from .finetune import FusedOptimizer
-            return FusedOptimizer(params, name, lr, wd)
+            opt = FusedOptimizer(params, name, lr, wd, device=self.device)
+            if self.driver.swapper is not None:  # a streamed block is on the GPU to step, and goes back to RAM after
+                opt.before_step = self.driver.swapper.prepare_step
+            return opt
         if name == "adamw8bit":
             import bitsandbytes as bnb
             return bnb.optim.AdamW8bit(params, lr=lr, weight_decay=wd, betas=(0.9, 0.999))
@@ -659,12 +664,11 @@ class Trainer:
     def load_model(self, driver, path: str | None = None):
         """The diffusion model, from the profile's file or (a finetune carrying on) the checkpoint at ``path``."""
         self.phase("loading", "Loading diffusion model")
-        if self.finetune:  # trained whole, in bf16 on the GPU
+        driver.offload = float(self.s.get("offload", driver.info.training_defaults.get("offload", 0)) or 0) / 100
+        if self.finetune:  # trained whole, in bf16 (its streamed blocks trained as they stream)
             if path:
                 driver.profile["diffusion_model"] = path
-            driver.offload = 0.0
             return driver.load_transformer(trainable=True)
-        driver.offload = float(self.s.get("offload", driver.info.training_defaults.get("offload", 0)) or 0) / 100
         return driver.load_transformer()
 
     def render_slider_images(self, driver, model, network) -> tuple[list[ds.Item], list[str]]:
@@ -715,17 +719,28 @@ class Trainer:
         return network
 
     def make_full(self, driver, model):
-        """A finetune's stand-in for the LoRA: the model's own weights (``finetune.FullModel``)."""
-        from .finetune import FullModel
+        """A finetune's stand-in for the LoRA: the model's own weights (``finetune.FullModel``), with the profile's
+        training adapter beside them."""
+        from .finetune import FullModel, TrainingAdapter
 
         # saves are laid out like the profile's file (or, if it's gone, the checkpoint it carries on from)
         source = self.job["profile"]["diffusion_model"]
-        network = FullModel(model, source if os.path.exists(source) else driver.profile["diffusion_model"])
+        adapter = None
+        path = (self.job["profile"].get("training_adapter") or "").strip()
+        if path:
+            self.log(f"Attaching training adapter {path}")
+            adapter = TrainingAdapter(model, resolve_path(path), self.device)
+            self.log(f"  adapter applied to {len(adapter.handles)} layers")
+        network = FullModel(model, source if os.path.exists(source) else driver.profile["diffusion_model"],
+                            swapper=driver.swapper, adapter=adapter)
         n = network.num_parameters()
         self.log(f"Full finetune: every weight trains, " + (f"{n / 1e9:.2f}B" if n >= 1e9 else f"{n / 1e6:.1f}M")
                  + f" params ({self.s.get('optimizer')}, each weight updated as backward reaches it)")
-        if (self.job["profile"].get("training_adapter") or "").strip():
-            self.log("Note: the profile's training adapter isn't used in a finetune")
+        # a save is written beside the last one before "keep last N" deletes that
+        size, free = n * 2, shutil.disk_usage(os.path.join(self.job_dir, "output")).free
+        if free < 2 * size:
+            self.log(f"Warning: {free / 1e9:.0f} GB free on the disk the saves go to, and each is about "
+                     f"{size / 1e9:.0f} GB: a save may fail, and with it stopping the job")
         return network
 
     def make_evaluators(self, driver, model, network, items, val_keys, val_payload_files, bleed_prompts,
@@ -861,13 +876,14 @@ class Trainer:
         (a final one is renamed when that job trains on), else the file as it was named then."""
         src = self.s.get("extract_from") or {}
         if src.get("job_id"):
-            jobs = os.path.dirname(os.path.abspath(self.job_dir))
+            # its folder: named after it, or (from before folders were named) its id
+            folder = os.path.join(os.path.dirname(os.path.abspath(self.job_dir)), src.get("folder") or src["job_id"])
             try:
-                with open(os.path.join(jobs, src["job_id"], "status.json")) as f:
+                with open(os.path.join(folder, "status.json")) as f:
                     ckpts = json.load(f).get("checkpoints") or []
                 c = next((c for c in ckpts if c.get("step") == src.get("step")), None)
                 if c:
-                    return os.path.join(jobs, src["job_id"], "output", c["file"])
+                    return os.path.join(folder, "output", c["file"])
             except (OSError, json.JSONDecodeError):
                 pass
         return self.s["extract_source"]
@@ -922,6 +938,55 @@ class Trainer:
         self.log(f"Done in {(time.time() - self.status['started_at']) / 60:.1f} min")
         return "completed"
 
+    def run_merge(self) -> str:
+        """Merge LoRAs into one (``engine.merge``): ``merge_loras`` [{path, strength}], kept exact (``merge_rank``
+        0) or cut to that rank, as output/<name>.safetensors. Nothing is trained and no model is loaded: the
+        LoRAs' layers are checked against the profile's model built without its weights, and merged a layer at a
+        time on the GPU. status["merge"] describes what it saved."""
+        from . import merge
+
+        s = self.s
+        Family = get_family(self.job["family"])
+        loras = [(e["path"], float(e.get("strength", 1.0))) for e in s["merge_loras"]]
+        for path, _ in loras:
+            if not os.path.isfile(path):
+                raise RuntimeError(f"{path} is gone")
+        rank = int(s.get("merge_rank") or 0)
+        fname = self.lora_file(0, final=True)
+        triggers = [t for e in s["merge_loras"] for t in [e.get("trigger", "")] if t]
+        meta = {**Family.lora_metadata, "dainamo.job": self.job["name"], "dainamo.network": "lora",
+                "dainamo.step": "0", "dainamo.trigger": ", ".join(dict.fromkeys(triggers)),
+                "dainamo.merged_from": json.dumps([{"file": os.path.basename(p), "strength": st} for p, st in loras])}
+        if rank:
+            meta.update(ss_network_dim=str(rank), ss_network_alpha=str(rank))
+        what = " + ".join(f"{os.path.basename(p)} × {st:g}" for p, st in loras)
+        self.phase("merging", f"Merging {what}" + (f", cut to rank {rank}" if rank else ", exactly"))
+        layers = merge.model_layers(Family, self.job["profile"])
+
+        def progress(done: int, total: int):
+            self.status.update(step=done, total_steps=total, message=f"Merged {done} of {total} layers")
+            self.progress(self.status["message"], keep=done == total)
+            self.write_status()
+
+        made = merge.merge(loras, os.path.join(self.job_dir, "output", fname), rank, layers, self.device, meta,
+                           progress=progress, check=self.check_control_during_prep)
+        for i in made["inputs"]:
+            if i["matched"] < i["layers"]:
+                self.log(f"Warning: {i['file']} changes {i['layers']} layers, {i['layers'] - i['matched']} of which "
+                         "this model doesn't have (at that size); they're left out")
+        worst = made["worst"]
+        self.log(f"Saved {fname}: {made['layers']} layers as LoRAs"
+                 + (f" ({made['cut']} cut to rank {rank})" if rank else "")
+                 + f" and {made['whole']} changes kept whole, {made['bytes'] / 1e6:.0f} MB. It keeps "
+                 f"{made['kept']:.1%} of the merged change"
+                 + (f"; least in {worst['name']}, {worst['kept']:.1%}" if worst else "") + ".")
+        self.status.update(step=0, total_steps=0)
+        self.status["checkpoints"] = [{"step": 0, "file": fname, "final": True}]
+        self.status["merge"] = {"file": fname, **made}
+        self.status["phase"] = "completed"
+        self.log(f"Done in {(time.time() - self.status['started_at']) / 60:.1f} min")
+        return "completed"
+
     def end_evaluation(self, state: str, message: str = ""):
         """Record how a checkpoint evaluation ended, and give the job back the phase and message it had."""
         self.ev.update(state=state, message=message, finished_at=time.time())
@@ -954,6 +1019,8 @@ class Trainer:
                                    "restart it from step 0")
         model = self.load_model(driver, resume_from)
         if driver.swapper is not None and not s.get("gradient_checkpointing", True):
+            if self.finetune:  # (the server doesn't queue one)
+                raise RuntimeError("Offloading a finetune needs gradient checkpointing: turn it on, or offload 0%")
             self.log("Note: layer offloading saves little VRAM in training without gradient checkpointing, "
                      "since every block's weights stay saved for the backward pass")
         if s.get("gradient_checkpointing", True):
@@ -1079,6 +1146,8 @@ class Trainer:
                 opt.step()
                 sched.step()
                 opt.zero_grad(set_to_none=True)
+                if self.finetune and driver.swapper is not None:  # the last block backward ran goes back to RAM
+                    driver.swapper.release_all()
                 step += 1
 
                 if not math.isfinite(loss_acc):

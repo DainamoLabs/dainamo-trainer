@@ -83,6 +83,8 @@ class Krea2Driver(FamilyDriver):
             "batch_size": 1, "optimizer": "adamw8bit", "timestep_sampling": "shift",
         },
         sliders=True,
+        # 26 GB in bf16, so a finetune streams some blocks from system RAM on a 24 GB card, and each save is as big
+        finetune={"learning_rate": 1e-5, "optimizer": "adafactor", "keep_last": 1},
     )
     bucket_divisibility = VAE_FACTOR * PATCH
     caption_tokens = MAX_TEXT_TOKENS

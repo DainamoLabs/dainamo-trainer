@@ -193,6 +193,7 @@ def materialize(model: nn.Module, loaded: LoadedWeights, dtype: torch.dtype, kee
         else:
             new = nn.Linear(module.in_features, module.out_features, bias=bias is not None, device="meta")
             new.weight = nn.Parameter(put(dequantize(weight, q, dtype)), requires_grad=False)
+            del state[f"{prefix}.weight"], weight  # its expanded copy replaces it, so the two never all exist at once
             if bias is not None:
                 new.bias = nn.Parameter(put(bias, dtype), requires_grad=False)
         setattr(parent, attr, new)

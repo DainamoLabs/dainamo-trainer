@@ -230,3 +230,61 @@ def test_activation_offload_keeps_saved_inputs_in_ram_with_the_same_gradients():
     # the saved activations of a forward pass take one block input's worth of VRAM, not six
     assert held[2] < 2 * x.nbytes
     swapper.remove()
+
+
+class TrainedBlock(nn.Module):
+    """A finetune's block: every weight trains, in bf16; a buffer streams with it."""
+
+    def __init__(self, d):
+        super().__init__()
+        self.lin = nn.Linear(d, d)
+        self.out = nn.Linear(d, d, bias=False)
+        self.register_buffer("gain", torch.rand(d) + 0.5)
+
+    def forward(self, x):
+        return x + self.out(torch.tanh(self.lin(x) * self.gain.to(x.dtype)))
+
+
+@pytest.mark.parametrize("swapped", [3, 6])  # some blocks on the GPU, or none (the first one streams too)
+def test_a_finetunes_streamed_blocks_train_as_resident_ones_do(swapped):
+    """Streamed blocks stepped during backward (``trainable``) end each step with exactly the weights blocks kept
+    on the GPU get, the same parameters the optimizer holds, back in pinned RAM; forward passes between steps
+    (samples) see them too, and ``settle`` leaves the newest weights in RAM to save. Not swapped out after a step,
+    the last block backward ran is used as it is, not copied in again from RAM."""
+    from dainamo.engine.finetune import FusedOptimizer
+
+    dev = torch.device("cuda", torch.cuda.device_count() - 1)
+    torch.manual_seed(0)
+    blocks = nn.ModuleList(TrainedBlock(128) for _ in range(6)).to(torch.bfloat16).requires_grad_(False)
+    ref = copy.deepcopy(blocks).to(dev)
+    streamed = copy.deepcopy(blocks)
+    swapper = BlockSwapper(streamed, swapped, dev, log=lambda *_: None, trainable=True)
+    params = list(streamed.parameters())
+    for m in (ref, streamed):
+        m.requires_grad_(True)
+    opts = []
+    for m, sw in ((ref, None), (streamed, swapper)):
+        opt = FusedOptimizer(m.parameters(), "adafactor", lr=1e-2, device=dev)
+        if sw is not None:
+            opt.before_step = sw.prepare_step
+        opts.append(opt)
+    for step in range(4):
+        x = torch.randn(8, 128, device=dev, dtype=torch.bfloat16)
+        for m in (ref, streamed):
+            torch.manual_seed(step)  # the same stochastic rounding
+            run(m, x, True).float().square().mean().backward()
+        assert list(streamed.parameters()) == params and all(p.grad is None for p in params)
+        if step % 2:
+            swapper.release_all()
+            for i in swapper.swapped:
+                assert streamed[i].lin.weight.device.type == "cpu" and streamed[i].lin.weight.is_pinned()
+            assert not swapper.resident and not swapper.dirty
+        else:  # (a block on the GPU before them swapped the streamed blocks out as backward reached it)
+            assert swapper.resident == swapper.dirty == ({0} if swapped == len(blocks) else set())
+        with torch.no_grad():
+            assert torch.equal(run(ref, x, False), run(streamed, x, False))
+    swapper.settle()
+    for (k, a), b in zip(ref.state_dict().items(), streamed.state_dict().values()):
+        assert torch.equal(a.cpu(), b.cpu()), k
+    assert not torch.equal(blocks[-1].lin.weight, streamed[-1].lin.weight)  # it trained
+    swapper.remove()

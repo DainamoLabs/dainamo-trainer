@@ -14,6 +14,12 @@ fp32 copy of the weight, which is written back to bf16 with stochastic rounding:
 far smaller than bf16's spacing near the weights, so rounding to nearest would lose nearly all of them,
 while stochastic rounding keeps each one on average. Because the updates happen during backward, there's no
 gradient accumulation and no global gradient-norm clipping; Adafactor clips its own updates.
+
+A model too big for the GPU in bf16 (Krea 2's 26 GB) streams its last blocks from system RAM as it trains
+(``offload.BlockSwapper`` with ``trainable``): each streamed block is stepped while it's on the GPU for
+backward, and copied back to RAM after. A Turbo model's training adapter (``TrainingAdapter``) applies beside
+the weights while training, as it does for a LoRA, so the finetune learns on the de-distilled model and is
+saved, and samples, without it.
 """
 
 from __future__ import annotations
@@ -66,9 +72,11 @@ class FusedOptimizer(torch.optim.Optimizer):
 
     Each inner optimizer steps an fp32 proxy of its parameter, which holds a copy of the weight and its gradient
     only for that step. Their state lives in one dict, ``state``, keyed by proxy (so ``offload.park_optimizer``
-    sees all of it)."""
+    sees all of it), on ``device`` (default: each parameter's), where the steps run: a streamed block's weights
+    are in system RAM between steps. ``before_step(p)``, if set, is called before each parameter's step (the
+    swapper streaming it brings it to the GPU)."""
 
-    def __init__(self, params, name: str, lr: float, weight_decay: float = 0.0):
+    def __init__(self, params, name: str, lr: float, weight_decay: float = 0.0, device=None):
         params = list(params)
         super().__init__(params, {"lr": lr, "weight_decay": weight_decay})
         self.name = name
@@ -76,8 +84,9 @@ class FusedOptimizer(torch.optim.Optimizer):
         self.inner: list[torch.optim.Optimizer] = []
         self._empty: dict[torch.device, torch.Tensor] = {}
         self.hooks = []
+        self.before_step = None
         for i, p in enumerate(params):
-            proxy = nn.Parameter(self._placeholder(p.device))
+            proxy = nn.Parameter(self._placeholder(device if device is not None else p.device))
             opt = _make(name, [proxy], lr, weight_decay)
             opt.state = self.state
             self.proxies.append(proxy)
@@ -92,6 +101,8 @@ class FusedOptimizer(torch.optim.Optimizer):
 
     @torch.no_grad()
     def _step_one(self, i: int, p: torch.Tensor):
+        if self.before_step is not None:
+            self.before_step(p)
         proxy, opt = self.proxies[i], self.inner[i]
         group = self.param_groups[0]
         opt.param_groups[0].update(lr=group["lr"], weight_decay=group["weight_decay"])
@@ -200,14 +211,43 @@ DTYPE_SIZES = {"F64": 8, "F32": 4, "F16": 2, "BF16": 2, "I64": 8, "I32": 4, "I16
                "F8_E4M3": 1, "F8_E5M2": 1}
 
 
+class TrainingAdapter:
+    """A frozen LoRA (a Turbo model's training adapter) applied beside a finetune's weights while it trains, as a
+    LoRA job applies it: a forward hook on each Linear it has weights for adds its change to the output while
+    it's on. Hooks leave the model's layers, and so the names its save copies, as they are."""
+
+    def __init__(self, model: nn.Module, path: str, device, dtype=torch.bfloat16):
+        from safetensors.torch import load_file
+
+        from .lora import adapter_layers
+
+        self.enabled = True
+        self.handles = []
+        for name, adapter in adapter_layers(load_file(path)):
+            try:
+                module = model.get_submodule(name)
+            except AttributeError:
+                continue
+            if not isinstance(module, nn.Linear) or (adapter.full is not None and adapter.full.dim() != 2):
+                continue  # as for a LoRA, a training adapter applies only to Linears
+            self.handles.append(module.register_forward_hook(partial(self._apply, adapter.to(device, dtype))))
+        if not self.handles:
+            raise ValueError(f"Training adapter {path} matched no layers of this model")
+
+    def _apply(self, adapter, module, args, out):
+        return out + adapter(args[0]).to(out.dtype) if self.enabled else out
+
+
 class FullModel:
     """The diffusion model itself as what a job trains, in a ``LoRANetwork``'s place (``kind`` "full"). ``source``
-    is a file of it (the one it was loaded from, or the profile's), whose layout ``save`` copies."""
+    is a file of it (the one it was loaded from, or the profile's), whose layout ``save`` copies. ``swapper``: the
+    ``offload.BlockSwapper`` streaming its last blocks, if any; ``adapter``: a ``TrainingAdapter``, if any."""
 
     kind = "full"
 
-    def __init__(self, model: nn.Module, source: str):
+    def __init__(self, model: nn.Module, source: str, swapper=None, adapter: TrainingAdapter | None = None):
         self.model = model
+        self.swapper, self.adapter = swapper, adapter
         self.layout = Layout(source, model)
         self.modules: dict = {}  # no adapter layers
         self.params = [p for p in model.parameters()]
@@ -225,9 +265,13 @@ class FullModel:
         pass
 
     def set_assistants_enabled(self, enabled: bool):
-        pass
+        """The training adapter on (training) or off (sampling)."""
+        if self.adapter is not None:
+            self.adapter.enabled = enabled
 
     def save(self, path: str, metadata: dict[str, str] | None = None):
+        if self.swapper is not None:  # the streamed blocks' newest weights are back in RAM first
+            self.swapper.settle()
         save_model(self.model, path, self.layout, metadata)
 
 

@@ -2,7 +2,7 @@
 
 | Family | Files a profile needs | Notes |
 | --- | --- | --- |
-| Krea 2 | Krea 2 Raw or Turbo, Qwen3-VL-4B, Qwen-Image VAE | Train Turbo with Ostris's turbo training adapter; it's on only during training. |
+| Krea 2 | Krea 2 Raw or Turbo, Qwen3-VL-4B, Qwen-Image VAE | Train Turbo with Ostris's turbo training adapter; it's on only during training. Can be [finetuned](finetuning.md). |
 | MOSS-Image | MOSS-Image Base or SFT, Qwen3.5-9B, FLUX.2 VAE | The ComfyUI single file. Samples like the reference pipeline: shift 5, Euler, CFG 3. Can be [finetuned](finetuning.md). |
 | Qwen-Image 2.1 | the Qwen-Image 2.1 DiT (base or Turbo), Qwen3-VL-8B, Qwen-Image 2.1 VAE (RGBA) | Images with references in `_refs` train as edits (the caption is the instruction); images without train text-to-image. Transparent PNGs train as RGBA. Sample cards can add reference images to render an edit. Turbo needs its training adapter. |
 | LTX 2.5 (video + audio) | the 22B DiT (dev or distilled), Gemma 4 12B with LTX's projection, video VAE (diffusion decoder or conv), audio VAE | Trains clips and images; clips with sound train audio too. Sample cards can set a frame count and a first frame. Samples are MP4 with 48 kHz audio. |

@@ -200,6 +200,7 @@ export type Job = {
   network: "lora" | "lokr" | "full"; // the adapter it trains, or "full": a finetune of the whole model
   refmod: boolean; // makes a RefMod of its datasets instead of training
   extract: boolean; // extracts a LoRA from a finetune's checkpoint instead of training
+  merge: boolean; // merges LoRAs into one instead of training
 };
 
 // the RefMod a job made: its file, shape (latent frames of height × width cells), the reference tokens it puts into
@@ -220,6 +221,14 @@ export type ExtractMade = {
   worst: { name: string; kept: number } | null; change: number; bytes: number; source: string; base: string;
 };
 
+// the LoRA a merge job made: layers saved as LoRAs (``cut`` of them to the rank; rank 0: exact) and kept whole, the
+// share of the merged change's squared size it keeps (overall, and in the layer keeping least), and what it merged
+export type MergeMade = {
+  file: string; rank: number; layers: number; cut: number; whole: number; kept: number; bytes: number;
+  worst: { name: string; kept: number } | null;
+  inputs: { file: string; strength: number; matched: number; layers: number }[];
+};
+
 export type JobDetail = Job & {
   config: any;
   dir: string;
@@ -230,6 +239,7 @@ export type JobDetail = Job & {
     evaluation?: Evaluation | null;
     refmod?: RefModMade;
     extract?: ExtractMade;
+    merge?: MergeMade;
   };
 };
 

@@ -57,12 +57,13 @@ download from any address, including ones on your local network.
 4. **New job**: pick the profile and datasets, set the steps and sample prompts,
    and press **Fit to GPU** if the projection says it won't fit.
 5. **Queue**: open the job for its samples, loss and log. The LoRA is saved in
-   `data/jobs/<id>/` and downloadable from the Checkpoints tab.
+   `data/jobs/<job name>_<id>/` and downloadable from the Checkpoints tab.
 6. **Sandbox**: generate with the LoRA and compare it with the base model.
 
 ## Documentation
 
 - [Profiles and model files](docs/profiles-and-model-files.md)
+- [Merge & extract](docs/merge-and-extract.md): LoRAs merged into one, LoRAs extracted from any finetuned model
 - [Datasets](docs/datasets.md): health check, caption edits, Split into clips, Add from URL
 - [Captions](docs/captions.md): Auto-Caption and the caption provider
 - [Jobs](docs/jobs.md): Create Job, the queue, editing and continuing jobs, the checkpoint picker, notifications

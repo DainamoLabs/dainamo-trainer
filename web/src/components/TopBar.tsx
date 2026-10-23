@@ -28,12 +28,12 @@ function ago(ts: number) {
 }
 
 /** What a running job is doing (unless training, which its percentage says), its step of how many and the time left
- * (while training), and how far along it is (while training or extracting, the phases that count steps). */
+ * (while training), and how far along it is (while training, extracting or merging, the phases that count steps). */
 function progressOf(j: Job) {
   const p = j.progress;
   const stopping = j.status === "stopping";
   const phase = stopping ? "Stopping" : j.evaluating ? "Evaluating checkpoints" : PHASES[p.phase || ""] || p.phase || "Starting";
-  const counted = !j.evaluating && (p.phase === "training" || p.phase === "extracting") && !!p.total_steps;
+  const counted = !j.evaluating && ["training", "extracting", "merging"].includes(p.phase || "") && !!p.total_steps;
   const pct = counted ? Math.min(100, (100 * (p.step || 0)) / p.total_steps!) : null;
   const left = !stopping && p.phase === "training" && p.eta_seconds != null ? fmtDuration(p.eta_seconds) : null;
   const steps = counted ? `${(p.step || 0).toLocaleString()} / ${p.total_steps!.toLocaleString()}` : null;

@@ -18,6 +18,9 @@ Use **Download** to put the adapter in your `loras` folder. An `owner/repo/file`
 path also works, but downloads into the hidden Hugging Face cache, where ComfyUI
 doesn't look.
 
+[Merge & extract](merge-and-extract.md), the third tab, merges LoRAs and
+extracts them from finetuned models.
+
 ## Model files
 
 **Model files**, the Profiles page's second tab, shows what each family needs

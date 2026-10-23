@@ -67,9 +67,9 @@ def check_settings(s: dict, div: int, audio: bool = False) -> dict:
 
 def check_finetune(s: dict) -> None:
     """A full finetune (``engine.finetune``): every weight trains, with an optimizer whose state fits beside the
-    model. Its weights update during backward, so there's one batch a step and no offloading; it's the whole
-    model at full strength, so there's no slider, concept bleed or strength sweep (the checkpoint picker's
-    validation loss still applies)."""
+    model. Its weights update during backward, so there's one batch a step, and its offloaded blocks come back for
+    backward through gradient checkpointing; it's the whole model at full strength, so there's no slider, concept
+    bleed or strength sweep (the checkpoint picker's validation loss still applies)."""
     from ..engine.finetune import OPTIMIZERS
 
     s["finetune_enabled"] = bool(s.get("finetune_enabled", False))
@@ -84,7 +84,9 @@ def check_finetune(s: dict) -> None:
                                  "(AdamW and Prodigy keep 8 bytes or more a weight)")
     if s.get("bleed_enabled"):
         raise HTTPException(400, "Concept bleed compares the LoRA on and off, so it doesn't apply to a finetune")
-    s.update(grad_accum=1, offload=0, sweep_enabled=False)
+    if s.get("offload") and not s.get("gradient_checkpointing", True):
+        raise HTTPException(400, "Offloading a finetune needs gradient checkpointing: turn it on, or offload 0%")
+    s.update(grad_accum=1, sweep_enabled=False)
 
 
 REFMOD_DEFAULTS = {"refmod_kind": "visual", "refmod_mode": "compressed", "refmod_size": 1024, "refmod_frames": 22,

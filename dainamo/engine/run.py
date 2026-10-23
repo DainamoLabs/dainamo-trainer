@@ -1,5 +1,5 @@
 """Subprocess entry point: ``python -m dainamo.engine.run <job_dir>`` (training, a checkpoint evaluation of a
-finished job, making a RefMod, or extracting a LoRA from a finetune).
+finished job, making a RefMod, extracting a LoRA from a finetune, or merging LoRAs).
 
 Exit codes: 0 completed, 3 stopped by user, 1 failed.
 """
@@ -29,13 +29,14 @@ def main():
         trainer = Trainer(job_dir)
         result = (trainer.run_evaluation() if trainer.evaluating
                   else trainer.run_refmod() if trainer.s.get("refmod_enabled")
-                  else trainer.run_extract() if trainer.s.get("extract_enabled") else trainer.run())
+                  else trainer.run_extract() if trainer.s.get("extract_enabled")
+                  else trainer.run_merge() if trainer.s.get("merge_enabled") else trainer.run())
         trainer.write_status(force=True)
         sys.exit(3 if result == "stopped" else 0)
     except StopRequested:
         if trainer:
             trainer.status["phase"] = "stopped"
-            made = trainer.s.get("refmod_enabled") or trainer.s.get("extract_enabled")  # nothing trains
+            made = any(trainer.s.get(k) for k in ("refmod_enabled", "extract_enabled", "merge_enabled"))  # nothing trains
             trainer.log("Stopped" if made else "Stopped before training began")
         sys.exit(3)
     except Exception as e:  # report the failure to the UI, then exit non-zero

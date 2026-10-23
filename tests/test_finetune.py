@@ -171,11 +171,15 @@ class TinyDiT(nn.Module):
     def __init__(self):
         super().__init__()
         self.blocks = nn.ModuleList([nn.Linear(3, 3), nn.Linear(3, 3)])
+        self.gradient_checkpointing = False
 
     def forward(self, x):
         h = x.permute(0, 2, 3, 1)
         for b in self.blocks:
-            h = h + b(h)
+            if self.gradient_checkpointing and torch.is_grad_enabled():
+                h = h + torch.utils.checkpoint.checkpoint(b, h, use_reentrant=False)
+            else:
+                h = h + b(h)
         return h.permute(0, 3, 1, 2)
 
 
@@ -267,6 +271,87 @@ def test_a_finetune_job_trains_saves_whole_models_and_continues(tmp_path, monkey
         trainer_mod.Trainer(str(job_dir)).run()
 
 
+def _finetune_job(tmp_path, name: str, **settings) -> tuple:
+    """A tiny finetune job, its model in bf16, and the profile's training adapter: a LoRA on ``blocks.0``."""
+    from tests.test_trainer import _images
+
+    torch.manual_seed(0)
+    base = TinyDiT().to(torch.bfloat16).state_dict()
+    source = str(tmp_path / "tiny.safetensors")
+    if not os.path.exists(source):
+        save_file(base, source)
+        save_file({"diffusion_model.blocks.0.lora_A.weight": torch.randn(2, 3),
+                   "diffusion_model.blocks.0.lora_B.weight": torch.randn(3, 2), "diffusion_model.blocks.0.alpha":
+                   torch.tensor(2.0)}, str(tmp_path / "adapter.safetensors"))
+        _images(str(tmp_path / "train"), [(200, 30, 30), (190, 40, 20), (60, 160, 60)])
+    job_dir = tmp_path / name
+    job_dir.mkdir()
+    job = {"name": "t", "family": "tiny",
+           "profile": {"diffusion_model": source, "training_adapter": str(tmp_path / "adapter.safetensors")},
+           "datasets": [{"path": str(tmp_path / "train"), "trigger": "", "repeats": 1, "resolution": 64}],
+           "settings": {"steps": 6, "resolution": 64, "seed": 1, "optimizer": "adafactor", "learning_rate": 0.01,
+                        "save_every": 3, "sample_every": 0, "keep_last": 0, "finetune_enabled": True,
+                        "grad_accum": 1, **settings}}
+    (job_dir / "job.json").write_text(json.dumps(job))
+    return job_dir, job, base
+
+
+@gpu
+def test_a_finetune_trains_its_streamed_blocks_and_the_training_adapter_applies(tmp_path, monkeypatch):
+    """Offloaded (both blocks stream, so does the first), a finetune trains, saves and carries on exactly as it
+    does on the GPU. The training adapter applies while it trains: the result differs from training without it,
+    and isn't in the saved model."""
+    from dainamo.engine import trainer as trainer_mod
+
+    monkeypatch.setattr(trainer_mod, "get_family", lambda name: _tiny_family())
+    runs = {}
+    for name, offload in (("gpu", 0), ("streamed", 100)):
+        job_dir, job, base = _finetune_job(tmp_path, name, offload=offload)
+        assert trainer_mod.Trainer(str(job_dir)).run() == "completed"
+        job["settings"]["steps"] = 9  # resumed from its final model, whose blocks stream again
+        (job_dir / "job.json").write_text(json.dumps(job))
+        assert trainer_mod.Trainer(str(job_dir)).run() == "completed"
+        runs[name] = {f: load_file(str(job_dir / "output" / f)) for f in sorted(os.listdir(job_dir / "output"))}
+    assert list(runs["gpu"]) == list(runs["streamed"]) == ["t.safetensors", "t_000003.safetensors",
+                                                         "t_000006.safetensors"]
+    for f, tensors in runs["gpu"].items():
+        assert set(tensors) == set(base)  # the model's own layers only: the adapter isn't saved
+        for k, t in tensors.items():
+            assert torch.equal(t, runs["streamed"][f][k]), (f, k)
+
+    # without the adapter, the same job trains to other weights
+    job_dir, job, _ = _finetune_job(tmp_path, "plain", offload=100)
+    job["profile"]["training_adapter"] = ""
+    (job_dir / "job.json").write_text(json.dumps(job))
+    assert trainer_mod.Trainer(str(job_dir)).run() == "completed"
+    plain = load_file(str(job_dir / "output" / "t.safetensors"))
+    assert not torch.equal(plain["blocks.0.weight"], runs["gpu"]["t_000006.safetensors"]["blocks.0.weight"])
+
+
+def test_the_training_adapter_adds_its_change_while_on_and_leaves_the_layers_as_they_are(tmp_path):
+    from dainamo.engine.finetune import TrainingAdapter
+
+    torch.manual_seed(0)
+    model = Net()
+    names = set(model.state_dict())
+    down, up = torch.randn(2, 16), torch.randn(16, 2)
+    path = str(tmp_path / "a.safetensors")
+    save_file({"diffusion_model.blocks.1.lora_A.weight": down, "diffusion_model.blocks.1.lora_B.weight": up,
+               "diffusion_model.blocks.1.alpha": torch.tensor(1.0), "diffusion_model.norm.diff": torch.ones(16)}, path)
+    adapter = TrainingAdapter(model, path, "cpu", torch.float32)
+    assert len(adapter.handles) == 1 and set(model.state_dict()) == names  # a norm's change doesn't apply
+    h = torch.randn(4, 16)
+    assert torch.allclose(model.blocks[1](h), F.linear(h, model.blocks[1].weight, model.blocks[1].bias)
+                          + h @ down.t() @ up.t() * 0.5, atol=1e-5)
+    model.blocks[1](h).sum().backward()  # the layer's own weights still train through it
+    assert model.blocks[1].weight.grad is not None
+    adapter.enabled = False
+    assert torch.equal(model.blocks[1](h), F.linear(h, model.blocks[1].weight, model.blocks[1].bias))
+    with pytest.raises(ValueError, match="matched no layers"):
+        save_file({"diffusion_model.nothing.lora_A.weight": down, "diffusion_model.nothing.lora_B.weight": up}, path)
+        TrainingAdapter(model, path, "cpu")
+
+
 # --- the server ----------------------------------------------------------------------------------------------
 
 
@@ -286,21 +371,25 @@ def test_finetune_settings_are_checked(client, tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler, "_launch", lambda: None)
     moss = client.post("/api/profiles", json={"name": "ft moss", "family": "moss_image", "data": {}}).json()["id"]
     krea = client.post("/api/profiles", json={"name": "ft krea", "family": "krea2", "data": {}}).json()["id"]
+    qwen = client.post("/api/profiles", json={"name": "ft qwen", "family": "qwen_image_2", "data": {}}).json()["id"]
     did = client.post("/api/datasets", json={"name": "ft", "path": str(tmp_path)}).json()["id"]
 
     def create(pid, **settings):
         return client.post("/api/jobs", json={"name": "ft", "profile_id": pid, "datasets": [{"id": did}],
                                               "settings": {"finetune_enabled": True, "optimizer": "adafactor", **settings}})
 
-    assert "can't be finetuned" in create(krea).json()["detail"]
+    assert "can't be finetuned" in create(qwen).json()["detail"]
+    assert create(krea).status_code == 200
     assert "Adafactor or AdamW 8-bit" in create(moss, optimizer="adamw").json()["detail"]
     assert "slider" in create(moss, slider_enabled=True, slider_target="a", slider_positive="b",
                               slider_negative="c").json()["detail"]
     assert "Concept bleed" in create(moss, bleed_enabled=True, bleed_prompts=["a dog"]).json()["detail"]
+    # offloaded blocks come back for backward through gradient checkpointing's recomputation
+    assert "gradient checkpointing" in create(moss, offload=30, gradient_checkpointing=False).json()["detail"]
     r = create(moss, grad_accum=4, offload=30, picker_enabled=True, sweep_enabled=True)
     assert r.status_code == 200
     s = r.json()["config"]["settings"]
-    assert (s["grad_accum"], s["offload"], s["picker_enabled"], s["sweep_enabled"]) == (1, 0, True, False)
+    assert (s["grad_accum"], s["offload"], s["picker_enabled"], s["sweep_enabled"]) == (1, 30, True, False)
     listed = next(j for j in client.get("/api/jobs").json() if j["id"] == r.json()["id"])
     assert listed["network"] == "full"
     jid = r.json()["id"]
@@ -339,16 +428,22 @@ def test_a_finetune_loads_every_layer_in_bf16_as_the_projection_counts_it(tmp_pa
     from tests.test_memory import D, N, TinyDriver, write_model
 
     path = write_model(tmp_path / "m.safetensors")  # its attn layers are int8
-    d = TinyDriver({"diffusion_model": path}, torch.device("cpu"), log=lambda *_: None)
-    d.offload = 0.5  # ignored: nothing streams in a finetune
+    cuda = torch.cuda.is_available()
+    d = TinyDriver({"diffusion_model": path}, torch.device("cuda" if cuda else "cpu"), log=lambda *_: None)
+    d.offload = 0.5  # half its blocks expanded in system RAM, and trained as they stream
     model = d.load_transformer(trainable=True)
-    assert d.swapper is None and not any(isinstance(m, QuantLinear) for m in model.modules())
+    assert d.swapper is not None and d.swapper.trainable and d.swapper.swapped == list(range(N // 2, N))
+    assert not any(isinstance(m, QuantLinear) for m in model.modules())
     assert all(p.dtype == torch.bfloat16 for p in model.parameters())
+    assert all(not p.is_cuda and p.is_pinned() == cuda for i in d.swapper.swapped for p in model.blocks[i].parameters())
+    assert all(p.is_cuda == cuda for p in model.blocks[0].parameters())
     n = sum(p.numel() for p in model.parameters())
     p = memory.project(TinyDriver, {"diffusion_model": path}, {"finetune_enabled": True, "optimizer": "adafactor",
                                                                "resolution": 512, "offload": 50})
     assert p["adapter_params"] == n
     assert p["model_gb"] == pytest.approx(n * 2 / memory.GB)
+    # a block stepped in backward is held until it's copied back to RAM: one more in flight than for a LoRA
+    assert p["inflight_gb"] == pytest.approx((memory.IN_FLIGHT_BLOCKS + 1) * max(p["block_gb"]))
     train = dict(p["phases"][0]["parts"])
     vectors = N * 3 * D + D  # each block's norm weight and bias and mlp bias, and proj_in's bias
     matrices = N * 2 + 1

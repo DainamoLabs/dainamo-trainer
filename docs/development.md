@@ -12,6 +12,7 @@ dainamo/
     lora.py               LoRA and LoKr networks + frozen adapters, ComfyUI key formats
     finetune.py           full finetuning and saving whole models
     extract.py            LoRAs extracted from a finetune
+    merge.py              LoRAs merged into one, or cut to a smaller rank
     dataset.py            discovery, aspect buckets, caption/trigger handling
     trainer.py            family-agnostic training loop
     slider.py             concept sliders: their settings and training step
@@ -24,7 +25,7 @@ dainamo/
       ltx2/               LTX 2.5: diffusers' LTX-2 classes loaded from ComfyUI files, and the driver
   server/
     app.py                FastAPI app: middleware, routers, the built web UI
-    routes/               the API, one module per area (system, profiles, models, datasets, jobs, sandbox, llm)
+    routes/               the API, one module per area (system, profiles, models, datasets, jobs, sandbox, llm, tools)
     validation.py         job settings checks
     db.py                 SQLite store and its schema migrations
     queue.py              job queue: launches training processes onto GPUs
@@ -43,7 +44,7 @@ dainamo/
 scripts/measure_memory.py measures a family's activation memory for the projection
 web/                      React + Vite UI (built into web/dist)
 docs/                     these documents, and the screenshots in docs/screenshots/
-data/                     database, uploaded datasets, job outputs (data/jobs/<id>/)
+data/                     database, uploaded datasets, job outputs (data/jobs/<name>_<id>/)
 ```
 
 **Database.** To change the schema, add a step to the end of `MIGRATIONS` in
@@ -55,7 +56,10 @@ new step runs once, in a transaction.
 PyTorch rounds each pinned allocation up to a power of two. Low VRAM moves each
 block's saved input to pinned RAM on a side stream and prefetches it one block
 ahead of backward. A finetune steps each weight's optimizer inside backward on
-an fp32 copy, written back to bf16 with stochastic rounding.
+an fp32 copy, written back to bf16 with stochastic rounding. Its offloaded
+blocks are swapped through `.data`, so the optimizer keeps the same parameters,
+and a block that was stepped is copied back to RAM on the side stream when it's
+swapped out.
 
 ## Adding a model family
 
@@ -101,10 +105,11 @@ only the header matters.
 | `test_minimax.py` | MiniMax H3's packed sequences: per-row timesteps, first-frame and reference rows, audio and no audio, and that the sampler lands on the clean latent given the true velocity |
 | `test_yue2.py` | music: lyrics split from captions, songs cut into clips, music job settings and sample cards, padded composer conditions, a training step reaching the LoRA and its ComfyUI names, the midpoint solver, saved songs and the audio health check. With the real checkpoint, the prompt format, the VRAM projection and the VAE's loudness envelope |
 | `test_refmod.py` | RefMod files against the pack's format (standalone, older, audio and bundle files), grid refinement, the token cap and strength, making them from images, clips and sound, reference audio in the prompt, generating with them, RefMod jobs end to end |
-| `test_offload.py` | block swapping gives exactly the same outputs and LoRA gradients as a model held on the GPU; streamed text encoders (Low VRAM); shared pinned slabs; parking models and optimizer state mid-training; saved activations in RAM giving the same loss and gradients |
+| `test_offload.py` | block swapping gives exactly the same outputs and LoRA gradients as a model held on the GPU, and a finetune's streamed blocks the same weights; streamed text encoders (Low VRAM); shared pinned slabs; parking models and optimizer state mid-training; saved activations in RAM giving the same loss and gradients |
 | `test_memory.py` | the shared loader with offloading, that projected weight sizes match a loaded model exactly, how each phase's VRAM and system RAM add up, Low VRAM's projections |
-| `test_finetune.py` | stepping each weight in backward matches a normal optimizer step, stochastic rounding is unbiased, optimizer state saves and loads, saved models keep their source's layout, a finetune job end to end and continued, the server's finetune rules |
+| `test_finetune.py` | stepping each weight in backward matches a normal optimizer step, stochastic rounding is unbiased, optimizer state saves and loads, saved models keep their source's layout, a finetune job end to end and continued, the same job offloaded giving the same weights, the training adapter applying only while training, the server's finetune rules |
 | `test_extract.py` | extracted factors are the best approximation of their rank, a tiny int8 finetune extracted exactly, the Sandbox applying it as the finetune, extract jobs finding their checkpoint, the server's rules |
+| `test_merge.py` | an exact merge is the stacked LoRAs, a cut one the best approximation of their sum, kohya files, LoKrs only at a rank, whole changes added up, layers another model has left out, the Sandbox applying a merge as its LoRAs, merge jobs, the Merge & extract routes |
 | `test_lokr.py` | LoKr factor splits, a LoKr layer against the full Kronecker product, `lokr_w1`/`lokr_w2` keys saved and loaded, the Sandbox applying LoKr files and explaining the ones it can't, a tiny LoKr job |
 | `test_slider.py` | the slider step (base predictions with the LoRA off, the guided target, the strength during backward) and a tiny slider job without a dataset |
 | `test_sampling.py` | samplers on Gaussian data with a known solution (Heun and DPM++ 2M converge at second order), DPM++ 2M against k-diffusion, the beta schedule |

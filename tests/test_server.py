@@ -239,6 +239,30 @@ def test_resolution_takes_one_or_several(client, tmp_path):
     client.post(f"/api/jobs/{r.json()['id']}/action", json={"action": "stop"})
 
 
+def test_job_folders_are_named_after_the_job(client, tmp_path):
+    from dainamo.server import db
+    from dainamo.server.queue import JOBS_DIR, job_dir
+
+    client.put("/api/settings", json={"queue": {"gpus": [99]}})
+    pid = client.post("/api/profiles", json={"name": "jf", "family": "krea2", "data": {}}).json()["id"]
+    did = client.post("/api/datasets", json={"name": "jf", "path": str(tmp_path)}).json()["id"]
+    jobs = [client.post("/api/jobs", json={"name": name, "profile_id": pid, "datasets": [{"id": did}],
+                                           "settings": {}}).json() for name in ("My LoRA: v1/2", "My LoRA: v1/2", "日本")]
+    assert [os.path.basename(job_dir(j["id"])) for j in jobs] == \
+        [f"My_LoRA_v1_2_{jobs[0]['id']}", f"My_LoRA_v1_2_{jobs[1]['id']}", jobs[2]["id"]]  # same name, own folder
+    assert client.get(f"/api/jobs/{jobs[0]['id']}").json()["dir"] == job_dir(jobs[0]["id"])
+    # renaming a job leaves its files where they are
+    edit = {"name": "renamed", "profile_id": pid, "datasets": [{"id": did}], "settings": {}}
+    assert client.put(f"/api/jobs/{jobs[0]['id']}", json=edit).status_code == 200
+    assert os.path.basename(job_dir(jobs[0]["id"])).startswith("My_LoRA_v1_2_")
+    # a job from before folders were named keeps its id as its folder
+    db.execute("INSERT INTO jobs (id, name, status, family, gpu, position, created, config) VALUES (?,?,?,?,?,?,?,?)",
+               ("oldjob123456", "old", "completed", "krea2", "auto", 0, 0, "{}"))
+    assert job_dir("oldjob123456") == os.path.join(JOBS_DIR, "oldjob123456")
+    for j in jobs:
+        client.post(f"/api/jobs/{j['id']}/action", json={"action": "stop"})
+
+
 def test_an_auto_clip_length_trains_each_clip_whole(client, tmp_path):
     client.put("/api/settings", json={"queue": {"gpus": [99]}})
     pid = client.post("/api/profiles", json={"name": "ac", "family": "minimax_h3", "data": {}}).json()["id"]

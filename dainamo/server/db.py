@@ -122,6 +122,8 @@ MIGRATIONS: list = [
     lambda c: _caption_options(c),
     # 3: the MOSS-Image caption style, for caption styles saved before it was a default
     lambda c: _add_caption_style(c, MOSS_CAPTION_STYLE),
+    # 4: each job's folder in data/jobs, named after the job (older jobs have none: their folder is their id)
+    "ALTER TABLE jobs ADD COLUMN folder TEXT;",
 ]
 
 

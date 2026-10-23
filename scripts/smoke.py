@@ -506,7 +506,7 @@ def main():
     if not results:
         say("  Nothing to test.")
     if failed or args.keep:
-        say(f"Kept {tmp} (server.log, and each job's log in jobs/<id>/)")
+        say(f"Kept {tmp} (server.log, and each job's log in its folder in jobs/)")
     else:
         shutil.rmtree(tmp, ignore_errors=True)
     sys.exit(1 if failed or not results else 0)

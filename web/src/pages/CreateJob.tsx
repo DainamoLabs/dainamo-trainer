@@ -402,7 +402,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
     const settings = {
       ...s, sample_prompts: fromCards(cards), slider_enabled: slider, network_type: lokr ? "lokr" : "lora",
       refmod_enabled: refmod, finetune_enabled: finetune, ...(refmod ? { picker_enabled: false, bleed_enabled: false } : {}),
-      ...(finetune ? { bleed_enabled: false, sweep_enabled: false, grad_accum: 1, offload: 0 } : {}),
+      ...(finetune ? { bleed_enabled: false, sweep_enabled: false, grad_accum: 1 } : {}),
       ...(isAudio ? { bleed_enabled: false } : {}),
       ...(slider ? { picker_enabled: false, ...(keepLayout ? { slider_preserve: [] } : {}) } : {}),
       ...(first ? { resolution: first.resolution, flip: first.flip, caption_dropout: first.caption_dropout }
@@ -461,7 +461,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
     ...(isAudio ? { clip_seconds: s.clip_seconds, sample_seconds: s.sample_seconds } : {}),
   }, "train");
   const target = gpuTarget(sys?.gpus, gpu);
-  const vramPeak = !refmod && vram && !vram.error && vram.blocks ? peakOf(vram, finetune ? 0 : streamedFor(vram, s.offload)) : null;
+  const vramPeak = !refmod && vram && !vram.error && vram.blocks ? peakOf(vram, streamedFor(vram, s.offload)) : null;
   // what each save of a finetune takes on disk: the whole model, in bf16
   const saveGb = finetune && vram && !vram.error ? (vram.adapter_params * 2) / 1e9 : 0;
 
@@ -849,8 +849,8 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
             )}
             {imageInput?.help && <div className="help" style={{ marginTop: 8 }}>{imageInput.help}</div>}
             <div style={{ marginTop: 16 }}>
-              <OffloadControl proj={vram} value={finetune ? 0 : Number(s.offload) || 0} onChange={set("offload")} gpu={target} ram={sys?.ram}
-                lowVram={family?.streams_text_encoder ? { on: lowVram, onChange: set("low_vram") } : null} offload={!finetune} />
+              <OffloadControl proj={vram} value={Number(s.offload) || 0} onChange={set("offload")} gpu={target} ram={sys?.ram}
+                lowVram={family?.streams_text_encoder ? { on: lowVram, onChange: set("low_vram") } : null} finetune={finetune} />
             </div>
             <details style={{ marginTop: 16 }}>
               <summary className="muted" style={{ cursor: "pointer" }}>Advanced</summary>
@@ -868,6 +868,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
                   <div className="help" style={{ gridColumn: "1 / -1" }}>
                     A finetune updates each weight as soon as backward has its gradient, so it takes one batch per step (no
                     gradient accumulation) and has no overall gradient clipping; Adafactor caps its own updates.
+                    {Number(s.offload) > 0 && !s.gradient_checkpointing && <span className="validation error" style={{ display: "inline" }}> Offloading a finetune needs gradient checkpointing.</span>}
                   </div>
                 )}
                 {family?.id === "qwen_image_2" && (
@@ -1025,7 +1026,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
             <div className="kv"><span>File size</span><span>{refImages + refClips ? `≤ ${fmtSize((refCapped ? refCap : refTokens) * 4 * 24 * 2)}` : "—"}</span></div>
             <div className="kv"><span>Concept</span><span>{CONCEPTS.find(([c]) => c === s.refmod_concept)?.[1].split(" · ")[0] || s.refmod_concept}</span></div>
           </> : <>
-          <div className="kv"><span>Training adapter</span><span>{profile?.data?.training_adapter ? (finetune ? "not used" : "on") : "off"}</span></div>
+          <div className="kv"><span>Training adapter</span><span>{profile?.data?.training_adapter ? "on" : "off"}</span></div>
           {slider && <div className="kv"><span>Train</span><span>Slider</span></div>}
           <div className="kv"><span>{finetune ? "Train" : "Network"}</span><span>{finetune
             ? `Whole model${vram && !vram.error && vram.adapter_params ? ` · ${(vram.adapter_params / 1e9).toFixed(2)}B weights` : ""}`
@@ -1049,7 +1050,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
           {!slider && <div className="kv"><span>Checkpoint picker</span><span>{s.picker_enabled ? "on" : "off"}</span></div>}
           {!isAudio && <div className="kv"><span>Concept bleed</span><span>{s.bleed_enabled ? "on" : "off"}</span></div>}
           <div className="kv"><span>Projected VRAM</span><span className={vramPeak && target && vramPeak.total > target.totalGb ? "vram-peak over" : ""}>
-            {vramPeak ? `≈ ${vramPeak.total.toFixed(1)} GB` : "—"}{s.offload && !finetune ? ` · ${s.offload}% offloaded` : ""}{lowVram ? " · low VRAM" : ""}</span></div>
+            {vramPeak ? `≈ ${vramPeak.total.toFixed(1)} GB` : "—"}{s.offload ? ` · ${s.offload}% offloaded` : ""}{lowVram ? " · low VRAM" : ""}</span></div>
           </>}
           {!slider && !refmod && missingCaps > 0 && <div className="validation warning" style={{ marginTop: 10 }}>{missingCaps} file(s) have no caption — they'll train on the trigger word only.</div>}
           <button className="btn primary" style={{ width: "100%", marginTop: 16, padding: "11px 14px" }} disabled={busy || !profileId || (chosen.length === 0 && !slider) || !sliderReady || (refmod && !refFits)} onClick={() => submit()}>

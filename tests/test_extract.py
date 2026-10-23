@@ -156,7 +156,7 @@ def test_an_extract_job_takes_the_checkpoint_at_its_step(tmp_path, monkeypatch):
     base, tuned, _, _ = finetuned(tmp_path)
     monkeypatch.setattr(trainer_mod, "get_family", lambda fid: TinyDriver)
     jobs = tmp_path / "jobs"
-    src = jobs / "src"
+    src = jobs / "ft_src"  # its folder, named after it
     (src / "output").mkdir(parents=True)
     # the finetune trained on after this was chosen, so its final model was renamed
     os.replace(tuned, src / "output" / "ft_000100.safetensors")
@@ -168,7 +168,7 @@ def test_an_extract_job_takes_the_checkpoint_at_its_step(tmp_path, monkeypatch):
         "settings": {"steps": 0, "extract_enabled": True, "extract_rank": 4,
                      "extract_source": str(src / "output" / "ft.safetensors"), "extract_base": base,
                      "extract_from": {"job_id": "src", "job_name": "ft", "file": "ft.safetensors", "step": 100,
-                                      "trigger": "sks"}}}))
+                                      "trigger": "sks", "folder": "ft_src"}}}))
     t = trainer_mod.Trainer(str(job))
     assert t.run_extract() == "completed"
     assert t.status["checkpoints"] == [{"step": 100, "file": "ft_r4.safetensors", "final": True}]
@@ -229,7 +229,7 @@ def test_a_finetune_checkpoint_is_queued_to_extract_a_lora(client, tmp_path, mon
     s = ex["config"]["settings"]
     assert ex["status"] == "queued" and ex["name"] == "ft_000200_r16" and ex["config"]["datasets"] == []
     assert s["extract_from"] == {"job_id": ft, "job_name": "ft", "file": "ft_000200.safetensors", "step": 200,
-                                 "trigger": "sks"}
+                                 "trigger": "sks", "folder": os.path.basename(job_dir(ft))}
     assert s["extract_base"] == base and s["extract_source"].endswith("ft_000200.safetensors")
     assert next(j for j in client.get("/api/jobs").json() if j["id"] == ex["id"])["extract"]
     # it's made again rather than edited, continued or scored

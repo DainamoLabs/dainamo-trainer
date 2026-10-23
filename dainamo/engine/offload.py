@@ -10,6 +10,16 @@ i.e. LoRA weights, stay on the GPU with their optimizer state. When a block is s
 module attributes are pointed at the CPU copies with *new* tensor objects; GPU tensors that autograd
 saved for backward stay alive exactly as long as autograd needs them.
 
+A finetune's blocks (``trainable``) are swapped whole, weights being trained included. Those are swapped
+through ``.data``, so the parameters the optimizer holds stay the ones the blocks use. Their optimizer steps
+during backward (``finetune.FusedOptimizer``), which tells the swapper first (``prepare_step``): the block is
+normally on the GPU for its recomputation by then, but a gradient that needs nothing saved (a bias added last)
+can arrive before that, and the block is then brought in early. A block that was stepped is copied back to RAM
+on the side stream when it's swapped out, before its next copy in reads it. Gradient checkpointing is
+required: its recomputation is what brings a block back for backward, and it saves a trained weight as a new
+tensor (``detach``), which pointing the parameter back at RAM leaves alone; without it, autograd would save
+the parameter itself.
+
 A block is normally swapped out by its forward hook, but non-reentrant gradient checkpointing stops
 the backward recomputation as soon as it has what it needs, so that hook never fires. Every block's
 pre-hook therefore also swaps out any other block still resident. Training needs gradient
@@ -35,12 +45,13 @@ import torch
 import torch.nn as nn
 
 
-def _frozen_tensors(block: nn.Module):
-    """(module, kind, name, tensor) for every frozen parameter and buffer in the block."""
+def _frozen_tensors(block: nn.Module, trainable: bool = False):
+    """(module, kind, name, tensor) for every frozen parameter and buffer in the block; ``trainable``: for
+    every parameter, kind "data" (swapped through ``.data``), and buffer."""
     for module in block.modules():
         for name, p in list(module._parameters.items()):
-            if p is not None and not p.requires_grad:
-                yield module, "param", name, p
+            if p is not None and (trainable or not p.requires_grad):
+                yield module, "data" if trainable else "param", name, p
         for name, b in list(module._buffers.items()):
             if b is not None:
                 yield module, "buffer", name, b
@@ -49,6 +60,8 @@ def _frozen_tensors(block: nn.Module):
 def _assign(module: nn.Module, kind: str, name: str, tensor: torch.Tensor):
     if kind == "param":
         module._parameters[name] = nn.Parameter(tensor, requires_grad=False)
+    elif kind == "data":
+        module._parameters[name].data = tensor
     else:
         module._buffers[name] = tensor
 
@@ -118,9 +131,10 @@ class PinnedArena:
 
 class BlockSwapper:
     def __init__(self, blocks: nn.ModuleList, num_swapped: int, device: torch.device, log=print,
-                 arena: PinnedArena | None = None):
+                 arena: PinnedArena | None = None, trainable: bool = False):
         self.blocks = blocks
         self.device = device
+        self.trainable = trainable
         n = len(blocks)
         num_swapped = max(0, min(int(num_swapped), n))
         self.swapped = list(range(n - num_swapped, n))
@@ -130,7 +144,9 @@ class BlockSwapper:
         self.resident: set[int] = set()  # swapped blocks currently pointed at GPU copies
         self.last = -1
         self.handles = []
-        frozen = {i: list(_frozen_tensors(blocks[i])) for i in self.swapped}
+        self.owner: dict[int, int] = {}  # a streamed block's parameter (id) -> the block's index
+        self.dirty: set[int] = set()  # streamed blocks stepped since they were copied in (a finetune's)
+        frozen = {i: list(_frozen_tensors(blocks[i], trainable)) for i in self.swapped}
         if arena is None:  # (one shared with other swappers was planned for all of their tensors)
             arena = PinnedArena([_nbytes(t) for i in self.swapped for *_, t in frozen[i]])
         for i, block in enumerate(blocks):
@@ -142,9 +158,10 @@ class BlockSwapper:
                     _assign(module, kind, name, cpu)
                     entries.append((module, kind, name, cpu))
                 self.cpu[i] = entries
+                self.owner.update((id(p), i) for p in block.parameters())
                 # trainable tensors (LoRA) live on the GPU regardless
                 for p in block.parameters():
-                    if p.requires_grad:
+                    if p.requires_grad and not trainable:
                         p.data = p.data.to(device)
                 self.handles.append(block.register_forward_pre_hook(self._make_pre(i)))
                 self.handles.append(block.register_forward_hook(self._make_post(i)))
@@ -152,7 +169,8 @@ class BlockSwapper:
                 block.to(device)
         if num_swapped:
             gb = sum(_nbytes(t) for e in self.cpu.values() for *_, t in e) / 1e9
-            log(f"  block swap: {n - num_swapped} of {n} blocks on the GPU, {num_swapped} streamed from RAM ({gb:.1f} GB)")
+            log(f"  block swap: {n - num_swapped} of {n} blocks on the GPU, {num_swapped} streamed from RAM ({gb:.1f} GB)"
+                + (", each copied back after its update" if trainable else ""))
 
     def _copy_in(self, i: int, stream) -> list:
         # The copies are allocated on the compute stream and only filled on the copy stream. Memory
@@ -177,9 +195,37 @@ class BlockSwapper:
         self.prefetched[i] = (event, tensors)
 
     def _release(self, i: int):
+        if i in self.dirty:
+            self._write_back(i)
         for mod, kind, name, cpu in self.cpu[i]:
             _assign(mod, kind, name, cpu)
         self.resident.discard(i)
+
+    def _write_back(self, i: int):
+        """Copy a stepped block's weights back to RAM, on the side stream once the steps are done, so the copy in
+        that reads them next is queued after it. Each GPU copy's memory is kept until it's been read."""
+        self.dirty.discard(i)
+        if self.stream is None:
+            for mod, kind, name, cpu in self.cpu[i]:
+                if kind == "data":
+                    cpu.copy_(mod._parameters[name].data)
+            return
+        self.stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(self.stream):
+            for mod, kind, name, cpu in self.cpu[i]:
+                if kind == "data":
+                    gpu = mod._parameters[name].data
+                    cpu.copy_(gpu, non_blocking=True)
+                    gpu.record_stream(self.stream)
+
+    def prepare_step(self, p: torch.Tensor):
+        """A finetune's optimizer is about to step ``p``: if it's a streamed block's, the block is brought to the GPU
+        (if a gradient came before its recomputation did), and its weights are copied back to RAM when it's
+        swapped out."""
+        i = self.owner.get(id(p))
+        if i is not None:
+            self._bring_in(i)
+            self.dirty.add(i)
 
     def _make_release(self, i: int):
         first = self.swapped[0] if self.swapped else None
@@ -192,18 +238,26 @@ class BlockSwapper:
                 self._prefetch(first)  # the last resident block runs while the first streamed one copies
         return hook
 
+    def _bring_in(self, i: int):
+        """Point block ``i`` at GPU copies: the one prefetched, or one made now. A block still on the GPU (left there
+        by a recomputation that stopped early, or brought in for a step) is used as it is: a finetune's copy there
+        may be newer than the one in RAM."""
+        if i in self.resident:
+            return
+        current = torch.cuda.current_stream(self.device)
+        if i in self.prefetched:
+            event, tensors = self.prefetched.pop(i)
+            current.wait_event(event)
+        else:
+            tensors = self._copy_in(i, current)
+        for (mod, kind, name, _), t in zip(self.cpu[i], tensors):
+            _assign(mod, kind, name, t)
+        self.resident.add(i)
+
     def _make_pre(self, i: int):
         def hook(module, args):
-            current = torch.cuda.current_stream(self.device)
-            if i in self.prefetched:
-                event, tensors = self.prefetched.pop(i)
-                current.wait_event(event)
-            else:
-                tensors = self._copy_in(i, current)
-            for (mod, kind, name, _), t in zip(self.cpu[i], tensors):
-                _assign(mod, kind, name, t)
-            self.resident.add(i)
-            direction = -1 if i < self.last else 1
+            self._bring_in(i)
+            direction = -1 if i <= self.last else 1  # (the same block again: backward has begun)
             self.last = i
             self._prefetch(i + direction)
         return hook
@@ -217,6 +271,13 @@ class BlockSwapper:
         """Swap out whatever a stopped recomputation left on the GPU (e.g. before sampling)."""
         for j in list(self.resident):
             self._release(j)
+
+    def settle(self):
+        """Swap everything out and wait for the copies back to RAM: the streamed blocks' weights there are then
+        up to date (to save them)."""
+        self.release_all()
+        if self.stream is not None:
+            self.stream.synchronize()
 
     def drop_prefetched(self):
         """Free copies made ahead of use (the copy stream finishes with them first)."""

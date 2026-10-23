@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { go } from "../App";
-import { api, fmtDuration, fmtTime, q, type Checkpoint, type DiskUse, type ExtractMade, type Job, type JobDetail, type JobDiskUse, type RefModMade } from "../api";
+import { api, fmtDuration, fmtTime, q, type Checkpoint, type DiskUse, type ExtractMade, type Job, type JobDetail, type JobDiskUse, type MergeMade, type RefModMade } from "../api";
 import { EvalPanel } from "../components/EvalPanel";
 import { EvaluateDialog } from "../components/EvalSettings";
 import { HardwareCards } from "../components/Hardware";
@@ -14,20 +14,21 @@ import { CLONE_KEY, formOf } from "./CreateJob";
 export const PHASES: Record<string, string> = {
   starting: "Starting", preparing: "Scanning datasets", caching_text: "Encoding captions", caching_latents: "Encoding training files",
   loading: "Loading model", rendering: "Rendering training images", training: "Training", sampling: "Sampling", evaluating: "Evaluating checkpoint", completed: "Completed", stopped: "Stopped", failed: "Failed",
-  encoding: "Making the RefMod", extracting: "Extracting the LoRA",
+  encoding: "Making the RefMod", extracting: "Extracting the LoRA", merging: "Merging the LoRAs",
 };
 
 function useJobAction() {
   const toast = useToast();
-  // a RefMod job (``refmod``) or an extracted LoRA's (``extract``) is made again from the start: "restart" asks
-  // about the file it made
-  return async (job: { id: string; name: string; evaluating?: boolean; refmod?: boolean; extract?: boolean }, action: string, after?: () => void) => {
+  // a RefMod job (``refmod``), an extracted LoRA's (``extract``) or a merged one's (``merge``) is made again from the
+  // start: "restart" asks about the file it made
+  return async (job: { id: string; name: string; evaluating?: boolean; refmod?: boolean; extract?: boolean; merge?: boolean }, action: string, after?: () => void) => {
     if (action === "restart" && !confirm(job.refmod ? `Make "${job.name}" again? The RefMod it made and its preview will be deleted.`
       : job.extract ? `Extract "${job.name}" again? The LoRA it made will be deleted.`
+      : job.merge ? `Merge "${job.name}" again? The LoRA it made will be deleted.`
       : `Restart "${job.name}" from step 0? Its checkpoints and samples will be deleted.`)) return;
     try {
       await api.post(`/api/jobs/${job.id}/action`, { action });
-      const again = job.refmod ? "Queued to be made again" : job.extract ? "Queued to be extracted again" : "";
+      const again = job.refmod ? "Queued to be made again" : job.extract ? "Queued to be extracted again" : job.merge ? "Queued to be merged again" : "";
       const msg: Record<string, string> = { stop: job.evaluating ? "Stopping the checkpoint evaluation" : again ? "Stopping" : "Stopping — saving state…", sample: "Sampling requested", save: "Checkpoint requested", resume: again || "Re-queued (resumes from last save)", restart: again || "Restarted" };
       if (msg[action]) toast(msg[action]);
       after?.();
@@ -57,6 +58,7 @@ function DiskCard({ job }: { job: JobDetail }) {
   const refmod = !!job.config?.settings?.refmod_enabled;
   const finetune = !!job.config?.settings?.finetune_enabled;
   const extract = !!job.config?.settings?.extract_enabled;
+  const merge = !!job.config?.settings?.merge_enabled;
   const clean = async (part: "cache" | "state") => {
     try {
       const r = await api.post<{ freed: number; kept: string[] }>("/api/disk/clean", { parts: [part], jobs: [job.id] });
@@ -67,12 +69,12 @@ function DiskCard({ job }: { job: JobDetail }) {
     }
   };
   const rows: [string, number, React.ReactNode][] = [
-    [refmod ? "RefMod" : finetune ? "Finetuned models" : extract ? "Extracted LoRA" : "LoRA checkpoints", disk.output, null],
-    ...(extract ? [] : [[refmod ? "Preview" : "Samples", disk.samples, null] as [string, number, React.ReactNode]]),
+    [refmod ? "RefMod" : finetune ? "Finetuned models" : extract ? "Extracted LoRA" : merge ? "Merged LoRA" : "LoRA checkpoints", disk.output, null],
+    ...(extract || merge ? [] : [[refmod ? "Preview" : "Samples", disk.samples, null] as [string, number, React.ReactNode]]),
     // a job's own cache is from before caches were shared between jobs
     ...(disk.cache > 0 ? [["Cached captions and latents (its own, from before they were shared)", disk.cache,
       finished && <button className="btn sm" onClick={() => setConfirm("cache")}>Clear</button>] as [string, number, React.ReactNode]] : []),
-    ...((refmod || extract) && !disk.state ? [] : [["Training state (to resume or continue)", disk.state,
+    ...((refmod || extract || merge) && !disk.state ? [] : [["Training state (to resume or continue)", disk.state,
       job.status === "completed" && finished && disk.state > 0 && <button className="btn sm" onClick={() => setConfirm("state")}>Delete</button>] as [string, number, React.ReactNode]]),
     ["Log, metrics and status", disk.other, null],
   ];
@@ -125,6 +127,7 @@ function JobRow({ j, reload, queuedIndex, queuedCount, size }: { j: Job; reload:
           {j.slider && <span>slider</span>}
           {j.refmod && <span>RefMod</span>}
           {j.extract && <span>LoRA from a finetune</span>}
+          {j.merge && <span>merged LoRA</span>}
           {j.network === "lokr" && !j.refmod && <span>LoKr</span>}
           {j.network === "full" && <span>finetune</span>}
           {j.datasets.length > 0 && <span>{j.datasets.join(", ")}</span>}
@@ -141,7 +144,7 @@ function JobRow({ j, reload, queuedIndex, queuedCount, size }: { j: Job; reload:
             {p.message && <div className="faint" style={{ marginTop: 4 }}>{p.message}</div>}
           </div>
         )}
-        {!(active && j.evaluating) && (active || ((p.step ?? 0) > 0 && !j.extract)) && (
+        {!(active && j.evaluating) && (active || ((p.step ?? 0) > 0 && !j.extract && !j.merge)) && (
           <div style={{ marginTop: 10 }}>
             <div className="row small" style={{ marginBottom: 5 }}>
               <span>{active ? PHASES[p.phase || ""] || p.phase : `Step ${p.step}`}{active && p.phase === "training" ? ` · step ${p.step} / ${p.total_steps}` : ""}</span>
@@ -164,14 +167,14 @@ function JobRow({ j, reload, queuedIndex, queuedCount, size }: { j: Job; reload:
         </>}
         {(j.status === "running" || j.status === "queued") && <button className="btn" onClick={() => act(j, "stop", reload)}><IconStop /> {j.status === "queued" ? "Cancel" : "Stop"}</button>}
         {j.status === "stopping" && <button className="btn danger" onClick={() => act(j, "stop", reload)}>Force stop</button>}
-        {["stopped", "failed", "interrupted"].includes(j.status) && <button className="btn primary" onClick={() => act(j, "resume", reload)}><IconPlay /> {j.refmod ? "Make again" : j.extract ? "Extract again" : "Resume"}</button>}
-        {!active && j.status !== "queued" && !j.extract && <button className="btn icon" title="Duplicate settings into a new job" onClick={() => cloneJob(j.id)}><IconCopy /></button>}
+        {["stopped", "failed", "interrupted"].includes(j.status) && <button className="btn primary" onClick={() => act(j, "resume", reload)}><IconPlay /> {j.refmod ? "Make again" : j.extract ? "Extract again" : j.merge ? "Merge again" : "Resume"}</button>}
+        {!active && j.status !== "queued" && !j.extract && !j.merge && <button className="btn icon" title="Duplicate settings into a new job" onClick={() => cloneJob(j.id)}><IconCopy /></button>}
         {!active && <button className="btn icon danger" title="Delete" onClick={() => setConfirmDel(true)}><IconTrash /></button>}
       </div>
       {confirmDel && (
         <ConfirmDialog title="Delete job" danger confirmLabel="Delete job" onClose={() => setConfirmDel(false)} onConfirm={remove}
           message={<>Remove <strong style={{ color: "var(--text)" }}>{j.name}</strong> from the queue?</>}
-          checkbox={j.refmod ? "Also delete its RefMod and preview from disk" : j.extract ? "Also delete its LoRA from disk"
+          checkbox={j.refmod ? "Also delete its RefMod and preview from disk" : j.extract || j.merge ? "Also delete its LoRA from disk"
             : j.network === "full" ? "Also delete its finetuned models and samples from disk"
             : "Also delete its LoRA checkpoints and samples from disk"} />
       )}
@@ -377,7 +380,7 @@ function ExtractCard({ job, made }: { job: JobDetail; made?: ExtractMade }) {
         <div className="kv"><span>Layers</span><span>{made.layers} as rank {made.rank} LoRAs, {made.whole} kept whole{made.unchanged ? `, ${made.unchanged} unchanged` : ""}</span></div>
         <div className="kv"><span>Change</span><span>the finetune moved the weights by {(100 * made.change).toFixed(2)}%</span></div>
       </>}
-      <div className="kv"><span>Finetuned</span><span className="ellipsis">{from.job_id ? <a href={`#/queue/${from.job_id}`}>{from.job_name}</a> : from.job_name}{" · "}<span className="mono">{made?.source || from.file}</span>{from.step ? ` (step ${from.step})` : ""}</span></div>
+      <div className="kv"><span>Finetuned</span><span className="ellipsis">{from.job_id && <><a href={`#/queue/${from.job_id}`}>{from.job_name}</a>{" · "}</>}<span className="mono">{made?.source || from.file || basename(s.extract_source)}</span>{from.step ? ` (step ${from.step})` : ""}</span></div>
       <div className="kv"><span>Original</span><span className="mono ellipsis">{made?.base || basename(s.extract_base)}</span></div>
       <div className="help" style={{ marginTop: 10 }}>
         What the finetune changed, as a LoRA: each weight matrix's change at rank {s.extract_rank} (its largest part), and the
@@ -386,6 +389,49 @@ function ExtractCard({ job, made }: { job: JobDetail; made?: ExtractMade }) {
         with the finetuned model in the Sandbox, and if it falls short, extract again at a higher rank. Saved in{" "}
         <span className="mono">{job.dir}/output/</span>; it's in the Sandbox's LoRAs, and ComfyUI loads it from{" "}
         <span className="mono">models/loras</span> on the original model.
+      </div>
+    </div>
+  );
+}
+
+/** What a merge job made: its LoRA, the LoRAs it merged at their strengths, and how much of their change it keeps. */
+function MergeCard({ job, made }: { job: JobDetail; made?: MergeMade }) {
+  const s = job.config?.settings || {};
+  const inputs: { path: string; strength: number }[] = s.merge_loras || [];
+  return (
+    <div className="card card-pad" style={{ marginBottom: 16 }}>
+      <h2>LoRA</h2>
+      {!made ? (
+        <div className="muted small" style={{ marginBottom: 8 }}>{job.status === "queued" ? "Not merged yet." : job.status === "running" ? "Being merged…" : "Not merged."}</div>
+      ) : <>
+        <div className="kv">
+          <span className="mono ellipsis">{made.file}</span>
+          <span className="row" style={{ gap: 8 }}>
+            <span className="faint small">{fmtSize(made.bytes)}</span>
+            <a className="btn sm" href={`/api/jobs/${job.id}/file/output/${made.file}`} download><IconDownload /></a>
+          </span>
+        </div>
+        <div className="kv"><span>Kept</span><span>{pct(made.kept)} of the merged change{made.worst ? ` · least in ${made.worst.name}: ${pct(made.worst.kept)}` : ""}</span></div>
+        <div className="kv"><span>Layers</span><span>{made.layers} as LoRAs{made.rank ? ` (${made.cut} cut to rank ${made.rank})` : ""}, {made.whole} kept whole</span></div>
+      </>}
+      {inputs.map((l, i) => {
+        const m = made?.inputs[i];
+        return (
+          <div className="kv" key={i}>
+            <span>{i === 0 ? "Merged" : ""}</span>
+            <span className="ellipsis"><span className="mono">{basename(l.path)}</span> × {l.strength}
+              {m && m.matched < m.layers ? <span className="faint"> · {m.matched} of its {m.layers} layers</span> : null}</span>
+          </div>
+        );
+      })}
+      <div className="help" style={{ marginTop: 10 }}>
+        {s.merge_rank
+          ? <>What the LoRAs do together, each layer's merged change cut to rank {s.merge_rank} (its largest part). Kept is how much of
+            the change it holds, by squared size. Compare it in the Sandbox with the LoRAs themselves at these strengths, and if it
+            falls short, merge again at a higher rank.</>
+          : <>What the LoRAs do together, exactly: their ranks added up. In the Sandbox it gives what they give together at these strengths.</>}
+        {" "}Saved in <span className="mono">{job.dir}/output/</span>; it's in the Sandbox's LoRAs, and ComfyUI loads it from{" "}
+        <span className="mono">models/loras</span>; use it at strength 1.
       </div>
     </div>
   );
@@ -418,6 +464,8 @@ function JobDetailView({ id, view }: { id: string; view?: string }) {
   const refmod = !!job.config?.settings?.refmod_enabled; // makes a RefMod: nothing is trained
   const finetune = !!job.config?.settings?.finetune_enabled; // trains the whole model: each checkpoint is one
   const extract = !!job.config?.settings?.extract_enabled; // extracts a LoRA from a finetune: nothing is trained
+  const merge = !!job.config?.settings?.merge_enabled; // merges LoRAs into one: nothing is trained
+  const once = refmod || extract || merge; // makes one file, made again rather than resumed, edited or continued
   const made = st.refmod;
   const jobPath = `${job.dir}/output/`;
   const checkpoints = st.checkpoints || [];
@@ -436,35 +484,36 @@ function JobDetailView({ id, view }: { id: string; view?: string }) {
           <div className="small"><a href="#/queue">Queue</a> <span className="faint">/</span></div>
           <div className="row"><h1 className="ellipsis">{job.name}</h1><StatusPill status={job.status} /></div>
           <p>{[job.config?.profile_name, slider && `slider: ${job.config?.settings?.slider_target}`, refmod && "RefMod",
-            !refmod && !finetune && !extract && job.config?.settings?.network_type === "lokr" && "LoKr", finetune && "finetune",
+            !once && !finetune && job.config?.settings?.network_type === "lokr" && "LoKr", finetune && "finetune",
             extract && `LoRA from a finetune, rank ${job.config?.settings?.extract_rank}`,
+            merge && `merged LoRA, ${job.config?.settings?.merge_rank ? `rank ${job.config.settings.merge_rank}` : "exact"}`,
             job.config?.datasets?.map((d: any) => d.name).join(", ")].filter(Boolean).join(" · ")} {job.assigned_gpu != null && `· GPU ${job.assigned_gpu}`}</p>
         </div>
         <div className="row">
           {running && !evaluating && <>
-            {!refmod && !extract && <>
+            {!once && <>
               <button className="btn" onClick={() => act(job, "sample")}><IconCamera /> Sample now</button>
               <button className="btn" onClick={() => act(job, "save")}><IconSave /> Save now</button>
             </>}
-            <button className="btn" onClick={() => act({ ...job, refmod, extract }, "stop", reload)}><IconStop /> Stop</button>
+            <button className="btn" onClick={() => act({ ...job, refmod, extract, merge }, "stop", reload)}><IconStop /> Stop</button>
           </>}
           {evaluating && ["queued", "running"].includes(job.status) && (
             <button className="btn" onClick={() => act({ ...job, evaluating }, "stop", reload)}><IconStop /> {job.status === "queued" ? "Cancel evaluation" : "Stop evaluation"}</button>
           )}
-          {!refmod && !extract && ["stopped", "failed", "interrupted"].includes(job.status) && <button className="btn primary" onClick={() => act(job, "resume", reload)}><IconPlay /> Resume</button>}
-          {!refmod && !extract && job.status === "completed" && !evaluating && job.resumable && (
+          {!once && ["stopped", "failed", "interrupted"].includes(job.status) && <button className="btn primary" onClick={() => act(job, "resume", reload)}><IconPlay /> Resume</button>}
+          {!once && job.status === "completed" && !evaluating && job.resumable && (
             <button className="btn" title="Train this job on for more steps, from where it finished" onClick={() => setExtend(true)}><IconPlay /> Continue training</button>
           )}
-          {!refmod && !finetune && !extract && !running && !evaluating && !["queued", "stopping"].includes(job.status) && (st.checkpoints || []).length > 0 && (
+          {!once && !finetune && !running && !evaluating && !["queued", "stopping"].includes(job.status) && (st.checkpoints || []).length > 0 && (
             <button className="btn" title="Score the saved checkpoints with the checkpoint picker and/or concept bleed, and recommend one" onClick={() => setEvaluate(true)}><IconTarget /> Evaluate checkpoints</button>
           )}
-          {!running && job.status !== "queued" && job.status !== "stopping" && (refmod || extract
-            ? <button className={`btn${job.status === "completed" ? "" : " primary"}`} onClick={() => act({ ...job, refmod, extract }, "restart", reload)}><IconRefresh /> {refmod ? "Make again" : "Extract again"}</button>
+          {!running && job.status !== "queued" && job.status !== "stopping" && (once
+            ? <button className={`btn${job.status === "completed" ? "" : " primary"}`} onClick={() => act({ ...job, refmod, extract, merge }, "restart", reload)}><IconRefresh /> {refmod ? "Make again" : extract ? "Extract again" : "Merge again"}</button>
             : <button className="btn" onClick={() => act(job, "restart", reload)}><IconRefresh /> Restart</button>)}
-          {!running && job.status !== "stopping" && !evaluating && !extract && (
+          {!running && job.status !== "stopping" && !evaluating && !extract && !merge && (
             <button className="btn" title="Change this job's settings" onClick={() => go("edit", job.id)}><IconEdit /> Edit</button>
           )}
-          {!running && !extract && <button className="btn" onClick={() => cloneJob(job.id)}><IconCopy /> Duplicate</button>}
+          {!running && !extract && !merge && <button className="btn" onClick={() => cloneJob(job.id)}><IconCopy /> Duplicate</button>}
         </div>
       </div>
 
@@ -498,6 +547,19 @@ function JobDetailView({ id, view }: { id: string; view?: string }) {
         {running && <div className="progress" style={{ marginBottom: 8 }}><div style={{ width: `${st.total_steps ? (100 * (st.step || 0)) / st.total_steps : 0}%` }} /></div>}
         {running && st.message && <div className="faint small" style={{ marginBottom: 16 }}>{st.message}</div>}
         <ExtractCard job={job} made={st.extract} />
+        <Terminal jobId={job.id} live={running || job.status === "stopping"}
+          alt={{ label: "Config", text: JSON.stringify(job.config, null, 2) }} />
+      </> : merge ? <>
+        <div className="stats" style={{ marginBottom: 16 }}>
+          <div className="stat"><div className="k">Phase</div><div className="v" style={{ fontSize: 15 }}>{PHASES[st.phase || ""] || st.phase || "Queued"}</div></div>
+          <div className="stat"><div className="k">Rank</div><div className="v" style={job.config?.settings?.merge_rank ? undefined : { fontSize: 15 }}>{job.config?.settings?.merge_rank || "Exact"}</div></div>
+          <div className="stat"><div className="k">Kept</div><div className="v">{st.merge ? pct(st.merge.kept) : "—"}</div></div>
+          <div className="stat"><div className="k">File size</div><div className="v" style={{ fontSize: 15 }}>{st.merge ? fmtSize(st.merge.bytes) : "—"}</div></div>
+          <div className="stat"><div className="k">Peak VRAM</div><div className="v">{st.vram_gb ? `${st.vram_gb} GB` : "—"}</div></div>
+        </div>
+        {running && <div className="progress" style={{ marginBottom: 8 }}><div style={{ width: `${st.total_steps ? (100 * (st.step || 0)) / st.total_steps : 0}%` }} /></div>}
+        {running && st.message && <div className="faint small" style={{ marginBottom: 16 }}>{st.message}</div>}
+        <MergeCard job={job} made={st.merge} />
         <Terminal jobId={job.id} live={running || job.status === "stopping"}
           alt={{ label: "Config", text: JSON.stringify(job.config, null, 2) }} />
       </> : <>
@@ -570,7 +632,7 @@ function JobDetailView({ id, view }: { id: string; view?: string }) {
       </>}
       </>}
 
-      {(refmod || extract) && <DiskCard job={job} />}
+      {once && <DiskCard job={job} />}
 
       {light && <Lightbox src={light} video={isVideoFile(light)} onClose={() => setLight(null)}
         audio={light.endsWith(".mp3") ? { poster: light.replace(/\.mp3$/, "_poster.png") } : undefined} />}

@@ -82,10 +82,9 @@ export type LowVram = { on: boolean; onChange: (on: boolean) => void };
 export function OffloadControl(props: {
   proj: VramProjection | null; value: number; onChange: (pct: number) => void; gpu: GpuTarget; compact?: boolean;
   lowVram?: LowVram | null; ram?: SystemRam | null;
-  offload?: boolean; // false: nothing can be offloaded (a finetune), so only the projection shows
+  finetune?: boolean; // offloaded blocks are trained as they stream, and copied back to RAM after
 }) {
-  const { proj, value, onChange, gpu, lowVram, ram } = props;
-  const fixed = props.offload === false;
+  const { proj, value, onChange, gpu, lowVram, ram, finetune } = props;
   const valid = proj && !proj.error && proj.blocks > 0;
   const streamed = valid ? streamedFor(proj, value) : 0;
   const phases = valid ? phaseTotals(proj, streamed) : [];
@@ -104,8 +103,8 @@ export function OffloadControl(props: {
     }
     onChange(100);
   };
-  const fullPeak = valid ? peakOf(proj, fixed ? 0 : proj.blocks) : null;
-  const lead = fixed ? "This won't fit" : "Even fully offloaded this won't fit";
+  const fullPeak = valid ? peakOf(proj, proj.blocks) : null;
+  const lead = "Even fully offloaded this won't fit";
   const fitsAtAll = valid && total ? (fullPeak?.total ?? 0) <= total : true;
   // fully offloaded, only encoding captions (the whole text encoder on the GPU) is still over
   const textBound = !!lowVram && !lowVram.on && fullPeak?.id === "captions";
@@ -116,21 +115,14 @@ export function OffloadControl(props: {
 
   return (
     <div className={"vram" + (props.compact ? " compact" : "")}>
-      {fixed ? (
-        <div className="vram-head">
-          <span className="vram-title">VRAM<Info text="A finetune trains the whole model in place on the GPU, so none of it can wait in system RAM." /></span>
-          <span className="vram-value muted">nothing offloaded</span>
-        </div>
-      ) : <>
-        <div className="vram-head">
-          <span className="vram-title">Layer offloading<Info text="Keeps this share of the diffusion model's blocks in system RAM and moves each to the GPU only while it runs: less VRAM, slower steps. Fit to GPU picks the lowest share that fits." /></span>
-          <span className="vram-value">
-            {value}%{valid && <span className="muted"> · {streamed} of {proj.blocks} blocks in system RAM</span>}
-          </span>
-        </div>
-        <input type="range" min={0} max={100} step={1} value={value} onChange={(e) => onChange(Number(e.target.value))}
-          aria-label="Share of the diffusion model's blocks kept in system RAM" />
-      </>}
+      <div className="vram-head">
+        <span className="vram-title">Layer offloading<Info text="Keeps this share of the diffusion model's blocks in system RAM and moves each to the GPU only while it runs: less VRAM, slower steps. Fit to GPU picks the lowest share that fits." /></span>
+        <span className="vram-value">
+          {value}%{valid && <span className="muted"> · {streamed} of {proj.blocks} blocks in system RAM</span>}
+        </span>
+      </div>
+      <input type="range" min={0} max={100} step={1} value={value} onChange={(e) => onChange(Number(e.target.value))}
+        aria-label="Share of the diffusion model's blocks kept in system RAM" />
       {lowVram && (
         <label className="switch-row">
           <span className="switch">
@@ -154,7 +146,7 @@ export function OffloadControl(props: {
               ≈ {peak.total.toFixed(1)} GB peak{total ? ` of ${total.toFixed(1)} GB` : ""}
               {state === "over" ? " — won't fit" : state === "tight" ? " — tight" : ""}
             </span>
-            {total > 0 && !fixed && <button className="btn sm" type="button" onClick={fit} title="Lowest offload that fits, with a little headroom">Fit to GPU</button>}
+            {total > 0 && <button className="btn sm" type="button" onClick={fit} title="Lowest offload that fits, with a little headroom">Fit to GPU</button>}
           </div>
           {!props.compact && (
             <div className="vram-legend">
@@ -166,12 +158,12 @@ export function OffloadControl(props: {
           <div className="help">
             {gpu ? `Compared with ${gpu.label}. ` : ""}
             {phases.length > 1 && <>By phase: {phases.map((ph) => `${ph.label.toLowerCase()} ${ph.total.toFixed(1)} GB`).join(" · ")}. </>}
-            {streamed > 0 && <>Offloaded blocks take {ramGb.toFixed(1)} GB of pinned system RAM and are copied to the GPU again each step, alongside the computation; steps slow down only when the copies take longer than the compute. </>}
+            {streamed > 0 && <>Offloaded blocks take {ramGb.toFixed(1)} GB of pinned system RAM and are copied to the GPU again each step{finetune ? ", and back once they're updated" : ""}, alongside the computation; steps slow down only when the copies take longer than the compute. </>}
             {!fitsAtAll && (textBound
               ? <span className="validation error" style={{ display: "inline" }}>{lead}: encoding the text takes {fullPeak?.total.toFixed(1)} GB with the whole text encoder on the GPU. Turn on Low VRAM to stream it. </span>
               : stepBound
-                ? <span className="validation error" style={{ display: "inline" }}>{lead}: a training step takes {fullPeak?.total.toFixed(1)} GB. Turn on Low VRAM to keep its saved activations in system RAM, or lower the resolution, batch size or frame count{fixed ? " (or use Adafactor)" : ""}. </span>
-                : <span className="validation error" style={{ display: "inline" }}>{lead}; lower the resolution, batch size or frame count{fixed ? " (or use Adafactor)" : ""}. </span>)}
+                ? <span className="validation error" style={{ display: "inline" }}>{lead}: a training step takes {fullPeak?.total.toFixed(1)} GB. Turn on Low VRAM to keep its saved activations in system RAM, or lower the resolution, batch size or frame count{finetune ? " (or use Adafactor)" : ""}. </span>
+                : <span className="validation error" style={{ display: "inline" }}>{lead}; lower the resolution, batch size or frame count{finetune ? " (or use Adafactor)" : ""}. </span>)}
           </div>
           {ramPeak && (
             <div className="help">

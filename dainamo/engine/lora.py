@@ -343,6 +343,29 @@ def adapter_layers(sd: dict[str, torch.Tensor]) -> list[tuple[str, Frozen]]:
     return [(next((n[len(p):] for p in LORA_PREFIXES if n.startswith(p)), n), f) for n, f in out]
 
 
+def linear_names(model: nn.Module) -> dict[str, str]:
+    """{module name with its dots as underscores: module name} for a model's Linears (``from_kohya``)."""
+    return {n.replace(".", "_"): n for n, m in model.named_modules() if hasattr(m, "in_features")}
+
+
+def from_kohya(sd: dict, names: dict[str, str]) -> dict:
+    """kohya-style ``lora_unet_<path_with_underscores>.lora_down/lora_up`` (or ``.lokr_w1`` ...) -> PEFT keys,
+    resolving the underscored path with ``names`` (``linear_names``); keys it can't resolve are left out. The
+    values (tensors, or anything else) are kept as they are."""
+    out = {}
+    for key, v in sd.items():
+        stem, _, rest = key.partition(".")
+        prefix = next((p for p in KOHYA_PREFIXES if stem.startswith(p)), None)
+        if prefix is None:
+            continue
+        name = names.get(stem[len(prefix):])
+        if name is None:
+            continue
+        rest = {"lora_down.weight": "lora_A.weight", "lora_up.weight": "lora_B.weight"}.get(rest, rest)
+        out[f"{name}.{rest}"] = v
+    return out
+
+
 def _wrap_existing(model: nn.Module, name: str, wrappers: dict) -> LoRALinear | None:
     """A rank-0 wrapper (adapters only) around ``name``, or None if it isn't a Linear of this model."""
     try:
@@ -429,21 +452,7 @@ class AdapterStack:
         self.patched = on
 
     def _from_kohya(self, sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """kohya-style ``lora_unet_<path_with_underscores>.lora_down/lora_up`` (or ``.lokr_w1`` ...) -> PEFT
-        keys, resolving the underscored path against this model's module names."""
-        names = {n.replace(".", "_"): n for n, m in self.model.named_modules() if hasattr(m, "in_features")}
-        out = {}
-        for key, v in sd.items():
-            stem, _, rest = key.partition(".")
-            prefix = next((p for p in KOHYA_PREFIXES if stem.startswith(p)), None)
-            if prefix is None:
-                continue
-            name = names.get(stem[len(prefix):])
-            if name is None:
-                continue
-            rest = {"lora_down.weight": "lora_A.weight", "lora_up.weight": "lora_B.weight"}.get(rest, rest)
-            out[f"{name}.{rest}"] = v
-        return out
+        return from_kohya(sd, linear_names(self.model))
 
     def set(self, loras: list[tuple[str, dict[str, torch.Tensor], float]]) -> list[dict]:
         """Apply [(label, state dict, strength)]; returns [{label, matched, total}] per LoRA. A file that

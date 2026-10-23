@@ -33,7 +33,7 @@ Besides a LoRA, a job can make:
 
 - a LoKr: **Network** under Training ([LoKr](lokr.md));
 - a slider, for image models: **Slider** under Train ([Sliders](sliders.md));
-- a finetune, for MOSS-Image: **Finetune** under Train
+- a finetune, for MOSS-Image and Krea 2: **Finetune** under Train
   ([Full finetuning](finetuning.md));
 - a RefMod, for MiniMax H3: **RefMod** under Make ([RefMods](refmods.md)).
 
@@ -53,6 +53,10 @@ click a sample to enlarge it; the arrow keys step through training
 (left/right) and prompts (up/down). Checkpoints has the saved checkpoints with
 download links, the checkpoint picker's results and the job's disk use. A
 failed job opens on Log.
+
+A job's files are in `data/jobs/<name>_<id>/`, named when the job is added;
+renaming the job later doesn't move them. Jobs added before folders had names
+keep `data/jobs/<id>/`.
 
 You can stop a job (it saves its state), resume or restart it, take samples or a
 checkpoint now, or duplicate its settings into a new job.

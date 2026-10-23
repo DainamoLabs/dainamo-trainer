@@ -20,8 +20,9 @@ Each phase also lists the system RAM it holds (``ram_totals``): its ``ram`` part
 model's streamed blocks (``model_ram`` "streamed", the default for a phase with the model) or all of it
 ("all": parked while samples decode), plus the process itself.
 
-A full finetune (``engine.finetune``) holds the whole model in bf16, quantized layers expanded, with nothing
-offloaded; its optimizer state is the trained part beside it.
+A full finetune (``engine.finetune``) holds the whole model in bf16, quantized layers expanded; its optimizer
+state is the trained part beside it. Its offloaded blocks train as they stream, and a stepped block's copy stays
+on the GPU until it's copied back to RAM: one more block in flight.
 """
 
 from __future__ import annotations
@@ -311,12 +312,12 @@ def project(driver_cls, profile: dict, settings: dict, kind: str = "train") -> d
         batch = int(settings.get("batch_size", 1) or 1)
         rank = int(settings.get("rank", 32) or 32)
         net = settings.get("network_type") or "lora"
-        if finetune:  # the trained weights are the model's, counted with it; no adapter
+        if finetune:  # the trained weights are the model's, counted with it, beside the training adapter (if any)
             model = {k: v for k, v in shapes.items() if not k.startswith(driver_cls.text_encoder_parts or ("\0",))}
             params, opt, update = finetune_parts(model, settings.get("optimizer", "adafactor"))
             name, lora, weights = "Weight updates", update, 0
-            notes.append(f"A finetune trains every weight, in bf16 on the GPU (nothing offloaded), and saves the "
-                         f"whole model each time: about {params * 2 / 1e9:.1f} GB a file.")
+            notes.append(f"A finetune trains every weight in bf16 and saves the whole model each time: about "
+                         f"{params * 2 / 1e9:.1f} GB a file.")
             if any(dt in QUANT_DTYPES for k, (dt, _) in model.items() if not k.endswith(DROPPED_SUFFIXES)):
                 notes.append("The model file is quantized: its layers are expanded to bf16 to train, so its rounding "
                              "is trained in. The bf16 release trains better.")
@@ -328,8 +329,10 @@ def project(driver_cls, profile: dict, settings: dict, kind: str = "train") -> d
             opt = params * OPTIMIZER_BYTES.get(settings.get("optimizer", "adamw8bit"), 8)
         n_tok = max(tokens(r, r, f) for r, f in sizes) * batch
         saved = n_tok * len(blocks) * mem.saved if offload_saved and mem is not None else 0
+        # a finetune's training adapter, apart from its weights (a LoRA's is counted with it)
+        beside = [["Training adapter", adapter / GB]] if finetune and adapter else []
         phases.append({"id": "training", "label": "Training step", "model": True, "parts": [
-            [name, lora / GB], ["Optimizer", opt / GB], ["Activations", activations(n_tok, True) / GB]],
+            [name, lora / GB], ["Optimizer", opt / GB], *beside, ["Activations", activations(n_tok, True) / GB]],
             "ram": [["Saved activations", saved / GB]] if saved else []})
         if saved:
             notes.append(f"Low VRAM: training steps keep the blocks' saved activations ({saved / GB:.1f} GB at "
@@ -339,7 +342,7 @@ def project(driver_cls, profile: dict, settings: dict, kind: str = "train") -> d
         if mem is not None:
             decode = _vae_work(mem.vae_decode, sw * sh * sf, mem.decode_tile_pixels)
             infer = activations(tokens(sw, sh, sf), False)
-            held = [] if finetune else [[name, weights / GB]]  # a finetune's are the model's
+            held = beside if finetune else [[name, weights / GB]]  # a finetune's are the model's
             if low_vram:  # denoise with the optimizer state in RAM, then decode with the model and LoRA there too
                 # sample cards with images (a first frame, references) have the VAE encode them while sampling
                 cards = [c for c in settings.get("sample_prompts") or [] if isinstance(c, dict)]
@@ -353,7 +356,7 @@ def project(driver_cls, profile: dict, settings: dict, kind: str = "train") -> d
                                "ram": [*([] if finetune else [[name, params * 4 / GB]]), ["Optimizer", opt / GB]]})
             else:
                 phases.append({"id": "sampling", "label": "Sampling", "model": True, "parts": [
-                    ["Optimizer" if finetune else f"{name} + optimizer", (opt if finetune else lora + opt) / GB],
+                    *([["Optimizer", opt / GB], *beside] if finetune else [[f"{name} + optimizer", (lora + opt) / GB]]),
                     ["VAE", vae / GB], ["Working memory", max(infer, decode) / GB]]})
             phases.append({"id": "latents", "label": "Encoding images", "model": False, "parts": [
                 ["VAE", vae / GB], ["Working memory", _vae_work(mem.vae_encode, max(r * r * f for r, f in sizes)) / GB]]})
@@ -393,10 +396,10 @@ def project(driver_cls, profile: dict, settings: dict, kind: str = "train") -> d
         phases.append({"id": "captions", "label": "Encoding captions" if kind == "train" else "Encoding the prompt",
                        "model": False, "model_ram": "streamed" if kind != "train" else None, "parts": parts,
                        "ram": ram})
-    return _projection(mem, phases, notes, resident, blocks, params)
+    return _projection(mem, phases, notes, resident, blocks, params, IN_FLIGHT_BLOCKS + (1 if finetune else 0))
 
 
-def _projection(mem, phases, notes, resident, blocks, params) -> dict:
+def _projection(mem, phases, notes, resident, blocks, params, in_flight: int = IN_FLIGHT_BLOCKS) -> dict:
     if mem is None:
         notes.append("No activation measurements for this model yet, so the projection counts weights only.")
     biggest = max(blocks) if blocks else 0
@@ -404,7 +407,7 @@ def _projection(mem, phases, notes, resident, blocks, params) -> dict:
         "blocks": len(blocks),
         "block_gb": [b / GB for b in blocks],
         "resident_gb": resident / GB,
-        "inflight_gb": IN_FLIGHT_BLOCKS * biggest / GB,
+        "inflight_gb": in_flight * biggest / GB,
         "context_gb": CONTEXT_BYTES / GB,
         "fragmentation": FRAGMENTATION,
         "model_gb": (resident + sum(blocks)) / GB,

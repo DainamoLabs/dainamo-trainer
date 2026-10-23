@@ -289,7 +289,8 @@ class FamilyDriver:
         """Load the diffusion model, keeping quantized layers quantized. With ``offload`` set, the
         last blocks are read to system RAM and streamed in as they run (``self.swapper``);
         everything else is read straight to the GPU, so the whole model never sits in RAM at once.
-        ``trainable`` (a full finetune): quantized layers are expanded to bf16 instead, and nothing is streamed."""
+        ``trainable`` (a full finetune): quantized layers are expanded to bf16 instead, and the streamed blocks are
+        trained as they stream (``offload.BlockSwapper``'s ``trainable``)."""
         import gc
 
         from .. import comfy_io
@@ -302,7 +303,7 @@ class FamilyDriver:
         model = self.build_transformer(shapes)
         blocks = model.get_submodule(self.block_list)
         n = len(blocks)
-        k = 0 if trainable else self.streamed_blocks(n)
+        k = self.streamed_blocks(n)
         streamed = tuple(f"{self.block_list}.{i}." for i in range(n - k, n))
         opts = {"strip_prefix": prefix or None, "only_prefixed": bool(prefix),
                 "cast_to": lambda key: self.transformer_dtype_for(key) or self.dtype}
@@ -328,7 +329,7 @@ class FamilyDriver:
         else:
             self.log(f"  {n} blocks; " + (f"{n_quant} layers kept quantized ({', '.join(kinds)})" if n_quant
                                           else "bf16 weights"))
-        self.swapper = BlockSwapper(blocks, k, self.device, self.log) if k else None
+        self.swapper = BlockSwapper(blocks, k, self.device, self.log, trainable=trainable) if k else None
         return model
 
     def sample_timesteps(self, batch: int, latent_hw: tuple[int, int], settings: dict) -> torch.Tensor: ...
