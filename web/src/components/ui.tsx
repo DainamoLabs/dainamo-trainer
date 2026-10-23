@@ -81,16 +81,19 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
 }
 
 // ---- polling -------------------------------------------------------------
-export function usePoll<T>(url: string | null, ms: number, deps: unknown[] = []): [T | null, () => void, string | null] {
-  const [data, setData] = useState<T | null>(null);
-  const [err, setErr] = useState<string | null>(null);
+/** ``url``'s answer, fetched now and every ``ms`` (0: once, and again when ``deps`` change), a reload, and the last
+ * error. Nothing is fetched while ``url`` is null. The last answer stays while a new url loads, unless ``fresh``: then
+ * the answer and error are only ever the current url's (none while it's null or loading). */
+export function usePoll<T>(url: string | null, ms: number, deps: unknown[] = [], fresh = false): [T | null, () => void, string | null] {
+  const [data, setData] = useState<{ url: string; v: T } | null>(null);
+  const [err, setErr] = useState<{ url: string; msg: string } | null>(null);
   const tick = useRef(0);
   const load = useCallback(() => {
     if (!url) return;
     const my = ++tick.current;
     api.get<T>(url).then(
-      (d) => { if (my === tick.current) { setData(d); setErr(null); } },
-      (e) => my === tick.current && setErr(String(e.message || e)),
+      (d) => { if (my === tick.current) { setData({ url, v: d }); setErr(null); } },
+      (e) => my === tick.current && setErr({ url, msg: String(e.message || e) }),
     );
   }, [url]);
   useEffect(() => {
@@ -100,7 +103,8 @@ export function usePoll<T>(url: string | null, ms: number, deps: unknown[] = [])
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [load, ms, ...deps]);
-  return [data, load, err];
+  const mine = (x: { url: string } | null) => !!x && (!fresh || x.url === url);
+  return [mine(data) ? data!.v : null, load, mine(err) ? err!.msg : null];
 }
 
 // ---- file browser ----------------------------------------------------------
@@ -473,7 +477,8 @@ export function Empty({ icon, title, children, action }: { icon: React.ReactNode
   );
 }
 
-/** Picking several cards at once: Select starts it; Done (or Esc) ends it and forgets what was picked. */
+/** Picking several cards at once: Select starts it; Done (or Esc) ends it and forgets what was picked. Esc in a dialog
+ * or an enlarged file closes that, not this. */
 export function useSelection() {
   const [on, setOn] = useState(false);
   const [picked, setPicked] = useState<Set<string>>(new Set());
@@ -485,7 +490,7 @@ export function useSelection() {
   });
   useEffect(() => {
     if (!on) return;
-    const key = (e: KeyboardEvent) => { if (e.key === "Escape" && !document.querySelector(".modal-bg")) stop(); };
+    const key = (e: KeyboardEvent) => { if (e.key === "Escape" && !document.querySelector(".modal-bg, .lightbox")) stop(); };
     window.addEventListener("keydown", key);
     return () => window.removeEventListener("keydown", key);
   }, [on]);

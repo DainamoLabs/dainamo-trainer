@@ -186,7 +186,10 @@ def adapter_bytes(path: str) -> int | None:
             local = None
         if not isinstance(local, str):
             return None
-    return sum(_numel(shape) * 2 for k, (_, shape) in tensors(local).items() if k.endswith(".weight"))
+    # every tensor ``lora.adapter_layers`` loads (a LoRA's lora_A/lora_B, a LoKr's lokr_w1/lokr_w2 or their low-rank
+    # halves, whole changes' diff/diff_b), but not the alphas, which it reads as numbers
+    return sum(_numel(shape) * 2 for k, (_, shape) in tensors(local).items()
+               if not k.endswith(".alpha") and _numel(shape) > 1)
 
 
 def model_weights(driver_cls, path: str, expand: bool = False):
@@ -258,6 +261,14 @@ def decode_bytes(driver, width: int, height: int, frames: int = 1, loaded: bool 
     return int(work) + (0 if loaded else vae_bytes(driver, driver.profile))
 
 
+def encode_bytes(driver_cls, profile: dict, pixels: int, loaded: bool = False) -> int:
+    """VRAM VAE-encoding ``pixels`` (width × height × frames) takes: its working memory, and the VAE unless it's
+    ``loaded``."""
+    mem = driver_cls.memory
+    work = _vae_work(mem.vae_encode, pixels, mem.encode_tile_pixels) if mem else 2 * GB
+    return int(work) + (0 if loaded else vae_bytes(driver_cls, profile))
+
+
 def project(driver_cls, profile: dict, settings: dict, kind: str = "train") -> dict:
     """VRAM projection for a training job (``kind="train"``, ``settings`` as the job's) or a Sandbox
     generation (``kind="sample"``: width, height, frames, loras). Sizes are in GB."""
@@ -303,12 +314,14 @@ def project(driver_cls, profile: dict, settings: dict, kind: str = "train") -> d
                               tokens, activations)
     if kind == "train":
         frames = int(settings.get("num_frames", 1) or 1) if video else 1
-        # each dataset at its largest size, clips at the clip length (``datasets``: [{resolution, video}];
-        # without it, everything at the job's largest size); the biggest of them sets the peak
+        # each dataset at its largest size, clips at the clip length, with the most reference images a file of it
+        # trains with (``datasets``: [{resolution, video, refs}]; without it, everything at the job's largest size);
+        # the biggest of them sets the peak
         default = settings.get("resolution") or 1024
-        sizes = [(max(resolutions(d.get("resolution") or default)), frames if d.get("video") else 1)
-                 for d in settings.get("datasets") or []] or [(max(resolutions(default)), frames)]
-        res = max(r for r, _ in sizes)
+        sizes = [(max(resolutions(d.get("resolution") or default)), frames if d.get("video") else 1,
+                  max(0, int(d.get("refs") or 0) - driver_cls.references_counted))
+                 for d in settings.get("datasets") or []] or [(max(resolutions(default)), frames, 0)]
+        res = max(r for r, _, _ in sizes)
         batch = int(settings.get("batch_size", 1) or 1)
         rank = int(settings.get("rank", 32) or 32)
         net = settings.get("network_type") or "lora"
@@ -327,7 +340,7 @@ def project(driver_cls, profile: dict, settings: dict, kind: str = "train") -> d
             lora = params * 8 + adapter  # fp32 weights and gradients, plus the adapter
             weights = params * 4 + adapter  # while sampling: no gradients
             opt = params * OPTIMIZER_BYTES.get(settings.get("optimizer", "adamw8bit"), 8)
-        n_tok = max(tokens(r, r, f) for r, f in sizes) * batch
+        n_tok = max(tokens(r, r, f) + refs * driver_cls.reference_tokens(r, r) for r, f, refs in sizes) * batch
         saved = n_tok * len(blocks) * mem.saved if offload_saved and mem is not None else 0
         # a finetune's training adapter, apart from its weights (a LoRA's is counted with it)
         beside = [["Training adapter", adapter / GB]] if finetune and adapter else []
@@ -359,7 +372,7 @@ def project(driver_cls, profile: dict, settings: dict, kind: str = "train") -> d
                     *([["Optimizer", opt / GB], *beside] if finetune else [[f"{name} + optimizer", (lora + opt) / GB]]),
                     ["VAE", vae / GB], ["Working memory", max(infer, decode) / GB]]})
             phases.append({"id": "latents", "label": "Encoding images", "model": False, "parts": [
-                ["VAE", vae / GB], ["Working memory", _vae_work(mem.vae_encode, max(r * r * f for r, f in sizes)) / GB]]})
+                ["VAE", vae / GB], ["Working memory", _vae_work(mem.vae_encode, max(r * r * f for r, f, _ in sizes)) / GB]]})
         if not checkpointing:
             notes.append("Gradient checkpointing is off: every block's activations stay in VRAM, and "
                          "offloading saves little.")

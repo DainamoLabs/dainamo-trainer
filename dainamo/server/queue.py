@@ -30,6 +30,7 @@ from . import db, procs
 JOBS_DIR = os.path.join(db.DATA_DIR, "jobs")
 CACHE_DIR = os.path.join(db.DATA_DIR, "cache")  # encoded items and captions, shared by jobs (``engine.cache``)
 EXIT_CODES = {"completed": 0, "stopped": 3}
+STOP_GRACE = 180  # seconds a job asked to stop has to save its state before it's killed
 
 
 _folders: dict[str, str] = {}  # job id -> its folder's name, which never changes
@@ -110,6 +111,8 @@ class Scheduler:
         for j in db.query("SELECT * FROM jobs WHERE status IN ('running','stopping')"):
             if j["pid"] and procs.is_trainer(j["pid"], j["id"]):
                 self.procs[j["id"]] = _Detached(j["pid"], j["id"])
+                if j["status"] == "stopping":  # asked before the restart, when isn't kept: it gets the time from now
+                    self.stop_deadline[j["id"]] = time.time() + STOP_GRACE
             elif "evaluate" in (j["config"] or {}):
                 notify.evaluation_ended(j["id"], end_evaluation(j["id"], j["config"]))
             else:
@@ -196,9 +199,7 @@ class Scheduler:
                 candidates = sorted(usable, key=lambda g: load.get(g, 0))
             candidates = [g for g in candidates if g != reserved]
             gpu = next((g for g in candidates if load.get(g, 0) < per_gpu), None)
-            if gpu is None:
-                if mode == "sequential":
-                    break  # strict FIFO
+            if gpu is None:  # pinned to a GPU that's busy or reserved: the next job in line goes first
                 continue
             if sbx.sandbox.occupies(gpu):  # one GPU: training comes first, the Sandbox unloads
                 sbx.sandbox.yield_gpu()
@@ -247,7 +248,7 @@ class Scheduler:
             elif job["status"] == "running":
                 send_control(job_id, "stop")
                 # give it time to save state, then force
-                self.stop_deadline[job_id] = time.time() + 180
+                self.stop_deadline[job_id] = time.time() + STOP_GRACE
                 db.execute("UPDATE jobs SET status='stopping' WHERE id=?", (job_id,))
             elif job["status"] == "stopping" and job_id in self.procs:
                 procs.kill_tree(self.procs[job_id].pid)

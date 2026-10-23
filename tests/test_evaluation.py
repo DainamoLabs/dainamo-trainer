@@ -145,6 +145,44 @@ def test_bleed_measures_movement_toward_dataset_and_drift_measures_change(tmp_pa
     assert calls == []
 
 
+def test_a_resumed_finetune_never_renders_its_baseline(tmp_path, monkeypatch):
+    """The base references render at LoRA strength 0, which a finetune ignores: resumed, its weights are a
+    checkpoint's, so without the references from step 0 the probe is off (and the picker stops counting bleed)
+    rather than measuring against the wrong baseline. With them on disk, it carries on."""
+    from types import SimpleNamespace
+
+    from dainamo.engine.trainer import Trainer
+
+    monkeypatch.setattr(evaluation, "DinoEmbedder", lambda device: lambda images: torch.ones(len(images), 3))
+    train = tmp_path / "train.png"
+    Image.new("RGB", (8, 8), (255, 255, 0)).save(train)
+    rendered, lines = [], []
+    t = Trainer.__new__(Trainer)
+    t.s, t.job_dir, t.device, t.log = {"bleed_enabled": True}, str(tmp_path), "cpu", lines.append
+    t.validator = t.probe = None
+    t.render_media = lambda model, network, specs: rendered.append(specs) or [Image.new("RGB", (8, 8))] * len(specs)
+    driver, items = SimpleNamespace(bucket_divisibility=16), [SimpleNamespace(path=str(train))]
+    t.make_evaluators(driver, None, None, items, [], [], ["fruit bowl"], base_weights=False)
+    assert t.probe is None and rendered == []
+    assert lines == ["Concept bleed: no baseline images from step 0, so the probe is off for this resumed finetune"]
+    # the picker's choice: a checkpoint the probe didn't measure isn't kept out as if it were over the limit
+    t.s = {"bleed_enabled": True, "picker_enabled": True, "bleed_max": 25}
+    t.status = {"checkpoints": [{"file": "a_100"}, {"file": "a_200"}]}
+    t.ev = {"evals": [{"step": 100, "file": "a_100", "val_loss": 0.2, "bleed": 10.0},
+                      {"step": 200, "file": "a_200", "val_loss": 0.1}], "recommended": None}
+    t.update_recommendation()
+    assert t.ev["recommended"]["file"] == "a_200"
+
+    # a fresh start renders them; resumed, they're used again
+    t.s = {"bleed_enabled": True}
+    t.make_evaluators(driver, None, None, items, [], [], ["fruit bowl"])
+    assert len(rendered) == 1 and all(sp["lora_scale"] == 0.0 for sp in rendered[0]) and t.probe.has_references()
+    rendered.clear()
+    t.probe = None
+    t.make_evaluators(driver, None, None, items, [], [], ["fruit bowl"], base_weights=False)
+    assert t.probe is not None and t.probe.base is not None and rendered == []
+
+
 def test_multi_resolution_items_cache_keys_and_holdout(tmp_path):
     import hashlib
 

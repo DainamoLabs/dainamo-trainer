@@ -1,11 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { go } from "../App";
-import { api, byFamily, type Dataset, type Family, type Gpu, type JobDetail, type Profile, type SystemRam } from "../api";
-import { CheckIssues, useDatasetCheck } from "../components/DatasetCheck";
+import { api, byFamily, type Dataset, type Family, type FamilySources, type Gpu, type JobDetail, type Profile, type SystemRam } from "../api";
+import { type CheckPairs, CheckIssues, PairSummary, useDatasetCheck } from "../components/DatasetCheck";
 import { EVAL_DEFAULTS, EvalSettings, evalCost } from "../components/EvalSettings";
+import { REFMOD_CONCEPTS, REFMOD_INFO } from "../components/MakeRefMod";
+import { PairsDialog } from "../components/Pairs";
 import { IconPlay, IconPlus, IconSave, IconX } from "../components/icons";
 import { ConfirmDialog, ImagesInput, Info, Num, ProfileOptions, usePoll, useToast } from "../components/ui";
-import { OffloadControl, gpuTarget, peakOf, streamedFor, useVramProjection } from "../components/Vram";
+import { MemoryEstimate, gpuTarget, useVramProjection } from "../components/Vram";
 
 type S = Record<string, any>;
 
@@ -54,10 +56,6 @@ const KINDS: [Kind, string, string][] = [
   ["finetune", "Finetune", "Trains every weight of the model itself rather than an adapter beside it: the most it can learn, for many concepts at once or a large dataset. Each save is a new diffusion-model file as big as the model, which ComfyUI loads in place of the original. It needs far more VRAM and disk than a LoRA, and a much lower learning rate."],
   ["refmod", "RefMod", "Your datasets' images and clips, or their sound, encoded once into a reference file, which the reference-to-video model (ref2va) takes as it takes reference images or reference audio, without encoding them again. Nothing is trained: it takes minutes, with only a VAE loaded. ComfyUI loads it with the ComfyUI-MiniMaxH3Mod nodes."],
 ];
-const CONCEPTS: [string, string][] = [
-  ["generic", "Generic"], ["identity", "Identity · a person or character"], ["pose_motion", "Pose & motion"],
-  ["clothing", "Clothing"], ["background", "Background"], ["style", "Style"],
-];
 const AUDIO_CONCEPTS: [string, string][] = [
   ["voice", "Voice"], ["singing", "Singing"], ["music_style", "Music style"], ["sound_fx", "Sound effect"],
   ["ambience", "Ambience"], ["generic", "Generic"],
@@ -70,8 +68,11 @@ const refFrames = (frames: number) => (frames < 5 ? 1 : Math.floor((frames - 5) 
 const INFO = {
   profile: "The model files to train with (the model, its text encoder and VAE), set up on the Profiles page.",
   gpu: "Auto starts the job on whichever of the GPUs chosen in Settings is least busy. Picking one makes the job wait for that GPU.",
+  outputName: "What the saved files are called (name.safetensors, name_000250.safetensors, …). Blank: the job's name.",
+  saveEvery: "How often a checkpoint is saved, in steps, besides the final one. 0 saves only at the end.",
+  keepLast: "How many of the step saves are kept on disk; older ones are deleted as new ones are saved. The final save is always kept. 0 keeps them all.",
   repeats: "How many times each of this dataset's files is used per epoch. Raise it to give a small dataset as much weight as a bigger one.",
-  resolution: "The size files train at: each is scaled to about this many pixels squared, keeping its shape, and never enlarged. Select several to train every file at each size, so the LoRA works across sizes.",
+  resolution: "The size files train at: each is scaled to about this many pixels squared, keeping its shape, and never enlarged. Select several to train every file at each size, so the LoRA works across sizes. Smaller sizes train faster; the largest sets the VRAM.",
   captionDropout: "The chance a step trains on a file from this dataset with an empty caption, which keeps the LoRA working without its trigger words. 0 turns it off.",
   flip: "Also trains on a mirrored copy of each file, doubling the items. Leave it off for text, logos or subjects that aren't symmetrical.",
   swap: "Also trains on each song with its left and right channels swapped, doubling the items.",
@@ -95,10 +96,10 @@ const INFO = {
   sampleAtStart: "Renders the sample prompts before the first update, so they show the base model: a baseline to compare the later samples with.",
   finetuneLr: "How big each update to the model's weights is. A finetune changes the model itself, so it takes a far lower rate than a LoRA (about a tenth); too high and the model forgets what it knew.",
   finetuneOptimizer: "Adafactor keeps almost no state beside the model, so it fits where AdamW 8-bit, which keeps 2 bytes a weight (as much again as the model), may not. Either way each weight is updated as soon as its gradient is ready, so the model's gradients never all exist at once.",
-  refmodMode: "Compressed averages each reference down to a small grid, then refines the grid (a few hundred steps on the grid alone) so that, scaled back up, it matches the full encode: few tokens, so many references fit, with less detail. Full keeps each encode as it is, every reference cropped to the first one's shape: the most detail, and the most tokens.",
-  refmodTokens: "The reference tokens the RefMod may put into the model, which take VRAM and time at every step like the video's own. Over the cap, near-duplicate frames go first, then the rest are spread evenly. 0: no cap. A 1024 × 1024 image encoded in full is 1024 tokens.",
-  refmodMerge: "Refines one grid against every reference at once, so it settles on what they have in common, instead of stacking a grid per reference: the fewest tokens, for one subject seen in several shots.",
-  refmodConcept: "What the RefMod is of. It's kept in the file, where ComfyUI's RefMod nodes show it; it doesn't change how it's made.",
+  refmodMode: REFMOD_INFO.mode,
+  refmodTokens: REFMOD_INFO.tokens,
+  refmodMerge: REFMOD_INFO.merge,
+  refmodConcept: REFMOD_INFO.concept,
   refmodKind: "Pictures encodes the datasets' images and clips with the video VAE: a subject, a look or a motion to take after. Sound encodes their sound with the audio VAE (sound files, and clips' soundtracks): a voice, singing, a style of music or a sound. The model takes a sound reference only beside a picture one (a reference image or a visual RefMod).",
   refmodSeconds: "How much sound the RefMod holds: the datasets' sound files and clips with sound, each from its start, in order, until there's this much. A generation uses as much of it as the video is long (MiniMax H3 makes up to 10 s), from the start, as the released pipeline does; ComfyUI may use more.",
 };
@@ -153,6 +154,7 @@ export function formOf(cfg: any, profiles: Profile[]) {
     datasets: cfg.datasets.map((d: any) => ({
       id: d.id, repeats: d.repeats, resolution: d.resolution ?? cfg.settings.resolution,
       flip: d.flip ?? cfg.settings.flip, caption_dropout: d.caption_dropout ?? cfg.settings.caption_dropout,
+      sources: (d.sources || []).map((x: any) => x.id),
     })),
   };
 }
@@ -201,24 +203,39 @@ function Resolutions(props: { v: unknown; on: (v: number | number[]) => void; vi
   );
 }
 
-// A dataset in the job: which one, how much it repeats against the others, the sizes it trains at,
-// and its own flip and caption dropout
-type DsCard = { id: string; repeats: number; resolution: number | number[]; flip: boolean; caption_dropout: number };
+// A dataset in the job: which one, how much it repeats against the others, the sizes it trains at, its own flip
+// and caption dropout, and the source datasets its files pair with (models that train with them; "" not chosen yet)
+type DsCard = { id: string; repeats: number; resolution: number | number[]; flip: boolean; caption_dropout: number; sources: string[] };
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+// strengths as typed ("0.6, 0.8") that the server takes: 1 to most of them, each -10 to 10
+const strengthsOk = (raw: unknown, most: number) => {
+  const v = String(raw ?? "").replace(/,/g, " ").split(/\s+/).filter(Boolean).map(Number);
+  return v.length >= 1 && v.length <= most && v.every((x) => x >= -10 && x <= 10);
+};
 const fmtSize = (bytes: number) => (bytes < 1e6 ? `${Math.max(1, Math.round(bytes / 1e3))} KB` : `${(bytes / 1e6).toFixed(1)} MB`);
 
 /** The health check of a dataset card's dataset, for this model at the card's resolutions (music: clip length);
- * ``onLongest`` hears its longest clip's frames. */
-function CardCheck({ id, resolution, family, frames, seconds, auto, onLongest }: {
+ * ``onLongest`` hears its longest clip's frames. With ``pairing`` (a model that trains with reference images), it
+ * says how many files pair with one from the ``sources`` datasets (or the _refs folder): ``onPairs`` shows them, and
+ * ``onPaired`` hears the counts. */
+function CardCheck({ id, resolution, family, frames, seconds, auto, onLongest, pairing, sources, onPairs, onPaired }: {
   id: string; resolution: unknown; family?: string; frames: number; seconds?: number; auto?: boolean;
   onLongest?: (id: string, frames: number) => void;
+  pairing?: FamilySources | null; sources?: string[]; onPairs?: () => void; onPaired?: (id: string, pairs: CheckPairs | null) => void;
 }) {
-  const { result, loading } = useDatasetCheck(id, { resolution: seconds == null ? resList(resolution).join(",") : "", family, frames, seconds, auto });
-  useEffect(() => { if (result) onLongest?.(id, result.longest_clip || 0); }, [result]);
+  const { result, loading } = useDatasetCheck(id, { resolution: seconds == null ? resList(resolution).join(",") : "", family, frames, seconds, auto,
+    references: !!pairing, sources });
+  useEffect(() => { if (result) { onLongest?.(id, result.longest_clip || 0); onPaired?.(id, result.pairs || null); } }, [result]);
   if (!result) return loading ? <div className="faint small">Checking the dataset…</div> : null;
-  return <div style={{ opacity: loading ? 0.5 : 1 }}><CheckIssues result={result} compact /></div>;
+  return (
+    <div className="stack" style={{ gap: 8, opacity: loading ? 0.5 : 1 }}>
+      {pairing && result.pairs && <PairSummary pairs={result.pairs} info={pairing} onShow={onPairs} />}
+      <CheckIssues result={result} compact />
+    </div>
+  );
 }
+
 
 function Sel(props: { label: string; v: string; on: (s: string) => void; opts: [string, string][]; help?: string; info?: string }) {
   return (
@@ -238,12 +255,9 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
   const [datasets] = usePoll<Dataset[]>("/api/datasets", 0);
   const [sys] = usePoll<{ gpus: Gpu[]; ram?: SystemRam }>("/api/system", 0);
 
-  const clone = useMemo(() => {
-    if (edit) return edit.job;
-    const c = load<any>(CLONE_KEY);
-    localStorage.removeItem(CLONE_KEY);
-    return c;
-  }, []);
+  // a duplicated job is read here and cleared once mounted (StrictMode runs this twice, so it can't clear it)
+  const [clone] = useState<any>(() => (edit ? edit.job : load<any>(CLONE_KEY)));
+  useEffect(() => { if (!edit) localStorage.removeItem(CLONE_KEY); }, []);
   const last = clone || load<any>(STORE);
 
   const [name, setName] = useState(edit ? clone.name : clone ? clone.name + " v2" : "");
@@ -263,15 +277,28 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
   });
   // s.resolution, s.flip and s.caption_dropout are what a newly added dataset starts with (the model's
   // defaults, or the first dataset of the last job)
-  const newCard = (): DsCard => ({ id: "", repeats: 1, resolution: s.resolution, flip: !!s.flip, caption_dropout: Number(s.caption_dropout) || 0 });
+  const newCard = (): DsCard => ({ id: "", repeats: 1, resolution: s.resolution, flip: !!s.flip, caption_dropout: Number(s.caption_dropout) || 0, sources: [] });
   const [dsCards, setDsCards] = useState<DsCard[]>(() => {
     const list: DsCard[] = (Array.isArray(clone?.datasets) ? clone.datasets : []).map((d: any) => ({
       ...newCard(), id: String(d.id), repeats: Math.max(1, Number(d.repeats) || 1), resolution: d.resolution ?? s.resolution,
       ...(d.flip != null ? { flip: !!d.flip } : {}), ...(d.caption_dropout != null ? { caption_dropout: Number(d.caption_dropout) } : {}),
+      sources: Array.isArray(d.sources) ? d.sources.map(String) : [],
     }));
     return list.length ? list : [newCard()];
   });
   const setDsCard = (i: number, patch: Partial<DsCard>) => setDsCards((cs) => cs.map((c, j) => (j === i ? { ...c, ...patch } : c)));
+  // a card's k-th source dataset: choosing none removes it (the first one's "None" leaves none)
+  const setSource = (i: number, k: number, id: string) => setDsCards((cs) => cs.map((c, j) => {
+    if (j !== i) return c;
+    const list = c.sources.length ? [...c.sources] : [""];
+    if (id) list[k] = id;
+    else list.splice(k, 1);
+    return { ...c, sources: list };
+  }));
+  // how each card's dataset pairs with its source images, as its health check found (null: nothing pairs)
+  const [paired, setPaired] = useState<Record<string, CheckPairs | null>>({});
+  const notePaired = (id: string, p: CheckPairs | null) => setPaired((m) => (JSON.stringify(m[id]) === JSON.stringify(p) ? m : { ...m, [id]: p }));
+  const [pairsOf, setPairsOf] = useState<{ id: string; name: string; sources: string[]; video: boolean } | null>(null);
   const [cards, setCards] = useState<Card[]>(() => {
     const c = toCards(last?.settings?.sample_prompts);
     return c.length ? c : [blankCard()];
@@ -360,7 +387,11 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
     && s.slider_positive.trim() !== s.slider_negative.trim());
   // section numbers, after the slider's (or RefMod's) own section when there is one
   const num = (n: number) => String(n + ((slider || refmod) && n > 1 ? 1 : 0)).padStart(2, "0");
-  const epochs = perEpoch ? (s.steps * s.batch_size * s.grad_accum) / perEpoch : 0;
+  // batches per update: a finetune takes one (it updates during backward)
+  const accum = finetune ? 1 : Number(s.grad_accum) || 1;
+  // a finetune's optimizer, as its select shows it: Adafactor when the LoRA's isn't one a finetune takes
+  const finetuneOptimizer = FINETUNE_OPTIMIZERS.some(([o]) => o === s.optimizer) ? s.optimizer : "adafactor";
+  const epochs = perEpoch ? (s.steps * s.batch_size * accum) / perEpoch : 0;
   // an Auto clip length trains each clip whole, so the longest one (as the datasets' health checks find it) sets
   // the VRAM; until they're in, the most a clip trains at
   const [longest, setLongest] = useState<Record<string, number>>({});
@@ -391,7 +422,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
   const soundCapped = !!refCap && soundTokens > refCap;
   const refFits = refSound ? !refCap || refCap >= 2 : !refCap || perFrame <= refCap;
   const setRefKind = (kind: string) => setS((x) => {
-    const list = kind === "audio" ? AUDIO_CONCEPTS : CONCEPTS;
+    const list = kind === "audio" ? AUDIO_CONCEPTS : REFMOD_CONCEPTS;
     return { ...x, refmod_kind: kind, refmod_concept: list.some(([c]) => c === x.refmod_concept) && x.refmod_concept !== "generic"
       ? x.refmod_concept : list[0][0] };
   });
@@ -400,9 +431,9 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
     // the first dataset's resolution, flip and dropout are remembered as the starting point for new ones
     const first = chosen[0];
     const settings = {
-      ...s, sample_prompts: fromCards(cards), slider_enabled: slider, network_type: lokr ? "lokr" : "lora",
+      ...s, sample_prompts: fromCards(cards), slider_enabled: slider, network_type: lokr ? "lokr" : "lora", grad_accum: accum,
       refmod_enabled: refmod, finetune_enabled: finetune, ...(refmod ? { picker_enabled: false, bleed_enabled: false } : {}),
-      ...(finetune ? { bleed_enabled: false, sweep_enabled: false, grad_accum: 1 } : {}),
+      ...(finetune ? { bleed_enabled: false, sweep_enabled: false, optimizer: finetuneOptimizer } : {}),
       ...(isAudio ? { bleed_enabled: false } : {}),
       ...(slider ? { picker_enabled: false, ...(keepLayout ? { slider_preserve: [] } : {}) } : {}),
       ...(first ? { resolution: first.resolution, flip: first.flip, caption_dropout: first.caption_dropout }
@@ -413,7 +444,8 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
       output_name: outName.trim(),
       profile_id: profileId,
       gpu,
-      datasets: chosen.map((c) => ({ id: c.id, repeats: c.repeats, resolution: c.resolution, flip: c.flip, caption_dropout: c.caption_dropout })),
+      datasets: chosen.map((c) => ({ id: c.id, repeats: c.repeats, resolution: c.resolution, flip: c.flip, caption_dropout: c.caption_dropout,
+        ...(pairing ? { sources: c.sources.filter(Boolean) } : {}) })),
       settings,
     };
     setBusy(true);
@@ -447,11 +479,15 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
   const forVariant = (w: { variants: string[] | null }) => !w.variants || w.variants.includes(variant);
   const imageInput = family?.workflows.find((w) => w.images && forVariant(w))?.images;
   const firstFrame = !!family?.workflows.some((w) => w.id === "i2v" && forVariant(w));
+  // a model that trains with reference images (an edit's source images), which each dataset pairs from source datasets
+  const sourcesInfo = family?.sources && forVariant(family.sources) ? family.sources : null;
+  const pairing = !!sourcesInfo && !refmod && !slider ? sourcesInfo : null;
   const lowVram = !!s.low_vram && !!family?.streams_text_encoder;
   // what the VRAM projection depends on
   const vram = useVramProjection(profileId || undefined, {
     resolution: resolutions.length ? resolutions : s.resolution,
-    datasets: chosen.map((c) => ({ resolution: c.resolution, video: c.d.videos > 0 })), batch_size: s.batch_size, rank: s.rank, optimizer: s.optimizer,
+    datasets: chosen.map((c) => ({ resolution: c.resolution, video: c.d.videos > 0, refs: pairing ? paired[c.id]?.most ?? c.sources.filter(Boolean).length : 0 })),
+    batch_size: s.batch_size, rank: s.rank, optimizer: s.optimizer,
     network_type: kind === "lokr" ? "lokr" : "lora", lokr_factor: s.lokr_factor, finetune_enabled: finetune,
     gradient_checkpointing: s.gradient_checkpointing, sample_width: s.sample_width, sample_height: s.sample_height,
     low_vram: lowVram,
@@ -461,12 +497,22 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
     ...(isAudio ? { clip_seconds: s.clip_seconds, sample_seconds: s.sample_seconds } : {}),
   }, "train");
   const target = gpuTarget(sys?.gpus, gpu);
-  const vramPeak = !refmod && vram && !vram.error && vram.blocks ? peakOf(vram, streamedFor(vram, s.offload)) : null;
+  // why the job can't be added yet
+  const blocked = !profileId ? "Choose a profile to continue." : chosen.length === 0 && !slider ? "Choose at least one dataset to continue."
+    : !sliderReady ? "Fill in the slider's prompts to continue."
+    : slider && s.slider_sample_strengths !== "" && !strengthsOk(s.slider_sample_strengths, 6) ? "Give the slider 1–6 sample strengths, each -10 to 10, to continue."
+    : refmod && !refFits ? "Fix the token cap above to continue."
+    : refmod && Math.trunc(Number(s.refmod_grid)) % 2 ? "Make the RefMod's grid an even number to continue."
+    : finetune && Number(s.offload) > 0 && !s.gradient_checkpointing ? "Turn on gradient checkpointing, or offload 0%, to continue."
+    : !refmod && !slider && !finetune && s.picker_enabled && s.sweep_enabled && !strengthsOk(s.sweep_strengths, 8)
+      ? "Give the strength sweep 1–8 strengths, each -10 to 10, to continue."
+    : !refmod && !finetune && !isAudio && s.bleed_enabled && !(s.bleed_prompts || []).some((p: string) => p.trim())
+      ? "Add a probe prompt to the concept bleed detector to continue." : "";
   // what each save of a finetune takes on disk: the whole model, in bf16
   const saveGb = finetune && vram && !vram.error ? (vram.adapter_params * 2) / 1e9 : 0;
 
   return (
-    <div className="page">
+    <div className="page create">
       <div className="page-head">
         {edit ? (
           <div style={{ minWidth: 0 }}>
@@ -480,19 +526,19 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
           </div>
         ) : (
           <div>
-            <h1>Create Job</h1>
-            <p>{refmod ? "Make a RefMod of your datasets and add it to the queue." : finetune ? "Configure a finetune of the whole model and add it to the queue." : "Configure a LoRA training run and add it to the queue."}</p>
+            <h1>Create job</h1>
+            <p>{refmod ? "Make a RefMod of your datasets and add it to the queue." : finetune ? "Configure a finetune of the whole model and add it to the queue." : "Configure a training run and add it to the queue."}</p>
           </div>
         )}
       </div>
 
-      <div className="grid create-layout" style={{ gridTemplateColumns: "minmax(0,1fr) 300px", alignItems: "start" }}>
-        <div className="card">
+      <div className="create-layout">
+        <div className="create-main">
           <div className="section">
             <div className="section-head"><span className="num">01</span><h3>Basics</h3></div>
             <div className="grid cols-2">
               <label className="field"><span>Job name</span><input value={name} onChange={(e) => setName(e.target.value)} placeholder="my_character_v1" /></label>
-              <label className="field"><span>File name <span className="faint">· optional</span></span><input value={outName} onChange={(e) => setOutName(e.target.value)} placeholder="defaults to job name" /></label>
+              <label className="field"><span>Output filename<Info text={INFO.outputName} /></span><input value={outName} onChange={(e) => setOutName(e.target.value)} placeholder="Defaults to job name" /></label>
               <label className="field">
                 <span>Profile<Info text={INFO.profile} /></span>
                 {profiles && profiles.length === 0 ? (
@@ -504,11 +550,11 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
                 )}
                 {edit && !edit.job.profile_id && <span className="help">This job's profile, {edit.profileName}, is gone; it trains with the one chosen here.</span>}
               </label>
-              <Sel label="GPU" info={INFO.gpu} v={gpu} on={setGpu} opts={[["auto", "Auto (queue decides)"], ...(sys?.gpus || []).map((g) => [String(g.index), `GPU ${g.index} · ${g.name.replace("NVIDIA GeForce ", "")}`] as [string, string])]} />
+              <Sel label="GPU" info={INFO.gpu} v={gpu} on={setGpu} opts={[["auto", "Auto · Queue decides"], ...(sys?.gpus || []).map((g) => [String(g.index), `GPU ${g.index} · ${g.name.replace("NVIDIA GeForce ", "")}`] as [string, string])]} />
               {family && (
                 <div className="field">
-                  <span>{family.refmods ? "Make" : "Train"}</span>
-                  <div className="seg" role="group" aria-label="What to train">
+                  <span>{family.refmods ? "Make" : "Training method"}</span>
+                  <div className="seg method" role="group" aria-label="What to train">
                     {KINDS.filter(([k]) => (k !== "slider" || family.sliders) && (k !== "refmod" || family.refmods) && (k !== "finetune" || family.finetune)).map(([k, label]) => (
                       <button key={k} type="button" className={kind === k ? "on" : ""} aria-pressed={kind === k} onClick={() => setKind(k)}>{label}</button>
                     ))}
@@ -643,7 +689,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
                 </div>
                 </>}
                 <div className="grid cols-2">
-                  <Sel label="Concept" info={INFO.refmodConcept} v={s.refmod_concept} on={set("refmod_concept")} opts={refSound ? AUDIO_CONCEPTS : CONCEPTS} />
+                  <Sel label="Concept" info={INFO.refmodConcept} v={s.refmod_concept} on={set("refmod_concept")} opts={refSound ? AUDIO_CONCEPTS : REFMOD_CONCEPTS} />
                   <label className="field">
                     <span>Save a copy to <span className="faint">· optional</span></span>
                     <input value={s.refmod_copy_to} onChange={(e) => set("refmod_copy_to")(e.target.value)} placeholder="/path/to/ComfyUI/models/refmods" />
@@ -672,66 +718,71 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
           )}
 
           <div className="section">
-            <div className="section-head"><span className="num">{num(2)}</span><h3>Datasets</h3><span className="muted small">{refSound ? "their sound, in order, up to the length" : refmod ? "every image and clip is a reference" : slider ? "optional for a slider · pictures of the target" : "mix several · repeats weight one against the others"}</span></div>
+            <div className="section-head"><span className="num">{num(2)}</span><h3>Datasets</h3><span className="muted small">{refSound ? "Their sound, in order, up to the length." : refmod ? "Every image and clip is a reference." : slider ? "Optional for a slider · pictures of the target." : "Mix several · repeats weight one against the others."}</span></div>
             {datasets && datasets.length === 0 ? (
               <div className="empty" style={{ padding: 20 }}>No datasets yet. <a href="#/datasets">Create one →</a></div>
             ) : (
-              <div className="stack" style={{ gap: 10 }}>
+              <div className="ds-list">
                 {dsCards.map((c, i) => {
                   const d = datasets?.find((x) => x.id === c.id);
                   const usable = d ? usableFiles(d) : 0;
                   const items = usable * c.repeats * (isAudio ? 1 : resList(c.resolution).length) * (c.flip ? 2 : 1);
                   return (
-                    <div className="prompt-card" key={i}>
-                      <div className="prompt-card-body">
-                        <div className="ds-card-head">
-                          <label className="field">
-                            <span>Dataset</span>
-                            <select value={d ? c.id : ""} onChange={(e) => setDsCard(i, { id: e.target.value })}>
-                              <option value="" disabled>Choose a dataset…</option>
-                              {datasets?.map((x) => (
-                                <option key={x.id} value={x.id} disabled={x.id !== c.id && dsCards.some((o) => o.id === x.id)}>{x.name}</option>
-                              ))}
-                            </select>
+                    <div className="ds-block" key={i}>
+                      <div className={"ds-row" + (refmod ? " refmod" : "")}>
+                        <label className="field ds-choose">
+                          <span>Dataset</span>
+                          <select value={d ? c.id : ""} onChange={(e) => setDsCard(i, { id: e.target.value })}>
+                            <option value="" disabled>Choose a dataset…</option>
+                            {datasets?.map((x) => (
+                              <option key={x.id} value={x.id} disabled={x.id !== c.id && dsCards.some((o) => o.id === x.id)}>{x.name}</option>
+                            ))}
+                          </select>
+                        </label>
+                        {!refmod && (
+                          <label className="field ds-rep">
+                            <span>Repeats<Info text={INFO.repeats} /></span>
+                            <input type="number" min={1} value={c.repeats} onChange={(e) => setDsCard(i, { repeats: Math.max(1, Number(e.target.value) || 1) })} />
                           </label>
-                          {!refmod && (
-                            <label className="field">
-                              <span>Repeats<Info text={INFO.repeats} /></span>
-                              <input type="number" min={1} value={c.repeats} onChange={(e) => setDsCard(i, { repeats: Math.max(1, Number(e.target.value) || 1) })} />
-                            </label>
-                          )}
+                        )}
+                        <button className="btn ghost icon ds-remove" title="Remove dataset" aria-label="Remove dataset"
+                          onClick={() => setDsCards((cs) => (cs.length > 1 ? cs.filter((_, j) => j !== i) : [{ ...cs[0], id: "" }]))}>
+                          <IconX />
+                        </button>
+                        {i === 0 && (!datasets || dsCards.length < datasets.length) && (
+                          <button className="btn add-ds" onClick={() => setDsCards((cs) => [...cs, newCard()])}><IconPlus /> Add dataset</button>
+                        )}
+                      </div>
+                      {d && (
+                        <div className="ds-card-info muted small">
+                          {[d.images && plural(d.images, "image"),
+                            d.videos && plural(d.videos, "clip") + (d.video_sources < d.videos ? ` from ${plural(d.video_sources, "video")}` : ""),
+                            d.audio && plural(d.audio, refSound ? "sound file" : "song")].filter(Boolean).join(" · ") || "Empty"}
+                          {!refmod && <>{" · "}{d.captioned} captioned</>}{!refmod && usable > 0 && (isAudio
+                            ? (s.clip_seconds ? ` · ${plural(items, "song")} per epoch, a clip of each` : ` · ${plural(items, "song")} per epoch`)
+                            : ` · ${plural(items, "item")} per epoch`)}
+                          {d.trigger && <span className="pill">{d.trigger}</span>}
                         </div>
-                        {d && (
-                          <div className="ds-card-info muted small">
-                            {[d.images && plural(d.images, "image"),
-                              d.videos && plural(d.videos, "clip") + (d.video_sources < d.videos ? ` from ${plural(d.video_sources, "video")}` : ""),
-                              d.audio && plural(d.audio, refSound ? "sound file" : "song")].filter(Boolean).join(" · ") || "Empty"}
-                            {!refmod && <>{" · "}{d.captioned} captioned</>}{!refmod && usable > 0 && (isAudio
-                              ? (s.clip_seconds ? ` · ${plural(items, "song")} per epoch, a clip of each` : ` · ${plural(items, "song")} per epoch`)
-                              : ` · ${plural(items, "item")} per epoch`)}
-                            {d.trigger && <span className="pill">{d.trigger}</span>}
-                          </div>
-                        )}
-                        {c.id && datasets && !d && <div className="validation warning">This dataset was deleted. Choose another.</div>}
-                        {d && !d.exists && <div className="validation warning">Its folder wasn't found: {d.path}</div>}
-                        {d && !isVideo && !isAudio && d.videos > 0 && family && (
-                          <div className="validation warning">{family.label} trains on images, so {d.videos === 1 ? "its clip is" : `its ${d.videos} clips are`} skipped.</div>
-                        )}
-                        {d && isAudio && d.images + d.videos > 0 && family && (
-                          <div className="validation warning">{family.label} trains on audio, so its images and clips are skipped.</div>
-                        )}
-                        {d && refSound && d.images > 0 && (
-                          <div className="validation warning">A sound RefMod takes sound, so {d.images === 1 ? "its image is" : `its ${d.images} images are`} skipped{d.videos ? " (its clips count if they have sound)" : ""}.</div>
-                        )}
-                        {d && !isAudio && !refSound && (d.audio || 0) > 0 && family && (
-                          <div className="validation warning">{family.label} trains on {isVideo ? "images and clips" : "images"}, so {d.audio === 1 ? "its audio file is" : `its ${d.audio} audio files are`} skipped.</div>
-                        )}
-                        {!isAudio && !refmod && <Resolutions v={c.resolution} on={(v) => setDsCard(i, { resolution: v })} video={isVideo && (!d || d.videos > 0)} />}
-                        {d && !refmod && <CardCheck id={d.id} resolution={c.resolution} family={family?.id} frames={isVideo ? s.num_frames : 0}
-                          seconds={isAudio ? Number(s.clip_seconds) || 0 : undefined} auto={isVideo && autoFrames} onLongest={noteLongest} />}
-                        {!refmod && <div className="ds-card-opts">
+                      )}
+                      {c.id && datasets && !d && <div className="validation warning">This dataset was deleted. Choose another.</div>}
+                      {d && !d.exists && <div className="validation warning">Its folder wasn't found: {d.path}</div>}
+                      {d && !isVideo && !isAudio && d.videos > 0 && family && (
+                        <div className="validation warning">{family.label} trains on images, so {d.videos === 1 ? "its clip is" : `its ${d.videos} clips are`} skipped.</div>
+                      )}
+                      {d && isAudio && d.images + d.videos > 0 && family && (
+                        <div className="validation warning">{family.label} trains on audio, so its images and clips are skipped.</div>
+                      )}
+                      {d && refSound && d.images > 0 && (
+                        <div className="validation warning">A sound RefMod takes sound, so {d.images === 1 ? "its image is" : `its ${d.images} images are`} skipped{d.videos ? " (its clips count if they have sound)" : ""}.</div>
+                      )}
+                      {d && !isAudio && !refSound && (d.audio || 0) > 0 && family && (
+                        <div className="validation warning">{family.label} trains on {isVideo ? "images and clips" : "images"}, so {d.audio === 1 ? "its audio file is" : `its ${d.audio} audio files are`} skipped.</div>
+                      )}
+                      {!refmod && (
+                        <div className="ds-opts">
+                          {!isAudio && <Resolutions v={c.resolution} on={(v) => setDsCard(i, { resolution: v })} video={isVideo && (!d || d.videos > 0)} />}
                           {!slider && (
-                            <label className="field">
+                            <label className="field ds-dropout">
                               <span>Caption dropout<Info text={INFO.captionDropout} /></span>
                               <input type="number" min={0} max={1} step={0.01} value={c.caption_dropout}
                                 onChange={(e) => setDsCard(i, { caption_dropout: Math.min(1, Math.max(0, Number(e.target.value) || 0)) })} />
@@ -746,20 +797,44 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
                               <input type="checkbox" checked={c.flip} onChange={(e) => setDsCard(i, { flip: e.target.checked })} /> Flip horizontally<Info text={INFO.flip} />
                             </label>
                           )}
-                        </div>}
-                      </div>
-                      <button className="btn ghost icon" title="Remove dataset" aria-label="Remove dataset"
-                        onClick={() => setDsCards((cs) => (cs.length > 1 ? cs.filter((_, j) => j !== i) : [{ ...cs[0], id: "" }]))}>
-                        <IconX />
-                      </button>
+                        </div>
+                      )}
+                      {pairing && (
+                        <div className="ds-sources">
+                          {(c.sources.length ? c.sources : [""]).map((sid, k, list) => (
+                            <label className="field" key={k}>
+                              <span>{pairing.label}{list.length > 1 ? ` ${k + 1}` : ""}{k === 0 && <Info text={pairing.help} />}</span>
+                              <div className="row" style={{ gap: 6 }}>
+                                <select value={sid} onChange={(e) => setSource(i, k, e.target.value)} style={{ flex: 1, minWidth: 0 }}>
+                                  <option value="">{k === 0 ? `None · the files ${pairing.without}` : "Choose a dataset…"}</option>
+                                  {datasets?.map((x) => (
+                                    <option key={x.id} value={x.id} disabled={x.id === c.id || (x.id !== sid && c.sources.includes(x.id))}>{x.name}</option>
+                                  ))}
+                                </select>
+                                {list.length > 1 && (
+                                  <button className="btn ghost icon" title={`Remove ${pairing.label.toLowerCase()} ${k + 1}`} aria-label={`Remove ${pairing.label.toLowerCase()} ${k + 1}`}
+                                    onClick={() => setSource(i, k, "")}><IconX /></button>
+                                )}
+                              </div>
+                            </label>
+                          ))}
+                          {c.sources.length > 0 && c.sources.every(Boolean) && c.sources.length < pairing.max && (
+                            <button className="btn ghost sm" onClick={() => setDsCard(i, { sources: [...c.sources, ""] })}>
+                              <IconPlus /> Add another
+                            </button>
+                          )}
+                        </div>
+                      )}
+                      {d && !refmod && <CardCheck id={d.id} resolution={c.resolution} family={family?.id} frames={isVideo ? s.num_frames : 0}
+                        seconds={isAudio ? Number(s.clip_seconds) || 0 : undefined} auto={isVideo && autoFrames} onLongest={noteLongest}
+                        pairing={pairing} sources={c.sources.filter(Boolean)} onPaired={notePaired}
+                        onPairs={() => setPairsOf({ id: d.id, name: d.name, sources: c.sources.filter(Boolean), video: isVideo })} />}
                     </div>
                   );
                 })}
-                {(!datasets || dsCards.length < datasets.length) && (
-                  <button className="btn add-prompt" onClick={() => setDsCards((cs) => [...cs, newCard()])}><IconPlus /> Add dataset</button>
-                )}
               </div>
             )}
+            {pairsOf && pairing && <PairsDialog {...pairsOf} info={pairing} onClose={() => setPairsOf(null)} />}
             {refSound ? (
               <div className="help" style={{ marginTop: 8 }}>
                 The sound files and the clips with sound, in the datasets' order, each from its start, until there
@@ -784,8 +859,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
               </div>
             ) : (
               <div className="help" style={{ marginTop: 8 }}>
-                Files train at each of their dataset's resolutions, bucketed by aspect ratio, so the LoRA works across sizes (smaller ones train faster). Caption dropout is the chance a step uses an empty caption, which keeps the LoRA working without its trigger words.
-                {isVideo ? " Images train as stills and clips at the clip length below." : ""} VRAM is set by the largest size{isVideo ? ", and for clips the clip length" : ""}.
+                Repeats control each dataset's weight.{isVideo ? " Images train as stills, and clips at the clip length below." : ""}
               </div>
             )}
           </div>
@@ -797,7 +871,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
               <Num label="Steps" v={s.steps} on={set("steps")} min={1} />
               <Num label="Learning rate" info={finetune ? INFO.finetuneLr : INFO.learningRate} v={s.learning_rate} on={set("learning_rate")} step={finetune ? 0.000001 : 0.00001} />
               {finetune ? (
-                <Sel label="Optimizer" info={INFO.finetuneOptimizer} v={FINETUNE_OPTIMIZERS.some(([o]) => o === s.optimizer) ? s.optimizer : "adafactor"}
+                <Sel label="Optimizer" info={INFO.finetuneOptimizer} v={finetuneOptimizer}
                   on={set("optimizer")} opts={FINETUNE_OPTIMIZERS} />
               ) : (
                 <Sel label="Optimizer" info={INFO.optimizer} v={s.optimizer} on={set("optimizer")} opts={[["adamw8bit", "AdamW 8-bit"], ["adamw", "AdamW"], ["adafactor", "Adafactor"], ["prodigy", "Prodigy (set LR to 1)"]]} />
@@ -847,13 +921,8 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
                   help="Each song trains as clips this long, spread over it. 0 trains whole songs (up to 6 minutes) with the lyrics in their captions, after a [Lyrics] line." />
               </div>
             )}
-            {imageInput?.help && <div className="help" style={{ marginTop: 8 }}>{imageInput.help}</div>}
-            <div style={{ marginTop: 16 }}>
-              <OffloadControl proj={vram} value={Number(s.offload) || 0} onChange={set("offload")} gpu={target} ram={sys?.ram}
-                lowVram={family?.streams_text_encoder ? { on: lowVram, onChange: set("low_vram") } : null} finetune={finetune} />
-            </div>
-            <details style={{ marginTop: 16 }}>
-              <summary className="muted" style={{ cursor: "pointer" }}>Advanced</summary>
+            <details className="more" style={{ marginTop: 14 }}>
+              <summary>Advanced training settings</summary>
               <div className="grid cols-3" style={{ marginTop: 14 }}>
                 {!finetune && <Num label="Gradient accumulation" info={INFO.gradAccum} v={s.grad_accum} on={set("grad_accum")} min={1} />}
                 <Sel label="Timestep sampling" info={INFO.timesteps} v={s.timestep_sampling} on={set("timestep_sampling")} opts={family?.timestep_modes || [["shift", "Resolution shift"]]} />
@@ -880,14 +949,14 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
             </details>
           </div>
 
-          <div className="section">
+          <div className="section saving">
             <div className="section-head"><span className="num">{num(4)}</span><h3>Saving</h3></div>
-            <div className="grid cols-3">
-              <Num label="Save every (steps)" v={s.save_every} on={set("save_every")} min={0} help="0 = only at the end" />
-              <Num label="Keep last N saves" v={s.keep_last} on={set("keep_last")} min={0} help="0 = keep all" />
+            <div className="grid cols-2">
+              <Num label="Save every (steps)" info={INFO.saveEvery} v={s.save_every} on={set("save_every")} min={0} />
+              <Num label="Keep last N saves" info={INFO.keepLast} v={s.keep_last} on={set("keep_last")} min={0} />
             </div>
             {finetune && saveGb > 0 && (
-              <div className="help" style={{ marginTop: 8 }}>
+              <div className="help saving-note">
                 Each save is the whole model: about {saveGb.toFixed(1)} GB, so {s.keep_last
                   ? `the last ${s.keep_last} and the final one take about ${((Number(s.keep_last) + 1) * saveGb).toFixed(0)} GB`
                   : `all ${s.save_every ? Math.floor((s.steps - 1) / s.save_every) + 1 : 1} take about ${((s.save_every ? Math.floor((s.steps - 1) / s.save_every) + 1 : 1) * saveGb).toFixed(0)} GB`}.
@@ -1002,63 +1071,76 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
           </>}
         </div>
 
-        <div className="card card-pad summary">
-          <h2>Summary</h2>
-          <div className="kv"><span>Model</span><span>{family?.label || "—"}</span></div>
-          <div className="kv"><span>Profile</span><span className="ellipsis">{profile?.name || "—"}</span></div>
-          {refSound ? <>
-            <div className="kv"><span>Make</span><span>RefMod · sound</span></div>
-            <div className="kv"><span>Dataset{chosen.length === 1 ? "" : "s"}</span><span>{chosen.length || "—"}</span></div>
-            <div className="kv"><span>Sources</span><span>{refSounds ? [chosen.reduce((n, c) => n + (c.d.audio || 0), 0) && plural(chosen.reduce((n, c) => n + (c.d.audio || 0), 0), "sound file"),
-              refClips && plural(refClips, "clip")].filter(Boolean).join(" · ") : "—"}</span></div>
-            <div className="kv"><span>Length</span><span>≤ {soundCapped ? (refCap / AUDIO_TOKENS_PER_SECOND).toFixed(1) : s.refmod_seconds} s</span></div>
-            <div className="kv"><span>Tokens</span><span>≤ {(soundCapped ? refCap : soundTokens).toLocaleString()}{soundCapped ? " (capped)" : ""}</span></div>
-            <div className="kv"><span>File size</span><span>≤ {fmtSize((soundCapped ? refCap : soundTokens) * 32 * 2)}</span></div>
-            <div className="kv"><span>Concept</span><span>{AUDIO_CONCEPTS.find(([c]) => c === s.refmod_concept)?.[1] || s.refmod_concept}</span></div>
-          </> : refmod ? <>
-            <div className="kv"><span>Make</span><span>RefMod · {refCompressed ? "compressed" : "full"}</span></div>
-            <div className="kv"><span>Dataset{chosen.length === 1 ? "" : "s"}</span><span>{chosen.length || "—"}</span></div>
-            <div className="kv"><span>References</span><span>{refImages + refClips
-              ? [refImages && plural(refImages, "image"), refClips && plural(refClips, "clip")].filter(Boolean).join(" · ") + (refMerged ? " · merged" : "")
-              : "—"}</span></div>
-            <div className="kv"><span>{refCompressed ? "Grid" : "Size"}</span><span>{refCompressed ? `${s.refmod_grid} cells, long edge` : `${s.refmod_size} px short edge`}</span></div>
-            <div className="kv"><span>Tokens</span><span>{refImages + refClips ? `≤ ${(refCapped ? refCap : refTokens).toLocaleString()}${refCapped ? " (capped)" : ""}` : "—"}</span></div>
-            <div className="kv"><span>File size</span><span>{refImages + refClips ? `≤ ${fmtSize((refCapped ? refCap : refTokens) * 4 * 24 * 2)}` : "—"}</span></div>
-            <div className="kv"><span>Concept</span><span>{CONCEPTS.find(([c]) => c === s.refmod_concept)?.[1].split(" · ")[0] || s.refmod_concept}</span></div>
-          </> : <>
-          <div className="kv"><span>Training adapter</span><span>{profile?.data?.training_adapter ? "on" : "off"}</span></div>
-          {slider && <div className="kv"><span>Train</span><span>Slider</span></div>}
-          <div className="kv"><span>{finetune ? "Train" : "Network"}</span><span>{finetune
-            ? `Whole model${vram && !vram.error && vram.adapter_params ? ` · ${(vram.adapter_params / 1e9).toFixed(2)}B weights` : ""}`
-            : lokr ? `LoKr · factor ${s.lokr_factor === -1 ? "auto" : s.lokr_factor}` : `LoRA · rank ${s.rank}`}</span></div>
-          {vram && !vram.error && vram.adapter_params > 0 && (
-            <div className="kv"><span>File size</span><span>≈ {finetune ? `${saveGb.toFixed(1)} GB` : `${Math.round((vram.adapter_params * 2) / 1e6)} MB`}</span></div>
+        <div className="create-side">
+          <div className="create-side-cards">
+          <div className="card card-pad summary">
+            <h2 className="side-title">Run summary</h2>
+            <div className="kv"><span>Model</span><span>{family?.label || "—"}</span></div>
+            <div className="kv"><span>Profile</span><span className="ellipsis">{profile?.name || "—"}</span></div>
+            {refSound ? <>
+              <div className="kv"><span>Make</span><span>RefMod · sound</span></div>
+              <div className="kv"><span>Dataset{chosen.length === 1 ? "" : "s"}</span><span>{chosen.length || "—"}</span></div>
+              <div className="kv"><span>Sources</span><span>{refSounds ? [chosen.reduce((n, c) => n + (c.d.audio || 0), 0) && plural(chosen.reduce((n, c) => n + (c.d.audio || 0), 0), "sound file"),
+                refClips && plural(refClips, "clip")].filter(Boolean).join(" · ") : "—"}</span></div>
+              <div className="kv"><span>Length</span><span>≤ {soundCapped ? (refCap / AUDIO_TOKENS_PER_SECOND).toFixed(1) : s.refmod_seconds} s</span></div>
+              <div className="kv"><span>Tokens</span><span>≤ {(soundCapped ? refCap : soundTokens).toLocaleString()}{soundCapped ? " (capped)" : ""}</span></div>
+              <div className="kv"><span>File size</span><span>≤ {fmtSize((soundCapped ? refCap : soundTokens) * 32 * 2)}</span></div>
+              <div className="kv"><span>Concept</span><span>{AUDIO_CONCEPTS.find(([c]) => c === s.refmod_concept)?.[1] || s.refmod_concept}</span></div>
+            </> : refmod ? <>
+              <div className="kv"><span>Make</span><span>RefMod · {refCompressed ? "compressed" : "full"}</span></div>
+              <div className="kv"><span>Dataset{chosen.length === 1 ? "" : "s"}</span><span>{chosen.length || "—"}</span></div>
+              <div className="kv"><span>References</span><span>{refImages + refClips
+                ? [refImages && plural(refImages, "image"), refClips && plural(refClips, "clip")].filter(Boolean).join(" · ") + (refMerged ? " · merged" : "")
+                : "—"}</span></div>
+              <div className="kv"><span>{refCompressed ? "Grid" : "Size"}</span><span>{refCompressed ? `${s.refmod_grid} cells, long edge` : `${s.refmod_size} px short edge`}</span></div>
+              <div className="kv"><span>Tokens</span><span>{refImages + refClips ? `≤ ${(refCapped ? refCap : refTokens).toLocaleString()}${refCapped ? " (capped)" : ""}` : "—"}</span></div>
+              <div className="kv"><span>File size</span><span>{refImages + refClips ? `≤ ${fmtSize((refCapped ? refCap : refTokens) * 4 * 24 * 2)}` : "—"}</span></div>
+              <div className="kv"><span>Concept</span><span>{REFMOD_CONCEPTS.find(([c]) => c === s.refmod_concept)?.[1].split(" · ")[0] || s.refmod_concept}</span></div>
+            </> : <>
+            <div className="kv"><span>Training adapter</span><span>{profile?.data?.training_adapter ? "On" : "Off"}</span></div>
+            {slider && <div className="kv"><span>Train</span><span>Slider</span></div>}
+            <div className="kv"><span>{finetune ? "Train" : "Network"}</span><span>{finetune
+              ? `Whole model${vram && !vram.error && vram.adapter_params ? ` · ${(vram.adapter_params / 1e9).toFixed(2)}B weights` : ""}`
+              : lokr ? `LoKr · Factor ${s.lokr_factor === -1 ? "auto" : s.lokr_factor}` : `LoRA · Rank ${s.rank}`}</span></div>
+            {vram && !vram.error && vram.adapter_params > 0 && (
+              <div className="kv"><span>Output size</span><span>≈ {finetune ? `${saveGb.toFixed(1)} GB` : `${Math.round((vram.adapter_params * 2) / 1e6)} MB`}</span></div>
+            )}
+            {slider && <div className="kv"><span>Keeps</span><span>{keepLayout ? `layout above ${s.slider_layout_sigma}`
+              : preserve.filter((p) => p.trim()).length ? plural(preserve.filter((p) => p.trim()).length, "attribute") : "—"}</span></div>}
+            <div className="kv"><span>Dataset{chosen.length === 1 ? "" : "s"}</span><span>{chosen.length || (rendered ? `${s.slider_images} rendered images` : "Not selected")}</span></div>
+            {pairing && chosen.length > 0 && (() => {
+              const found = chosen.map((c) => paired[c.id]);
+              const withN = found.reduce((n, p) => n + (p?.with || 0), 0);
+              const files = chosen.reduce((n, c, k) => n + (found[k]?.of ?? c.files), 0);
+              return <div className="kv"><span>With {pairing.noun}s</span><span>{found.some((p) => p === undefined) ? "…"
+                : withN ? `${withN} of ${plural(files, "file")}` : "none"}</span></div>;
+            })()}
+            {(chosen.length > 0 || rendered) && (isAudio ? <>
+              <div className="kv"><span>Clips</span><span>{Number(s.clip_seconds) ? `${s.clip_seconds} s` : "whole songs"}</span></div>
+              <div className="kv"><span>Songs</span><span>{perEpoch || "—"}</span></div>
+            </> : <>
+              <div className="kv"><span>Resolution{resolutions.length > 1 ? "s" : ""}</span><span>{resolutions.join(" · ") || "—"}</span></div>
+              <div className="kv"><span>Items per epoch</span><span>{perEpoch || "—"}</span></div>
+              <div className="kv"><span>Epochs</span><span>{epochs ? epochs.toFixed(1) : "—"}</span></div>
+            </>)}
+            <div className="kv"><span>Steps</span><span>{Number(s.steps).toLocaleString()}</span></div>
+            <div className="kv"><span>Save events<Info text="Checkpoints saved during the run, the final one included (Save every)." /></span><span>{(s.save_every ? Math.floor((s.steps - 1) / s.save_every) + 1 : 1)}</span></div>
+            <div className="kv"><span>Keep latest<Info text="How many of the step saves stay on disk (Keep last N saves); the final save is always kept." /></span><span>{Number(s.keep_last) ? s.keep_last : "All"}</span></div>
+            {!slider && s.picker_enabled && <div className="kv"><span>Checkpoint picker</span><span>On</span></div>}
+            {!isAudio && s.bleed_enabled && <div className="kv"><span>Concept bleed</span><span>On</span></div>}
+            </>}
+            {!slider && !refmod && missingCaps > 0 && <div className="validation warning" style={{ marginTop: 10 }}>{missingCaps} file(s) have no caption — they'll train on the trigger word only.</div>}
+          </div>
+          {!refmod && (
+            <MemoryEstimate proj={vram} value={Number(s.offload) || 0} onChange={set("offload")} gpu={target} ram={sys?.ram} noProfile={!profileId}
+              lowVram={family?.streams_text_encoder ? { on: lowVram, onChange: set("low_vram") } : null} finetune={finetune} />
           )}
-          {slider && <div className="kv"><span>Keeps</span><span>{keepLayout ? `layout above ${s.slider_layout_sigma}`
-            : preserve.filter((p) => p.trim()).length ? plural(preserve.filter((p) => p.trim()).length, "attribute") : "—"}</span></div>}
-          <div className="kv"><span>Dataset{chosen.length === 1 ? "" : "s"}</span><span>{chosen.length || (rendered ? `${s.slider_images} rendered images` : "—")}</span></div>
-          {isAudio ? <>
-            <div className="kv"><span>Clips</span><span>{Number(s.clip_seconds) ? `${s.clip_seconds} s` : "whole songs"}</span></div>
-            <div className="kv"><span>Songs</span><span>{perEpoch || "—"}</span></div>
-          </> : <>
-            <div className="kv"><span>Resolution{resolutions.length > 1 ? "s" : ""}</span><span>{resolutions.join(" · ") || "—"}</span></div>
-            <div className="kv"><span>Items per epoch</span><span>{perEpoch || "—"}</span></div>
-            <div className="kv"><span>Epochs</span><span>{epochs ? epochs.toFixed(1) : "—"}</span></div>
-          </>}
-          <div className="kv"><span>Steps</span><span>{s.steps}</span></div>
-          <div className="kv"><span>Checkpoints</span><span>{s.save_every ? Math.floor((s.steps - 1) / s.save_every) + 1 : 1}</span></div>
-          {!slider && <div className="kv"><span>Checkpoint picker</span><span>{s.picker_enabled ? "on" : "off"}</span></div>}
-          {!isAudio && <div className="kv"><span>Concept bleed</span><span>{s.bleed_enabled ? "on" : "off"}</span></div>}
-          <div className="kv"><span>Projected VRAM</span><span className={vramPeak && target && vramPeak.total > target.totalGb ? "vram-peak over" : ""}>
-            {vramPeak ? `≈ ${vramPeak.total.toFixed(1)} GB` : "—"}{s.offload ? ` · ${s.offload}% offloaded` : ""}{lowVram ? " · low VRAM" : ""}</span></div>
-          </>}
-          {!slider && !refmod && missingCaps > 0 && <div className="validation warning" style={{ marginTop: 10 }}>{missingCaps} file(s) have no caption — they'll train on the trigger word only.</div>}
-          <button className="btn primary" style={{ width: "100%", marginTop: 16, padding: "11px 14px" }} disabled={busy || !profileId || (chosen.length === 0 && !slider) || !sliderReady || (refmod && !refFits)} onClick={() => submit()}>
+          </div>
+          <button className="btn primary create-submit" disabled={busy || !!blocked} onClick={() => submit()}>
             {edit ? <><IconSave /> Save changes</> : <><IconPlay /> Add to queue</>}
           </button>
-          {edit && <button className="btn ghost" style={{ width: "100%", marginTop: 8 }} onClick={() => go("queue", edit.id)}>Cancel</button>}
-          {chosen.length === 0 && !slider && <div className="help" style={{ marginTop: 8, textAlign: "center" }}>Choose at least one dataset</div>}
-          {!sliderReady && <div className="help" style={{ marginTop: 8, textAlign: "center" }}>Fill in the slider's prompts</div>}
+          {edit && <button className="btn ghost" style={{ width: "100%" }} onClick={() => go("queue", edit.id)}>Cancel</button>}
+          {blocked && <div className="help create-blocked">{blocked}</div>}
         </div>
         {restartAsk && (
           <ConfirmDialog title="Start again from step 0?" danger confirmLabel="Save and start again" message={restartAsk}

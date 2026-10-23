@@ -6,7 +6,7 @@ import { useToast } from "../components/ui";
 type Crop = [number, number, number, number]; // x, y, width, height in the video's pixels
 type Clip = { id: number; start: number; frames: number; crop: Crop | null };
 type PlanVideo = {
-  rel: string; path: string | null; looked: boolean; duration: number | null; fps: number | null; width: number | null;
+  rel: string; path: string | null; looked: boolean; stem: string | null; duration: number | null; fps: number | null; width: number | null;
   height: number | null; has_audio: boolean; cuts: number[]; clips: Clip[]; next: number; note: string;
   cut: Record<string, { start: number; frames: number; crop: Crop | null }>; // how each clip was cut, by number
 };
@@ -63,7 +63,7 @@ const nearest = (ls: number[], want: number) => ls.reduce((a, b) => (Math.abs(b 
 const crossed = (v: PlanVideo, c: Clip, fps: number) => v.cuts.filter((t) => t > c.start + 1e-3 && t <= c.start + (c.frames - 1) / fps + 1e-3);
 const overlapping = (v: PlanVideo, c: Clip, fps: number) =>
   v.clips.filter((o) => o.id !== c.id && o.start < c.start + c.frames / fps - 1e-3 && c.start < o.start + o.frames / fps - 1e-3);
-const clipFile = (v: PlanVideo, c: Clip) => `${v.rel.replace(/\.[^./]+$/, "")}_${String(c.id).padStart(3, "0")}.mp4`;
+const clipFile = (stem: string, c: Clip) => `${stem}_${String(c.id).padStart(3, "0")}.mp4`;
 const aspectOf = (crop: Crop | null) => {
   if (!crop) return "";
   const r = crop[2] / crop[3];
@@ -203,6 +203,7 @@ export default function ClipEditor({ id }: { id: string }) {
     waiting.current.delete(r);
     edits.current.set(r, (edits.current.get(r) || 0) + 1);
     try {
+      await flush(); // a save still on its way would land after the new plan and put the old clips back
       const res = await api.post<Saved>(`/api/datasets/${id}/clips/replan`, { rel: r, frames: newLen });
       dirty.current.delete(r);
       setPlan((pl) => pl && { ...pl, changes: res.changes, videos: pl.videos.map((v) => (v.rel === r ? res.video : v)) });
@@ -618,8 +619,10 @@ function CropBox({ v, crop, aspect, locked, onChange }: {
       const maxW = left ? ax : W - ax, maxH = top ? ay : H - ay;
       let w = Math.min(maxW, Math.max(MIN_CROP, w0 + (left ? -dx : dx)));
       let h = Math.min(maxH, Math.max(MIN_CROP, h0 + (top ? -dy : dy)));
-      if (aspect) {
-        w = Math.min(w, maxH * aspect, maxW);
+      if (aspect) { // the width from the smallest that leaves the height MIN_CROP too, to the largest the frame has room for
+        const lo = MIN_CROP * Math.max(1, aspect), hi = Math.min(maxW, maxH * aspect);
+        if (hi < lo) return; // no room for it at this corner
+        w = Math.min(hi, Math.max(lo, w0 + (left ? -dx : dx)));
         h = w / aspect;
       }
       c = [left ? ax - w : ax, top ? ay - h : ay, w, h];
@@ -653,8 +656,8 @@ function TimeInput({ value, max, disabled, onCommit }: { value: number; max: num
     onKeyDown={(e) => e.key === "Enter" && commit()} aria-label="Start" />;
 }
 
-/** The selected clip: where it starts, how long it is, its crop, what's wrong with it, and its first and last frames
- *  as the cut gives them. */
+/** The selected clip: its file, where it starts, how long it is, its crop, what's wrong with it, and its first and
+ *  last frames as the cut gives them. */
 function ClipPanel({ plan, v, clip, locked, aspect, onChange, onRemove, onNudge, onAspect, onCropAll }: {
   plan: Plan; v: PlanVideo; clip: Clip; locked: boolean; aspect: string; onChange: (c: Clip) => void; onRemove: () => void;
   onNudge: (by: number) => void; onAspect: (a: string) => void; onCropAll: () => void;
@@ -671,7 +674,7 @@ function ClipPanel({ plan, v, clip, locked, aspect, onChange, onRemove, onNudge,
       <div className="row wrap" style={{ gap: 8 }}>
         <strong>Clip {clip.id}</strong>
         <span className={"pill " + (st === "cut" ? "completed" : "running")}>{st === "cut" ? "Cut" : st === "new" ? "Not cut yet" : "Changed"}</span>
-        <span className="faint mono ellipsis">{clipFile(v, clip)}</span>
+        {v.stem && <span className="faint mono ellipsis">{clipFile(v.stem, clip)}</span>}
         <span className="spacer" />
         <button className="btn sm danger" onClick={onRemove} disabled={locked}><IconTrash /> Remove</button>
       </div>

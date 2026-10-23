@@ -53,7 +53,6 @@ from .offload import ActivationOffload, make_room, park_optimizer, unpark
 from .slider import Slider, slider_loss
 
 
-PREVIEW_FRAMES = 12  # a RefMod's frames decoded for its job page
 
 
 class StopRequested(Exception):
@@ -262,7 +261,7 @@ class Trainer:
         """Per item {role: cache key}; registers every condition in ``conds``."""
         out, memo = [], {}
         for it in items:
-            sig = (it.path, it.flip, it.size, it.frames, it.caption, it.lyrics)
+            sig = (it.path, it.flip, it.size, it.frames, it.caption, it.lyrics, tuple(it.refs))
             if sig not in memo:
                 roles = {}
                 for role, (prompt, images) in self.driver.item_conditions(it, self.s).items():
@@ -530,8 +529,11 @@ class Trainer:
         s = self.s
         available = {c["file"] for c in self.status["checkpoints"]}
         before = self.ev.get("recommended")
+        # bleed counts while the probe runs: with it off (``make_evaluators``), the checkpoints it doesn't measure
+        # would never count as under the limit
         rec = evaluation.recommend(self.ev["evals"], bool(s.get("picker_enabled")),
-                                   bool(s.get("bleed_enabled")), float(s.get("bleed_max", 25)), available)
+                                   bool(s.get("bleed_enabled")) and self.probe is not None,
+                                   float(s.get("bleed_max", 25)), available)
         self.ev["recommended"] = rec
         if rec and (not before or before.get("file") != rec["file"]):
             self.log(f"Recommended checkpoint: {rec['file']} (step {rec['step']}): {rec['reason']}")
@@ -589,7 +591,8 @@ class Trainer:
         # flip and caption dropout are each dataset's own (jobs from before that have the job's)
         items = ds.build_items(self.training_datasets(), res, driver.bucket_divisibility, bool(s.get("flip", False)),
                                log=self.log, video_frames=video_frames, snap_frames=driver.snap_frames, fps=driver.fps,
-                               caption_dropout=float(s.get("caption_dropout", 0.0)))
+                               caption_dropout=float(s.get("caption_dropout", 0.0)),
+                               references=driver.trains_references)
         if len(res) > 1:
             per_res = {r: sum(1 for it in items if it.resolution == r) for r in res}
             self.log("Training at " + ", ".join(f"{r} ({n} items)" for r, n in per_res.items()))
@@ -622,8 +625,8 @@ class Trainer:
             elif validation_datasets:
                 # validation loss is measured at one size: the largest
                 val_items = list({it.path: it for it in ds.build_items(
-                    validation_datasets, res[-1], div, False, log=self.log,
-                    video_frames=video_frames, snap_frames=driver.snap_frames, fps=fps)}.values())
+                    validation_datasets, res[-1], div, False, log=self.log, video_frames=video_frames,
+                    snap_frames=driver.snap_frames, fps=fps, references=driver.trains_references)}.values())
                 overlap = {it.path for it in val_items} & {it.path for it in items}
                 if overlap:
                     self.log(f"Note: {len(overlap)} validation item(s) are also training items; the picker "
@@ -744,8 +747,10 @@ class Trainer:
         return network
 
     def make_evaluators(self, driver, model, network, items, val_keys, val_payload_files, bleed_prompts,
-                        prefix: str = "bleed"):
-        """The checkpoint picker's validator and the concept-bleed probe, as the settings ask."""
+                        prefix: str = "bleed", base_weights: bool = True):
+        """The checkpoint picker's validator and the concept-bleed probe, as the settings ask. Without
+        ``base_weights`` (a resumed finetune's are a checkpoint's), the probe can't render the base model, so it runs
+        only if its references from step 0 are still there."""
         s, div = self.s, driver.bucket_divisibility
         if s.get("picker_enabled"):
             self.validator = evaluation.Validator(
@@ -756,7 +761,11 @@ class Trainer:
                 bleed_prompts, int(s.get("bleed_width", 512)) // div * div, int(s.get("bleed_height", 512)) // div * div,
                 int(s.get("bleed_seed", 1234)), os.path.join(self.job_dir, "samples"), self.render_media, self.log,
                 prefix=prefix)
-            self.probe.setup(model, network, self.device, [it.path for it in items])
+            if not (base_weights or self.probe.has_references()):
+                self.log("Concept bleed: no baseline images from step 0, so the probe is off for this resumed finetune")
+                self.probe = None
+            else:
+                self.probe.setup(model, network, self.device, [it.path for it in items])
 
     def run_evaluation(self) -> str:
         """Score a finished job's saved checkpoints, as asked from its page (``job["evaluate"]``): the base
@@ -803,8 +812,7 @@ class Trainer:
     def run_refmod(self) -> str:
         """Make a RefMod (``engine.refmod``) of the datasets' images and clips with only the video VAE loaded, or
         (``refmod_kind`` audio) of their sound with only the audio VAE: output/<name>.safetensors, copied to
-        ``refmod_copy_to`` if set, and a preview in samples/ (each reference, up to ``PREVIEW_FRAMES`` latent
-        frames decoded one at a time; or the sound, decoded). status["refmod"] describes it."""
+        ``refmod_copy_to`` if set, and a preview in samples/ (``refmod.save_preview``; or the sound, decoded). status["refmod"] describes it."""
         s = self.s
         driver = self.driver = self.make_driver()
         if not driver.info.refmods:
@@ -853,15 +861,9 @@ class Trainer:
                                          os.path.join(self.job_dir, "samples"), "refmod_audio"),
                         frames=0, height=0, width=0, preview=[])
             return self._refmod_done(made)
-        preview = []
-        idx = torch.linspace(0, t - 1, min(t, PREVIEW_FRAMES)).round().long().unique().tolist()
-        self.phase("encoding", f"Decoding a preview of {len(idx)} frame(s)")
-        for n, j in enumerate(idx):
-            self.check_control_during_prep()
-            img = driver.to_media({"video": latent[:, :, j:j + 1].to(self.device), "frames": 1})[0]
-            stem = f"refmod_{n:02d}"
-            img.save(os.path.join(self.job_dir, "samples", stem + ".png"))
-            preview.append({"file": stem + ".png", "frame": j})
+        self.phase("encoding", f"Decoding a preview of {min(t, refmod.PREVIEW_FRAMES)} frame(s)")
+        preview = refmod.save_preview(driver, latent, os.path.join(self.job_dir, "samples"),
+                                      self.check_control_during_prep)
         made.update(frames=int(t), height=int(h), width=int(w), preview=preview)
         return self._refmod_done(made)
 
@@ -1064,7 +1066,8 @@ class Trainer:
 
         if not items:  # a slider job without datasets renders its training images first
             items, payload_files = self.render_slider_images(driver, model, network)
-        self.make_evaluators(driver, model, network, items, val_keys, val_payload_files, bleed_prompts)
+        self.make_evaluators(driver, model, network, items, val_keys, val_payload_files, bleed_prompts,
+                             base_weights=resume_from is None)
         slider_conds = [{k: self.text_emb(p) for k, p in prompts.items()} for prompts in self.slider.prompt_sets()] \
             if self.slider else []
         if self.slider:

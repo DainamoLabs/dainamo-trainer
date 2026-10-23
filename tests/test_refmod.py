@@ -228,6 +228,102 @@ def test_making_one_from_images_and_a_clip(tmp_path):
     assert z.shape == (1, 24, 1, 6, 8) and meta["kind"] == "image" and meta["source"] == "image"
 
 
+def test_the_plan_matches_what_is_made(tmp_path):
+    """``plan`` counts the tokens ``make`` makes and the largest encode, without encoding."""
+    paths = refmod.sources([{"path": _media(tmp_path)}])
+    for extra in ({}, {"refmod_mode": "full"}, {"refmod_merge": True}, {"refmod_frames": 4}):
+        s = {**SETTINGS, **extra}
+        vae = FakeVAE()
+        z, _ = refmod.make(vae, paths, s, log=lambda m: None)
+        plan = refmod.plan(paths, s, 24, P.align_num_frames_down, P.video_latent_num_frames)
+        assert plan["tokens"] == refmod.tokens(z), extra
+        assert plan["per_frame"] == refmod.tokens(z[:, :, :1]) and plan["sheet"] is None
+        assert plan["pixels"] == max(t * h * w for _, _, t, h, w in vae.seen)
+        assert [r["kind"] for r in plan["refs"]] == ["image", "image", "video" if s["refmod_frames"] >= 5 else "image"]
+
+
+def test_a_sheet_keeps_its_images_whole_and_apart(tmp_path):
+    layouts = [refmod.sheet_plan(sizes, 1024) for sizes in
+               ([(800, 1000)] * 2, [(1920, 1080)] * 2, [(1000, 1000)] * 3, [(600, 800)] * 3, [(1000, 1000)] * 6,
+                [(1920, 1080), (600, 800), (600, 800)], [(600, 800)] * 4)]
+    # portraits side by side, landscapes stacked, never wider or taller than 2.5:1, the fewest empty cells
+    assert [(p["columns"], p["rows"]) for p in layouts] == [(2, 1), (1, 2), (2, 2), (3, 1), (3, 2), (3, 1), (2, 2)]
+    sizes = [[(800, 1000)] * 2, [(1920, 1080)] * 2, [(1000, 1000)] * 3, [(600, 800)] * 3, [(1000, 1000)] * 6,
+             [(1920, 1080), (600, 800), (600, 800)], [(600, 800)] * 4]
+    for layout, imgs in zip(layouts, sizes):
+        w, h = layout["size"]
+        assert w % 32 == 0 and h % 32 == 0 and min(w, h) == 1024
+        boxes = layout["boxes"]
+        for (bw, bh), (x, y, fw, fh) in zip(imgs, boxes):
+            assert 0 <= x and x + fw <= w and 0 <= y and y + fh <= h
+            assert abs(fw / fh - bw / bh) < 0.01  # whole, not cropped or squeezed
+        for i, a in enumerate(boxes):  # apart: at least the gutter between any two
+            for b in boxes[i + 1:]:
+                gap = max(b[0] - (a[0] + a[2]), a[0] - (b[0] + b[2]), b[1] - (a[1] + a[3]), a[1] - (b[1] + b[3]))
+                assert gap >= refmod.SHEET_GUTTER
+    # three squares on a 2x2: the last row's one centred
+    assert layouts[2]["boxes"][2][0] == (1024 - layouts[2]["boxes"][2][2]) // 2
+
+    Image.new("RGB", (300, 400), (255, 0, 0)).save(tmp_path / "red.png")
+    Image.new("RGBA", (300, 400), (0, 0, 255, 255)).save(tmp_path / "blue.png")
+    paths = [str(tmp_path / "red.png"), str(tmp_path / "blue.png")]
+    sheet = refmod.make_sheet(paths, 256)
+    layout = refmod.sheet_plan([(300, 400), (300, 400)], 256)
+    assert sheet.size == layout["size"] and sheet.mode == "RGB"
+    (x0, y0, w0, h0), (x1, y1, w1, h1) = layout["boxes"]
+    assert sheet.getpixel((x0 + w0 // 2, y0 + h0 // 2)) == (255, 0, 0)
+    assert sheet.getpixel((x1 + w1 // 2, y1 + h1 // 2)) == (0, 0, 255)
+    assert sheet.getpixel(((x0 + w0 + x1) // 2, sheet.size[1] // 2)) == refmod.SHEET_BACKGROUND  # the gutter
+    # made of the sheet, it's one reference with the tokens the plan counts
+    sheet.save(tmp_path / "sheet.png")
+    s = {**SETTINGS, "refmod_mode": "full"}
+    z, _ = refmod.make(FakeVAE(), [str(tmp_path / "sheet.png")], s, log=lambda m: None)
+    plan = refmod.plan(paths, s, 24, P.align_num_frames_down, P.video_latent_num_frames, sheet=True)
+    assert z.shape[2] == 1 and plan["tokens"] == refmod.tokens(z) and plan["sheet"] == {"columns": 2, "rows": 1}
+
+
+def test_the_sandbox_makes_one_with_the_vae_it_has(tmp_path, monkeypatch):
+    """The Sandbox worker's "refmod" command: a sheet of the images, encoded with the loaded driver's VAE (the same
+    family and VAE file: nothing reloads), saved with its preview and made.json, and copied."""
+    import io
+
+    from dainamo.engine import sandbox as worker
+    from dainamo.engine.families.base import FamilyInfo
+
+    class Loaded(FakeVAE):
+        info = FamilyInfo(id="minimax_h3", label="MiniMax H3", media=["video"], profile_fields=[], refmods=True)
+        device = CPU
+        profile = {"vae": "/models/vae.safetensors", "variant": "ref2va"}
+
+        def to_media(self, latents):
+            return [Image.new("RGB", (16, 16))]
+
+    events = io.StringIO()
+    monkeypatch.setattr(worker, "EVENTS", events)
+    session = worker.Session()
+    session.driver, session.vae_loaded = Loaded(), True
+    monkeypatch.setattr(session, "ensure_driver", lambda p: pytest.fail("reloaded the driver"))
+    for name, colour in (("front", (200, 0, 0)), ("side", (0, 200, 0))):
+        Image.new("RGB", (300, 400), colour).save(tmp_path / f"{name}.png")
+    out_dir, copy_to = tmp_path / "made", tmp_path / "comfy" / "refmods"
+    session.make_refmod({"id": "m1", "out_dir": str(out_dir), "name": "jake_sheet", "sheet": True,
+                         "paths": [str(tmp_path / "front.png"), str(tmp_path / "side.png")],
+                         "settings": {**SETTINGS, "refmod_mode": "full", "refmod_copy_to": str(copy_to)},
+                         "profile": {"id": "p", "family": "minimax_h3",
+                                     "data": {"vae": "/models/vae.safetensors", "variant": "fl2va"}}},
+                        lambda: False)
+    sent = [json.loads(line) for line in events.getvalue().splitlines()]
+    assert sent[0] == {"event": "started", "id": "m1"} and sent[-1]["event"] == "done"
+    made = sent[-1]["made"]
+    assert made["name"] == "jake_sheet" and made["sheet"] and made["references"] == 2 and made["frames"] == 1
+    assert session.driver.seen == [(1, 3, 1, *reversed(Image.open(out_dir / "sheet.png").size))]  # one reference
+    assert refmod.read_meta(str(out_dir / "jake_sheet.safetensors"))["name"] == "jake_sheet"
+    assert (copy_to / "jake_sheet.safetensors").exists() and made["copied_to"] == str(copy_to)
+    assert made["preview"] == [{"file": "refmod_00.png", "frame": 0}] and (out_dir / "refmod_00.png").exists()
+    assert json.loads((out_dir / "made.json").read_text()) == made and made["family"] == "minimax_h3"
+    assert any(e["event"] == "progress" and "sheet" in e["message"] for e in sent)
+
+
 class FakeAudioVAE:
     """Encodes like the H3 audio VAE in shape: (B, 1, samples) -> (B, 32, ceil(samples / 800)), each latent its
     800 samples' loudness (mean absolute value, repeated over the channels)."""
@@ -318,9 +414,12 @@ def test_ref2va_takes_refmods_as_reference_rows(tmp_path):
     assert video == 7 * 2 * 3
     # the references' tokens go in ahead of the video's: a's 1x2x3 and b's 3x1x1
     assert m.calls[0]["hidden_states"].shape[1] == video + 6 + 3
-    with pytest.raises(ValueError, match="ref2va"):
-        MinimaxH3Driver({"variant": "fl2va"}, CPU).sample(Recorder(), text_cond(), None, 96, 64, 2, 0, 7, frames=22,
-                                                         refmods=[{"path": a}])
+    fl2va = MinimaxH3Driver({"variant": "fl2va"}, CPU)
+    with pytest.raises(ValueError, match="Reference-to-Video"):
+        fl2va.sample(Recorder(), text_cond(), None, 96, 64, 2, 0, 7, frames=22, refmods=[{"path": a}])
+    m2 = Recorder()  # fl2va with Reference-to-Video, which it wasn't trained for
+    fl2va.sample(m2, text_cond(), None, 96, 64, 2, 0, 7, frames=22, refmods=[{"path": a}], references=True)
+    assert m2.calls[0]["hidden_states"].shape[1] == video + 6
 
 
 def test_a_standalone_audio_reference_packs_as_the_released_pipeline_does():

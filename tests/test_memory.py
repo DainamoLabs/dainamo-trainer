@@ -130,6 +130,25 @@ def test_projection_adds_up(tmp_path):
     assert multi["phases"] == p["phases"]  # several resolutions peak at the largest
 
 
+def test_a_training_adapter_counts_every_tensor_it_loads(tmp_path):
+    """A LoKr training adapter (or whole changes) counts too, not only a LoRA's .weight keys; alphas don't."""
+    k = "diffusion_model.blocks.0.attn"
+    lokr, lora, whole = tmp_path / "lokr.safetensors", tmp_path / "lora.safetensors", tmp_path / "whole.safetensors"
+    save_file({f"{k}.lokr_w1": torch.zeros(2, 2), f"{k}.lokr_w2": torch.zeros(32, 32, dtype=torch.bfloat16),
+               f"{k}.alpha": torch.tensor(1.0)}, str(lokr))
+    save_file({f"{k}.lora_A.weight": torch.zeros(4, D), f"{k}.lora_B.weight": torch.zeros(D, 4),
+               f"{k}.alpha": torch.tensor(4.0)}, str(lora))
+    save_file({f"{k}.diff": torch.zeros(D, D), f"{k}.diff_b": torch.zeros(D)}, str(whole))
+    assert memory.adapter_bytes(str(lokr)) == (2 * 2 + 32 * 32) * 2  # in bf16
+    assert memory.adapter_bytes(str(lora)) == 2 * 4 * D * 2
+    assert memory.adapter_bytes(str(whole)) == (D * D + D) * 2
+    assert memory.adapter_bytes("") == 0 and memory.adapter_bytes(str(tmp_path / "gone.safetensors")) is None
+    p = memory.project(TinyDriver, {"diffusion_model": write_model(tmp_path / "m.safetensors"),
+                                    "training_adapter": str(lokr)}, {"resolution": 512, "rank": 4})
+    params = N * 2 * 4 * (D + D)
+    assert dict(p["phases"][0]["parts"])["LoRA"] == pytest.approx((params * 8 + (2 * 2 + 32 * 32) * 2) / memory.GB)
+
+
 class TinyVideoDriver(TinyDriver):
     info = FamilyInfo(id="tinyvideo", label="Tiny video", media=["image", "video"], profile_fields=[])
 

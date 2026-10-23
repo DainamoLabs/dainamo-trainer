@@ -63,6 +63,35 @@ def test_swapped_blocks_match_resident_blocks(ckpt):
     swapper.remove()
 
 
+def test_every_pass_prefetches_the_block_after_the_one_running():
+    """Each streamed block is copied in on the side stream while the one before it runs, in every forward pass, not
+    just the first: a pass after another (which ended on the last block) or after backward (whose recomputation ran
+    the blocks last to first, ending on the first streamed one) still prefetches forward."""
+    dev = torch.device("cuda", torch.cuda.device_count() - 1)
+    torch.manual_seed(0)
+    blocks = nn.ModuleList(Block(64) for _ in range(6))
+    swapper = BlockSwapper(blocks, 3, dev, log=lambda *_: None)
+    copies = []  # (block, on the side stream)
+    copy_in = swapper._copy_in
+    swapper._copy_in = lambda i, stream: copies.append((i, stream is swapper.stream)) or copy_in(i, stream)
+    x = torch.randn(8, 64, device=dev)
+    with torch.no_grad():
+        for _ in range(3):  # sampling steps, or a text encoder's prompts
+            copies.clear()
+            run(blocks, x, False)
+            assert copies == [(3, True), (4, True), (5, True)]
+    copies.clear()
+    run(blocks, x, True).square().mean().backward()
+    # forward, then the recomputation from the last block (which forward swapped out) down, fetching the one below
+    # meanwhile; the last resident block's fetches the first streamed one for the next pass
+    assert copies == [(3, True), (4, True), (5, True), (5, False), (4, True), (3, True), (3, True)]
+    copies.clear()
+    with torch.no_grad():
+        run(blocks, x, False)
+    assert copies == [(4, True), (5, True)]
+    swapper.remove()
+
+
 class TinyEncoder(nn.Module):
     """A text encoder's shape: an embedding, a vision tower's blocks and a language model's layers."""
 

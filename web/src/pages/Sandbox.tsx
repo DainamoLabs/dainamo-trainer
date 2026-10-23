@@ -2,9 +2,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   api, byFamily, fmtClock, fmtDuration, fmtTime, type Family, type Gpu, type LoraOption, type ModelOption, type Profile, type RefModOption, type SandboxDefaults,
   type SandboxOutput, type SandboxParams, type SandboxProgress, type SandboxRun, type SandboxStatus, type SystemRam,
-  type Workflow,
+  type MediaKind, type Workflow,
 } from "../api";
 import { IconPlayFill, IconPlus, IconRefresh, IconRight, IconSparkle, IconStop, IconTrash, IconX } from "../components/icons";
+import { MakeRefModDialog, NEW_REFMOD, type RefModDraft } from "../components/MakeRefMod";
 import { AudioPlayer, Empty, ImagesInput, Info, Lightbox, PathInput, ProfileOptions, StatusPill, usePoll, useToast } from "../components/ui";
 import { OffloadControl, gpuTarget, offloadFit, useVramProjection } from "../components/Vram";
 
@@ -120,6 +121,9 @@ function saveForm(f: Form) {
 
 const fileUrl = (run: SandboxRun, name: string) => `/api/sandbox/file/${run.id}/${encodeURIComponent(name)}`;
 const base = (p: string) => p.split("/").pop() || p;
+
+// the workflow menu's groups, by what each workflow makes
+const WORKFLOW_GROUPS: [MediaKind, string][] = [["image", "Image"], ["video", "Video"], ["audio", "Music"]];
 
 // reference audio: sound files, or videos for their soundtrack
 const AUDIO_EXTS = ".mp3,.wav,.flac,.ogg,.m4a,.opus,.aac,.mp4,.mov,.mkv,.webm";
@@ -303,7 +307,12 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
   const profile = profiles?.find((p) => p.id === form.profile_id);
   const family = families.find((f) => f.id === profile?.family);
   const [loraOptions] = usePoll<LoraOption[]>(family ? `/api/sandbox/loras?family=${family.id}` : null, 0, [family?.id]);
-  const [refmodOptions] = usePoll<RefModOption[]>(family?.refmods ? `/api/sandbox/refmods?family=${family.id}` : null, 0, [family?.id]);
+  const [refmodOptions, reloadRefmods] = usePoll<RefModOption[]>(family?.refmods ? `/api/sandbox/refmods?family=${family.id}` : null, 0, [family?.id]);
+  // Make RefMod: its dialog's settings (kept between makes), whether it's open, and the make this page asked for
+  const [refmodDraft, setRefmodDraft] = useState<RefModDraft>(NEW_REFMOD);
+  const [refmodOpen, setRefmodOpen] = useState(false);
+  const [makingId, setMakingId] = useState<string | null>(null);
+  const handledMake = useRef<string | null>(null);
   const [modelOptions] = usePoll<ModelOption[]>(family?.finetune ? `/api/sandbox/models?family=${family.id}` : null, 0, [family?.id]);
 
   // pick a profile, then load its defaults; switching profiles applies them (and a workflow it supports)
@@ -346,6 +355,8 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
   const current = runs.find((r) => r.id === selected) || runs[0];
   const active = runs.filter((r) => r.status === "queued" || r.status === "running");
   const progress = session?.progress;
+  const making = makingId && session?.refmod?.id === makingId ? session.refmod : null;
+  const makingNow = making?.state === "queued" || making?.state === "running";
   const offload = form.offload ?? defaults?.offload ?? 0;
   const lowVram = !!form.low_vram && !!family?.streams_text_encoder;
   const [advanced, setAdvanced] = useState(() => {
@@ -366,6 +377,30 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
   // reference sound files: for a video only
   const formAudio = form.audio || [];
   const audioRefs = wf?.audio && video && form.frames > 1 ? formAudio.map((a) => a.trim()).filter(Boolean) : [];
+  // the RefMods menu: the Sandbox's, then the jobs'
+  const refmodGroups: [string, RefModOption[]][] = [["Made in the Sandbox", (refmodOptions || []).filter((o) => !o.job_id)],
+    ["Made by RefMod jobs", (refmodOptions || []).filter((o) => o.job_id)]];
+  // the dialog opens on its settings (the reference images, if it has no files yet), or on a make still going
+  const openMakeRefmod = () => {
+    if (making && !makingNow) setMakingId(null);
+    if (!refmodDraft.paths.some((p) => p.trim())) setRefmodDraft({ ...refmodDraft, paths: images.length ? images : [""] });
+    setRefmodOpen(true);
+  };
+  // a RefMod this page asked for, once made: listed, and added to the RefMods if there's room
+  useEffect(() => {
+    if (!making || handledMake.current === making.id || (making.state !== "done" && making.state !== "failed")) return;
+    handledMake.current = making.id;
+    if (making.state === "failed" || !making.made) {
+      if (!refmodOpen) toast(`Couldn't make the RefMod: ${making.message}`, true);
+      return;
+    }
+    const made = making.made;
+    reloadRefmods();
+    const rows = formRefmods.filter((l) => l.path.trim());
+    const room = !!wf?.refmods && rows.length < 4 && !rows.some((l) => l.path === made.path);
+    if (room) setForm({ refmods: [...rows, { path: made.path, strength: 1, custom: false }] });
+    if (!refmodOpen) toast(`Made ${made.name}${room ? " and added it to RefMods" : ""}`);
+  }, [making?.id, making?.state]); // eslint-disable-line react-hooks/exhaustive-deps
   const mode: SizeMode = form.size_mode === "match" && !wf?.images ? "shape" : form.size_mode;
   useEffect(() => {
     const path = images[0];
@@ -541,10 +576,14 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
             <label className="field">
               <span>Workflow<Info text={INFO.workflow} /></span>
               <select value={form.workflow} onChange={(e) => setForm({ workflow: e.target.value, images: "" })}>
-                {workflows.map((w) => {
-                  const ok = supported.some((s) => s.id === w.id);
-                  return <option key={w.id} value={w.id} disabled={!ok}>{w.label}{ok ? "" : ` — not for ${family?.label || "this model"}`}</option>;
-                })}
+                {WORKFLOW_GROUPS.map(([kind, label]) => (
+                  <optgroup key={kind} label={label}>
+                    {workflows.filter((w) => w.output === kind).map((w) => {
+                      const ok = supported.some((s) => s.id === w.id);
+                      return <option key={w.id} value={w.id} disabled={!ok}>{w.label}{ok ? "" : ` — not for ${family?.label || "this model"}`}</option>;
+                    })}
+                  </optgroup>
+                ))}
               </select>
             </label>
           </div>
@@ -603,8 +642,12 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
                     ) : (
                       <select value={l.path} onChange={(e) => e.target.value === "__custom" ? setRefmod(i, { custom: true, path: "" }) : setRefmod(i, { path: e.target.value })}>
                         <option value="">Choose a RefMod…</option>
-                        {(refmodOptions || []).map((o) => (
-                          <option key={o.path} value={o.path}>{o.job_name} · {o.kind === "audio" ? `sound, ${o.seconds} s` : o.mode} · {o.tokens.toLocaleString()} tokens</option>
+                        {refmodGroups.map(([label, opts]) => opts.length > 0 && (
+                          <optgroup key={label} label={label}>
+                            {opts.map((o) => (
+                              <option key={o.path} value={o.path}>{o.job_name} · {o.kind === "audio" ? `sound, ${o.seconds} s` : `${o.mode}${o.sheet ? ", sheet" : ""}`} · {o.tokens.toLocaleString()} tokens</option>
+                            ))}
+                          </optgroup>
                         ))}
                         <option value="__custom">Other file…</option>
                       </select>
@@ -618,7 +661,8 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
                   <button className="btn" onClick={() => setForm({ refmods: [...formRefmods, { path: "", strength: 1, custom: false }] })} disabled={formRefmods.length >= 4}>
                     <IconPlus /> Add RefMod
                   </button>
-                  {refmodOptions && refmodOptions.length === 0 && <span className="faint small">None made yet: make one on Create Job (Make: RefMod).</span>}
+                  <button className="btn" onClick={openMakeRefmod}><IconSparkle /> {makingNow ? "Making RefMod…" : "Make RefMod…"}</button>
+                  {refmodOptions && refmodOptions.length === 0 && <span className="faint small">None made yet.</span>}
                 </div>
               </div>
             </div>
@@ -986,6 +1030,10 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
         </div>
       </div>
       {light && <Lightbox src={light.src} video={light.video} audio={light.audio} onClose={() => setLight(null)} />}
+      {refmodOpen && (
+        <MakeRefModDialog draft={refmodDraft} setDraft={setRefmodDraft} profileId={form.profile_id} gpu={gpu} making={making}
+          onMake={setMakingId} onBack={() => setMakingId(null)} onClose={() => setRefmodOpen(false)} />
+      )}
     </div>
   );
 }

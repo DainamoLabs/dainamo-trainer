@@ -9,8 +9,8 @@ name. To write captions with a vision LLM, see [Captions](captions.md).
 A dataset's page shows its files in one of two views, and remembers the one
 you chose:
 
-- **Grid**: big cards, 24 to a page. A song plays on its card. **Edit
-  caption** edits it in place; Ctrl/Cmd+Enter or clicking away saves, Esc
+- **Grid**: big cards, 24 to a page. A song plays on its card. Click a
+  caption to edit it in place; Ctrl/Cmd+Enter or clicking away saves, Esc
   cancels. A card's **⋯** enlarges the file, copies its path or deletes it.
 - **List**: smaller cards, every file on one page. Click a caption to edit it.
 
@@ -46,12 +46,39 @@ but other trainers read captions as they are. **Delete** removes the selected
 datasets. Linked folders are left alone; uploaded files are deleted only if you
 tick the box. Esc or **Done** leaves Select.
 
-## Reference images
+## Edit datasets: sources and results
 
-Qwen-Image 2.1 edit sources and MiniMax H3 ref2va references go in a `_refs`
-folder inside the dataset, named after the file they belong to:
-`_refs/photo.png`, `_refs/photo_1.png`, and so on. In an edit dataset, the image
-is the result and its caption is the instruction.
+An edit LoRA (Qwen-Image 2.1) learns from pairs: an image before the edit, the
+image after, and an instruction. Keep them as two datasets:
+
+- **the results**: the images after the edit, each captioned with the edit
+  instruction ("Make it night: …"). This is the dataset the job trains;
+- **the sources**: the images before the edit, with the same file names
+  (`photo.jpg` pairs with `photo.png`; the type doesn't matter). They need no
+  captions.
+
+In Create Job, choose the results as the dataset and the sources as its
+**Source dataset**. A second or third source dataset adds more images to each
+edit. The two folders can be nested either way: sources in a subfolder of the
+results are only sources, and results in a subfolder of the sources (`photos/`
+and `photos/edited/`) train as results and are never their own source. With
+no source dataset, the model trains text-to-image, so the same model trains
+plain LoRAs from one dataset. A result without a source of its name trains
+text-to-image too, its caption a prompt.
+
+The card says how many files pair (**4 of 6 files pair with a source image**),
+its health check lists the files without a source and the sources that pair
+with none (usually a name that differs), and **Show pairs** shows each source
+beside its result and instruction. The dataset page's health check does the
+same: choose the model and a source dataset beside the resolution.
+
+MiniMax H3's ref2va trains with reference images the same way, from a
+**Reference dataset** (`clip.mp4` pairs with `clip.png`).
+
+Datasets from before source datasets keep their sources in a `_refs` folder
+inside the dataset, named after the file they belong to: `_refs/photo.png`,
+`_refs/photo_1.png`, and so on. Those are used when no source dataset is
+chosen, and checked and shown the same way.
 
 ## Health check
 
@@ -70,9 +97,11 @@ Folded, it still shows how the last check went:
   2.5: 1024);
 - clips shorter or longer than the clip length (a longer one trains only its
   start);
-- notes: captions without the trigger word, caption files with no image.
+- notes: captions without the trigger word, caption files with no image;
+- for a model that trains with source or reference images: files without one,
+  and sources that pair with no file.
 
-Each dataset card in Create Job runs the same check for that job. For songs, see
+Each dataset in Create Job runs the same check for that job. For songs, see
 [Music](music.md#datasets).
 
 ## Edit captions

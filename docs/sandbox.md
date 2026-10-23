@@ -4,7 +4,8 @@
 
 The Sandbox generates with a profile and LoRAs, to test them.
 
-- **Workflow**: only the ones the profile's model supports can be chosen.
+- **Workflow**, grouped into Image, Video and Music: only the ones the
+  profile's model supports can be chosen.
 - **Size**: a shape and megapixels, where a megapixel is 1024×1024 and sizes
   snap to 64 (1 MP at 9:16 is 768×1344). **Match input** takes the input
   image's shape; **Custom** takes a width and height.
@@ -14,7 +15,10 @@ The Sandbox generates with a profile and LoRAs, to test them.
 - **Diffusion model**, for MOSS-Image: the profile's, or a
   [finetune](finetuning.md) job's checkpoint.
 - Reference-to-Video with MiniMax H3 also takes [RefMods](refmods.md) and
-  reference audio.
+  reference audio; **Make RefMod…** makes one of images and clips, or a sheet
+  of images, without unloading the model. It works with an fl2va profile too,
+  but fl2va wasn't trained on references, so it may follow them less closely
+  than ref2va.
 
 **Compare with base model** renders each seed again without the LoRAs. **Compare
 checkpoints** renders one prompt and seed with each of a job's chosen

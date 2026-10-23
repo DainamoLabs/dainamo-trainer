@@ -1,24 +1,29 @@
 import { useEffect, useState } from "react";
-import { api, q } from "../api";
+import { api, q, type FamilySources } from "../api";
 
 type FileRef = { path: string; name: string };
 export type CheckIssue = {
   id: string; level: "error" | "warning" | "info"; title: string; detail: string; count: number;
   files?: FileRef[]; groups?: FileRef[][];
 };
-// longest_clip: the longest clip's frames at 24 fps (0: no clips)
-export type CheckResult = { files: number; images: number; videos: number; audio?: number; issues: CheckIssue[]; longest_clip?: number };
+// how a model that trains with reference images pairs the files: ``with`` of ``of`` have one, from source datasets
+// or the _refs folder; ``most``: the most one file has
+export type CheckPairs = { with: number; of: number; from: "sources" | "refs"; most: number };
+// longest_clip: the longest clip's frames at 24 fps (0: no clips); pairs: null when nothing pairs (text-to-image)
+export type CheckResult = { files: number; images: number; videos: number; audio?: number; issues: CheckIssue[]; longest_clip?: number; pairs?: CheckPairs | null };
 
 /** The dataset health check for training at ``resolution`` with a model ``family`` (re-run as they change);
  * ``frames`` is a video model's clip length (``auto``: each clip at its own length), ``seconds`` a music model's
- * (0: whole songs). */
-export function useDatasetCheck(id: string | null, params: { resolution?: string; family?: string; frames?: number; seconds?: number; auto?: boolean }) {
+ * (0: whole songs). With ``references`` (the model trains with reference images) it checks how the files pair
+ * with the images of the ``sources`` datasets, or else the _refs folder. */
+export function useDatasetCheck(id: string | null, params: { resolution?: string; family?: string; frames?: number; seconds?: number; auto?: boolean; references?: boolean; sources?: string[] }) {
   const [result, setResult] = useState<CheckResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [nonce, setNonce] = useState(0);
   const query = `resolution=${q(params.resolution || "")}&family=${q(params.family || "")}&frames=${params.frames || 0}`
-    + `&seconds=${params.seconds ?? -1}${params.auto ? "&auto=true" : ""}`;
+    + `&seconds=${params.seconds ?? -1}${params.auto ? "&auto=true" : ""}`
+    + (params.references ? `&references=true&sources=${q((params.sources || []).join(","))}` : "");
   useEffect(() => {
     if (!id) { setResult(null); return; }
     let live = true;
@@ -77,6 +82,20 @@ export function CheckIssues({ result, compact = false, onOpen }: {
           </div>
         </details>
       ))}
+    </div>
+  );
+}
+
+/** "38 of 40 files pair with a source image" (a model that trains with reference images), and a button to see them. */
+export function PairSummary({ pairs, info, onShow }: { pairs: CheckPairs; info: FamilySources; onShow?: () => void }) {
+  const all = pairs.with === pairs.of;
+  return (
+    <div className="pair-summary">
+      <span className={all ? "ok" : pairs.with ? "part" : "none"}>{all ? "✓ " : ""}{pairs.with} of {pairs.of} file{pairs.of === 1 ? "" : "s"} pair
+        with {pairs.most > 1 ? `${info.noun}s` : `a ${info.noun}`}</span>
+      {pairs.from === "refs" && <span className="faint"> from the _refs folder</span>}
+      {!all && <span className="muted"> · {pairs.of - pairs.with} {info.without}</span>}
+      {onShow && <button className="btn ghost sm" onClick={onShow}>Show pairs</button>}
     </div>
   );
 }

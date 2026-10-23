@@ -7,17 +7,24 @@
 ## Create Job
 
 Pick a profile, the datasets and the training settings, then add the job to the
-queue. Each dataset is a card with its own:
+queue. The sidebar sums up the run (its datasets, epochs, saves and file size)
+and estimates its memory; when **Add to queue** is greyed out, the line under it
+says what's missing.
+
+Each dataset (**Add dataset** for more) has its own:
 
 - **repeats**: how much it counts against the other datasets;
 - **resolutions**: with several, each file trains at each size, bucketed by
   aspect ratio, so the LoRA works across sizes. Files are never upscaled;
 - **caption dropout**: the chance a step uses an empty caption, which keeps the
   LoRA working without its trigger words;
-- **flip**: also train on mirror images.
+- **flip**: also train on mirror images;
+- **source datasets**, for an edit model (Qwen-Image 2.1) or MiniMax H3's
+  ref2va: the images its files pair with by name, the sources of an edit
+  ([Edit datasets](datasets.md#edit-datasets-sources-and-results)). Leave it
+  empty to train text-to-image.
 
-Each card runs the dataset's [health check](datasets.md#health-check) for this
-job.
+Each runs the dataset's [health check](datasets.md#health-check) for this job.
 
 **Video models** can mix image and clip datasets (say, stills at 1024 and clips
 at 384 and 512). A clip trains its first frames up to the clip length, never
@@ -26,14 +33,15 @@ instead, up to 241 frames (10 s). To use more of long videos, see
 [Split into clips](datasets.md#split-into-clips-video-models).
 
 VRAM is set by the biggest step: the largest size, and for clips the clip
-length. For **Layer offloading**, **Fit to GPU** and **Low VRAM**, see
-[Memory](memory.md).
+length. For **Layer offloading**, **Fit to GPU** and **Low VRAM**, in the
+sidebar's **Memory estimate**, see [Memory](memory.md).
 
 Besides a LoRA, a job can make:
 
-- a LoKr: **Network** under Training ([LoKr](lokr.md));
-- a slider, for image models: **Slider** under Train ([Sliders](sliders.md));
-- a finetune, for MOSS-Image and Krea 2: **Finetune** under Train
+- a LoKr: **LoKr** under Training method ([LoKr](lokr.md));
+- a slider, for image models: **Slider** under Training method
+  ([Sliders](sliders.md));
+- a finetune, for MOSS-Image and Krea 2: **Finetune** under Training method
   ([Full finetuning](finetuning.md));
 - a RefMod, for MiniMax H3: **RefMod** under Make ([RefMods](refmods.md)).
 
@@ -44,7 +52,9 @@ use the Sampling defaults.
 
 Each job's card shows a small loss curve once it has 10 steps, so you can spot a
 run going wrong without opening it. **Settings** sets the queue mode (one job at
-a time, several on one GPU, or spread across GPUs) and which GPUs to use.
+a time, several on one GPU, or spread across GPUs) and which GPUs to use. Jobs
+start in order; one pinned to a GPU that's busy or held by the Sandbox lets the
+next in line go first.
 
 **Select** puts a checkbox on each job, to delete several at once, optionally
 with their files (LoRAs or finetuned models, samples and training state). A

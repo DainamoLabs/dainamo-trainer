@@ -133,6 +133,48 @@ def test_sample_specs_and_conditions():
     assert YuE2Driver({}, torch.device("cpu")).cfg_scale(None) == 1.01  # planning off: the release's guidance
 
 
+def test_another_checkpoint_loads_its_own_composer_and_vae(tmp_path, monkeypatch):
+    """The Sandbox can point the driver at another checkpoint (``Session.use_model``): the tokenizer, composer and
+    VAE come from it then, not from the one loaded before; from the same one they're kept."""
+    from safetensors.torch import save_file
+
+    from dainamo.engine.families.yue2 import driver as yd
+
+    files = []
+    for name in ("a", "b"):
+        path = str(tmp_path / f"{name}.safetensors")
+        save_file({"text_encoders.yue2_tokenizer_json": torch.tensor(list(name.encode()), dtype=torch.uint8)}, path)
+        files.append(path)
+    loads = []
+
+    def load_state_dict(path, strip_prefix="", **kw):
+        loads.append((os.path.basename(path), strip_prefix))
+        return SimpleNamespace(tensors={})
+
+    class Part(torch.nn.Module):  # the composer's and the VAE's stand-in
+        def load_state_dict(self, sd, assign=False):
+            pass
+
+    monkeypatch.setattr(yd.comfy_io, "load_state_dict", load_state_dict)
+    monkeypatch.setattr(yd, "materialize", lambda *a, **kw: None)
+    monkeypatch.setattr(yd, "assert_materialized", lambda m: None)
+    for k, v in (("TextTokenizer", lambda blob: blob), ("Composer", Part), ("VAE", Part), ("fold_weight_norm", dict)):
+        monkeypatch.setattr(M, k, v)
+    d = YuE2Driver({"diffusion_model": files[0]}, torch.device("cpu"), log=lambda *_: None)
+    d.load_text_encoder()
+    d.load_vae()
+    composer, vae = d.text_encoder, d.vae
+    d.load_text_encoder()
+    d.load_vae()
+    assert d.text_encoder is composer and d.vae is vae and d._tokenizer() == "a"
+    assert loads == [("a.safetensors", "text_encoders."), ("a.safetensors", "vae.")]
+    d.profile["diffusion_model"] = files[1]  # as use_model does
+    d.load_text_encoder()
+    d.load_vae()
+    assert d.text_encoder is not composer and d.vae is not vae and d._tokenizer() == "b"
+    assert loads[2:] == [("b.safetensors", "text_encoders."), ("b.safetensors", "vae.")]
+
+
 # --- the acoustic model -----------------------------------------------------------------------------------
 def _nar():
     torch.manual_seed(0)

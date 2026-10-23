@@ -16,7 +16,8 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 
-from ...engine.dataset import caption_path, list_media, media_kind, read_caption, resolutions, split_clips
+from ...engine.dataset import (REFS_DIR, caption_path, inside, list_media, media_kind, nested_sources, read_caption,
+                               resolutions, split_clips)
 from ...engine.families import get_family
 from ...engine.media import spectrogram
 from ...engine.transcribe import MODELS as WHISPER_MODELS
@@ -178,6 +179,8 @@ def delete_media(path: str):
     d = _in_dataset(path)
     if not d["managed"]:
         raise HTTPException(400, "Files in linked folders are not deleted from disk; remove them yourself")
+    if os.path.isdir(path):
+        raise HTTPException(400, "That's a folder: only files are deleted here")
     for p in (path, caption_path(path)):
         if os.path.exists(p):
             os.remove(p)
@@ -187,12 +190,16 @@ def delete_media(path: str):
 @router.get("/media")
 def media(path: str):
     _in_dataset(path)
+    if not os.path.isfile(path):
+        not_found("File not found")
     return FileResponse(path)
 
 
 @router.get("/thumb")
 def thumb(path: str, size: int = 384):
     _in_dataset(path)
+    if not os.path.isfile(path):  # removed since the page listed it
+        not_found("File not found")
     st = os.stat(path)
     key = hashlib.sha1(f"{path}|{st.st_mtime_ns}|{size}".encode()).hexdigest()
     out = os.path.join(THUMBS, key + ".jpg")
@@ -219,15 +226,30 @@ def thumb(path: str, size: int = 384):
     return FileResponse(out, headers={"Cache-Control": "max-age=86400"})
 
 
+def _source_datasets(did: str, sources: str) -> list[dict]:
+    """The source datasets of comma-separated ids: [{id, name, path}]."""
+    out = []
+    for sid in [x.strip() for x in sources.split(",") if x.strip()]:
+        if sid == did:
+            raise HTTPException(400, "A dataset can't be its own source")
+        s = dataset_or_404(sid)
+        out.append({"id": s["id"], "name": s["name"], "path": s["path"]})
+    return out
+
+
 @router.get("/datasets/{did}/check")
 def check_dataset(did: str, resolution: str = "", family: str = "", frames: int = 0, seconds: int = -1,
-                  auto: bool = False):
+                  auto: bool = False, references: bool = False, sources: str = ""):
     """Health check (``dataset_check``) for training at ``resolution`` (comma-separated sizes) with a
     model ``family``; ``frames`` is the clip length for video models (blank: the family's default; ``auto``:
     each clip at its own length, up to the longest a clip trains at), and ``seconds`` a music model's (0: whole
-    songs; -1: the family's default)."""
+    songs; -1: the family's default). ``references``: the model trains with reference images (an edit's source
+    images; the family has ``sources``), paired from ``sources`` (comma-separated source dataset ids) or else the
+    dataset's _refs folder."""
     d = dataset_or_404(did)
     F = family_or_400(family) if family else None
+    refs = F.info.sources if F and references else None
+    paired = _source_datasets(did, sources) if refs else []
     if F and "audio" in F.info.media:
         clip = seconds if seconds >= 0 else int(F.info.training_defaults.get("clip_seconds", 30))
         return dataset_check.check(d["path"], d["trigger"], token_limit=F.caption_tokens, clip_seconds=clip)
@@ -238,7 +260,36 @@ def check_dataset(did: str, resolution: str = "", family: str = "", frames: int 
         clip_length = MAX_FRAMES if auto else frames or int(F.info.training_defaults.get("num_frames", 39))
         video_frames = F.snap_frames(clip_length) if F.snap_frames else clip_length
     return dataset_check.check(d["path"], d["trigger"], res, F.bucket_divisibility if F else 16, video_frames,
-                               F.caption_tokens if F else None, clip_length=clip_length, auto_frames=auto)
+                               F.caption_tokens if F else None, clip_length=clip_length, auto_frames=auto,
+                               references=refs, sources=paired)
+
+
+@router.get("/datasets/{did}/pairs")
+def dataset_pairs(did: str, sources: str = "", video: bool = False):
+    """The dataset's files with the reference images they pair with, as training pairs them: from ``sources``
+    (comma-separated source dataset ids) or else its _refs folder (``dataset_check.pairing``); ``video``: its clips
+    are files too. {from: "sources" | "refs" | None, columns: [source dataset names] (with sources), rows: [{path,
+    name, kind, caption, refs: [path or None per source dataset; with _refs, the references]}], unused: [{name,
+    files: [{path, name}]}] (the reference images no file pairs with)}."""
+    d = dataset_or_404(did)
+    srcs = _source_datasets(did, sources)
+    inner = nested_sources(d["path"], srcs)
+    files = [f for f in (list_media(d["path"]) if os.path.isdir(d["path"]) else [])
+             if (media_kind(f) == "image" or (video and media_kind(f) == "video"))
+             and not any(inside(f, p) for p in inner)]
+    p = dataset_check.pairing(d["path"], files, srcs)
+    if not p["from"]:
+        return {"from": None, "columns": [], "rows": [], "unused": []}
+
+    def named(path: str, root: str) -> dict:
+        return {"path": path, "name": os.path.relpath(path, root)}
+
+    rows = [{**named(f, d["path"]), "kind": media_kind(f), "caption": read_caption(f), "refs": p["refs"][f]}
+            for f in files]
+    unused = [{"name": srcs[i]["name"] if srcs else REFS_DIR,
+               "files": [named(f, srcs[i]["path"] if srcs else d["path"]) for f in fs]}
+              for i, fs in enumerate(p["unused"]) if fs]
+    return {"from": p["from"], "columns": [s["name"] for s in srcs], "rows": rows, "unused": unused}
 
 
 class BulkCaptionIn(BaseModel):

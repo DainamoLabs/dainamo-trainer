@@ -120,8 +120,7 @@ WORKFLOWS = {
 @dataclass
 class Workflow:
     id: str  # a WORKFLOWS key
-    # conditioning images it takes: {"label", "min", "max", "help"}; "help" also explains the dataset's
-    # _refs folder, and the sample cards of a job use the same input
+    # conditioning images it takes: {"label", "min", "max", "help"}; the sample cards of a job use the same input
     images: dict | None = None
     variants: list[str] | None = None  # profile variants it applies to (None: every variant)
     refmods: bool = False  # takes RefMods (``engine.refmod``) as references, as well as or instead of images
@@ -157,6 +156,11 @@ class FamilyInfo:
     # trains as a full finetune (``engine.finetune``) as well as adapters: the settings a finetune starts from
     # (its learning rate and optimizer, how many saves to keep), or None
     finetune: dict[str, Any] | None = None
+    # trains with per-item reference images (an edit's source images), which a training dataset pairs by file name
+    # from up to "max" source datasets (or its _refs folder): {"label" (one source dataset: "Source dataset"),
+    # "noun" (one image: "source image"), "max", "variants" (the profile variants that train with them; None:
+    # every one), "without" (what a file without one trains as), "help"}; None: it doesn't
+    sources: dict[str, Any] | None = None
 
     def to_json(self) -> dict:
         return {
@@ -173,7 +177,20 @@ class FamilyInfo:
             "lora_strength": self.lora_strength,
             "streams_text_encoder": self.streams_text_encoder,
             "finetune": self.finetune,
+            "sources": self.sources,
         }
+
+
+def takes_sources(info: FamilyInfo, profile: dict) -> bool:
+    """Whether a profile's model trains with source datasets (``FamilyInfo.sources``): its variant, or the variant
+    field's default when it has none, is one of theirs."""
+    if not info.sources:
+        return False
+    variants = info.sources.get("variants")
+    if not variants:
+        return True
+    field_ = next((f for f in info.profile_fields if f.key == "variant"), None)
+    return str(profile.get("variant") or (field_.default if field_ else "")) in variants
 
 
 class FamilyDriver:
@@ -184,6 +201,7 @@ class FamilyDriver:
     lora_targets: list[str] = []
     # video families: snaps a requested clip length to a frame count the VAE accepts
     snap_frames = None
+    latent_frames = None  # video families: a clip's frames -> its latent frames (the VAE's compression in time)
     fps: int = 24
 
     # attribute of the diffusion model holding its repeated blocks (the unit offloading streams)
@@ -280,6 +298,15 @@ class FamilyDriver:
         div = cls.bucket_divisibility
         text = cls.memory.text_tokens if cls.memory else 256
         return (width // div) * (height // div) + text
+
+    # reference images ``sequence_tokens`` already counts (MiniMax H3's keyframe or first reference)
+    references_counted = 0
+
+    @classmethod
+    def reference_tokens(cls, width: int, height: int) -> int:
+        """Tokens a training item of this size has more for each reference image it trains with (an edit's source
+        image), in ``sequence_tokens``' units."""
+        return (width // cls.bucket_divisibility) * (height // cls.bucket_divisibility)
 
     def streamed_blocks(self, num_blocks: int) -> int:
         # halves round up, as in the web UI (Python's round() would round them to even)
@@ -392,6 +419,11 @@ class FamilyDriver:
     def is_audio(self) -> bool:
         """Trains on audio files alone (music): items are clips of songs, samples are songs."""
         return "audio" in self.info.media
+
+    @property
+    def trains_references(self) -> bool:
+        """Its items train with the reference images they pair with (``FamilyInfo.sources``), at its variant."""
+        return takes_sources(self.info, self.profile)
 
     def item_conditions(self, item, settings: dict) -> dict[str, tuple[str, list | None]]:
         """Text conditions an item may train with: {role: (prompt, conditioning images or None)}."""

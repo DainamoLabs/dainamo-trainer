@@ -24,7 +24,13 @@ export type Family = {
   lora_strength: number; // the strength its LoRAs are meant to be used at (YuE2: 2)
   // trains as a full finetune too: the settings one starts from (learning rate, optimizer, saves kept); null: it can't
   finetune: Record<string, unknown> | null;
+  // trains with per-file reference images (an edit's source images) from source datasets paired by file name
+  sources: FamilySources | null;
 };
+
+// label: one source dataset ("Source dataset"); noun: one of its images ("source image"); variants: the profile
+// variants that train with them (null: every one); without: what a file without one trains as
+export type FamilySources = { label: string; noun: string; max: number; variants: string[] | null; without: string; help: string };
 
 export type WorkflowImages = { label: string; min: number; max: number; help: string };
 export type MediaKind = "image" | "video" | "audio";
@@ -139,7 +145,24 @@ export type SandboxProgress = {
 export type SandboxSession = {
   state: "off" | "starting" | "ready" | "busy" | "stopping"; gpu: number | null; message: string;
   progress: SandboxProgress | null; current: string | null; pending: string[]; yielding: boolean;
-  idle_seconds: number | null;
+  idle_seconds: number | null; refmod: SandboxRefMod | null;
+};
+// the RefMod the Sandbox is making, or made last
+export type SandboxRefMod = {
+  id: string; name: string; state: "queued" | "running" | "done" | "failed" | "cancelled"; message: string;
+  made: MadeRefMod | null;
+};
+export type MadeRefMod = {
+  name: string; file: string; path: string; kind: string; mode: "full" | "compressed"; references: number; sheet: boolean;
+  tokens: number; bytes: number; frames: number; width: number; height: number; copied_to: string | null;
+  preview: { file: string; frame: number }[];
+};
+// what making a RefMod will do (POST /api/sandbox/refmod/check): each reference at its encode size, the tokens (and
+// how many the cap keeps), the sheet's layout, and the VRAM the largest encode takes beside what's free
+export type RefModCheck = {
+  name: string; refs: { kind: "image" | "video"; width: number; height: number; frames: number }[];
+  tokens: number; per_frame: number; cap: number; kept: number; sheet: { columns: number; rows: number } | null;
+  vram: { gpu: number; need_gb: number; free_gb: number; loaded: boolean } | null; warning: string | null; error: string | null;
 };
 export type SandboxStatus = {
   mode: "reserve" | "idle"; gpu_count: number; training_gpus: number[]; blocked: string | null; session: SandboxSession;
@@ -149,10 +172,10 @@ export type SandboxDefaults = {
   steps: number; cfg: number; negative: string; width: number; height: number; frames: number; seconds?: number;
   supports_samplers: boolean; divisibility: number; offload: number; workflows: FamilyWorkflow[];
 };
-// a RefMod a job made (GET /api/sandbox/refmods)
+// a RefMod a job or the Sandbox made (GET /api/sandbox/refmods): a Sandbox one has no job_id, and job_name is its name
 export type RefModOption = {
-  job_id: string; job_name: string; file: string; path: string; kind: string; mode: "full" | "compressed";
-  frames: number; seconds?: number | null; tokens: number; references: number;
+  job_id: string | null; job_name: string; file: string; path: string; kind: string; mode: "full" | "compressed";
+  frames: number; seconds?: number | null; tokens: number; references: number; sheet?: boolean; created: number;
 };
 export type LoraOption = {
   job_id: string; job_name: string; job_status: string; file: string; path: string; step: number | null;

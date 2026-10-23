@@ -12,7 +12,10 @@ VAE:
     first reference's shape), then refined so the grid scaled back up matches the full encode (a few hundred
     Adam steps on its own ~2K numbers, no diffusion model). Far fewer tokens, less detail. ``refmod_merge``
     refines one grid against every reference instead of stacking one per reference
-A cap on the tokens (``refmod_max_tokens``) drops near-duplicate frames, then spreads the rest evenly.
+A cap on the tokens (``refmod_max_tokens``) drops near-duplicate frames, then spreads the rest evenly. A sheet
+(``make_sheet``, the Sandbox's) puts several images side by side in one picture first, so they're one reference:
+each kept whole and apart, where full encoding crops every reference to the first one's shape and a merge averages
+them.
 
 An audio RefMod (a voice, a singer, a style of music, a sound) holds the audio VAE's latents of a sound instead:
 (1, 32, 2, T), 32 latent channels by 2 stereo channels by 40 latents a second, normalized, the posterior mean (the
@@ -28,6 +31,7 @@ under ``audio_refmod_meta``). A bundle (format 5) holds several, ``ref_0``, ``re
 from __future__ import annotations
 
 import json
+import math
 import os
 
 import torch
@@ -280,11 +284,6 @@ def read_sound(path: str, seconds: float, info: dict | None = None) -> torch.Ten
     return ds.read_audio(path, seconds, AUDIO_RATE, 2)
 
 
-def audio_latents(seconds: float) -> int:
-    """The audio latents of ``seconds`` of sound (the VAE pads the last one out)."""
-    return -(-int(seconds * AUDIO_RATE) // AUDIO_HOP)
-
-
 @torch.no_grad()
 def encode_audio(audio_vae, wav: torch.Tensor, device) -> torch.Tensor:
     """A (2, samples) waveform at 32 kHz -> (1, 32, 2, T): the audio VAE's encode of each stereo channel,
@@ -307,15 +306,21 @@ def _media_size(path: str) -> tuple[int, int]:
         return ImageOps.exif_transpose(im).size
 
 
+def _frames_of(path: str, frames: int, fps: int, snap) -> int:
+    """The frames of a reference that are encoded: an image's one, or a clip's first ``frames`` at ``fps`` (fewer if
+    it's shorter, snapped down to a length the VAE takes; a clip too short for one gives its first frame)."""
+    if ds.media_kind(path) != "video":
+        return 1
+    n = min(frames, int(ds.probe_video(path)["duration"] * fps))
+    return snap(n) if n >= 5 else 1  # under 5: the VAE's shortest clip
+
+
 def _pixels(path: str, size: tuple[int, int], frames: int, fps: int, snap) -> torch.Tensor:
-    """A reference as (1, 3, T, H, W) in [-1, 1], cover-cropped to ``size``: an image, or a clip's first ``frames``
-    frames at ``fps`` (fewer if it's shorter, snapped down to a length the VAE takes; a clip too short for one is
-    its first frame)."""
+    """A reference as (1, 3, T, H, W) in [-1, 1], cover-cropped to ``size``: an image, or a clip's frames
+    (``_frames_of``)."""
     if ds.media_kind(path) != "video":
         return ds.load_and_crop(path, size).unsqueeze(2)
-    have = int(ds.probe_video(path)["duration"] * fps)
-    n = min(frames, have)
-    return ds.read_video_frames(path, size, snap(n) if n >= 5 else 1, fps)  # under 5: the VAE's shortest clip
+    return ds.read_video_frames(path, size, _frames_of(path, frames, fps, snap), fps)
 
 
 def make_audio(driver, paths: list[str], s: dict, log=print, check=lambda: None) -> tuple[torch.Tensor, dict]:
@@ -420,3 +425,101 @@ def make(driver, paths: list[str], s: dict, log=print, check=lambda: None) -> tu
     meta = describe("", latent, mode, source, " +".join(shapes), pool_desc, steps, tags,
                     str(s.get("refmod_description") or "").strip(), str(s.get("refmod_concept") or "generic"))
     return latent, meta
+
+
+def plan(paths: list[str], s: dict, fps: int, snap, latent_frames, sheet: bool = False) -> dict:
+    """What ``make`` will encode (of ``make_sheet``'s sheet, with ``sheet``), without encoding anything: {"refs":
+    [{kind, width, height, frames}] at their encode sizes, "tokens" it will hold before the cap, "per_frame": the
+    tokens of one latent frame, "pixels": the largest encode's pixels times its frames, "sheet": its columns and rows
+    (or None)}. ``latent_frames``: a clip's frames -> its latent frames."""
+    short = int(s["refmod_size"])
+    sizes = [_media_size(p) for p in paths]
+    frames = [_frames_of(p, int(s["refmod_frames"]), fps, snap) for p in paths]
+    layout = sheet_plan(sizes, short) if sheet else None
+    if layout:
+        sizes, frames = [layout["size"]], [1]
+    canvas = ref_size(*sizes[0], short) if s["refmod_mode"] == "full" else None
+    refs = [{"kind": "video" if f > 1 else "image", "width": w, "height": h, "frames": f}
+            for f, (w, h) in zip(frames, (canvas or ref_size(*size, short) for size in sizes))]
+    lat = [latent_frames(r["frames"]) if r["frames"] > 1 else 1 for r in refs]
+    if canvas:
+        per_frame, frames_held = (canvas[0] // 32) * (canvas[1] // 32), sum(lat)
+    else:
+        h, w = aspect_grid(int(s["refmod_grid"]), *sizes[0])
+        merged = bool(s.get("refmod_merge")) and len(refs) > 1
+        per_frame, frames_held = (h // 2) * (w // 2), max(lat) if merged else sum(lat)
+    return {"refs": refs, "tokens": per_frame * frames_held, "per_frame": per_frame,
+            "pixels": max(r["width"] * r["height"] * r["frames"] for r in refs),
+            "sheet": {"columns": layout["columns"], "rows": layout["rows"]} if layout else None}
+
+
+# --- sheets -----------------------------------------------------------------
+SHEET_MAX = 9  # images on one sheet: more leaves each too small
+SHEET_GUTTER = 32  # pixels between cells: two latent cells, so the VAE keeps neighbours apart
+SHEET_BACKGROUND = (128, 128, 128)  # mid grey, 0 in the VAE's [-1, 1]
+SHEET_RATIO = 2.5  # the widest (or tallest) a sheet's layout may be
+
+
+def sheet_plan(sizes: list[tuple[int, int]], short_edge: int) -> dict:
+    """Where images of ``sizes`` ((w, h) each) go on a sheet whose short edge is ``short_edge``: a grid of cells of
+    their median shape, with the fewest empty cells for a sheet no wider or taller than ``SHEET_RATIO``:1 (between
+    equals, the squarer sheet, then the wider), ``SHEET_GUTTER`` between cells and an incomplete last row centred.
+    Each image is fitted whole into its cell. -> {"columns", "rows", "size": (w, h) in multiples of 32, "boxes":
+    [(x, y, w, h)] each image's place}."""
+    n = len(sizes)
+    cell = sorted(w / h for w, h in sizes)[n // 2]
+
+    def rank(cols):
+        rows = -(-n // cols)
+        shape = cols * cell / rows
+        return not 1 / SHEET_RATIO <= shape <= SHEET_RATIO, cols * rows, abs(math.log(shape)), -cols
+
+    cols = min(range(1, n + 1), key=rank)
+    rows = -(-n // cols)
+    g = SHEET_GUTTER
+    # the cell height that makes the short side short_edge: the larger of the two that make one side it
+    ch = max((short_edge - (rows - 1) * g) / rows, (short_edge - (cols - 1) * g) / (cols * cell))
+    cw, ch = int(ch * cell), int(ch)
+    width, height = cols * cw + (cols - 1) * g, rows * ch + (rows - 1) * g
+    size = (-(-width // 32) * 32, -(-height // 32) * 32)
+    left, top = (size[0] - width) // 2, (size[1] - height) // 2
+    boxes = []
+    for i, (w, h) in enumerate(sizes):
+        row, col = divmod(i, cols)
+        shift = (cols - min(cols, n - row * cols)) * (cw + g) // 2  # an incomplete last row, centred
+        scale = min(cw / w, ch / h)
+        fw, fh = max(1, round(w * scale)), max(1, round(h * scale))
+        boxes.append((left + shift + col * (cw + g) + (cw - fw) // 2, top + row * (ch + g) + (ch - fh) // 2, fw, fh))
+    return {"columns": cols, "rows": rows, "size": size, "boxes": boxes}
+
+
+def make_sheet(paths: list[str], short_edge: int):
+    """The images ``paths`` on one sheet (``sheet_plan``), on mid grey: a PIL image."""
+    from PIL import Image, ImageOps
+
+    images = []
+    for p in paths:
+        with Image.open(p) as im:
+            images.append(ds.to_rgb(ImageOps.exif_transpose(im)))
+    layout = sheet_plan([im.size for im in images], short_edge)
+    sheet = Image.new("RGB", layout["size"], SHEET_BACKGROUND)
+    for im, (x, y, w, h) in zip(images, layout["boxes"]):
+        sheet.paste(im.resize((w, h), Image.LANCZOS), (x, y))
+    return sheet
+
+
+# --- previews ---------------------------------------------------------------
+PREVIEW_FRAMES = 12  # a picture RefMod's latent frames decoded to look at
+
+
+def save_preview(driver, latent: torch.Tensor, folder: str, check=lambda: None) -> list[dict]:
+    """Up to ``PREVIEW_FRAMES`` of a picture RefMod's latent frames, spread evenly, decoded one at a time through
+    ``driver`` (its video VAE loaded) to <folder>/refmod_NN.png: [{file, frame}]."""
+    t = latent.shape[2]
+    out = []
+    for n, j in enumerate(torch.linspace(0, t - 1, min(t, PREVIEW_FRAMES)).round().long().unique().tolist()):
+        check()
+        img = driver.to_media({"video": latent[:, :, j:j + 1].to(driver.device), "frames": 1})[0]
+        img.save(os.path.join(folder, f"refmod_{n:02d}.png"))
+        out.append({"file": f"refmod_{n:02d}.png", "frame": j})
+    return out

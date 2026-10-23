@@ -12,11 +12,36 @@ The file format is
 a RefMod made here loads there (copy it into `models/refmods`), and one made
 there loads in the Sandbox.
 
-## Making one
+## Making one in the Sandbox
 
-Choose **RefMod** under Make in Create Job (MiniMax H3 profiles, fl2va or
-ref2va), then what it's **Of**: *Pictures* or *Sound*. Nothing is trained; the
-job loads only a VAE and takes a few minutes or less.
+**Make RefMod…**, under RefMods in the Sandbox's Reference to Video, makes a
+picture RefMod of images and clips you choose (the reference images to start
+with). The Sandbox makes it with the VAE it has loaded, after any generations
+queued before it, so the model stays loaded; it's added to the RefMods when
+it's done. It keeps going if you close the window. The settings are a job's
+(below), and stay for the next one.
+
+- **Put the images on one sheet** (2 to 9 images, no clips) lays them out side
+  by side in one picture, each whole, with a grey gap between them, and
+  encodes that as one reference. Full encoding otherwise crops every
+  reference to the first one's shape, and a merge averages them. The images
+  share the sheet's size, so raise **Size** for more detail in each. Turning
+  it on picks Full: a compressed grid leaves each image only a few cells. The
+  model wasn't trained on sheets, so compare one with the same images as
+  separate references.
+- The window shows the tokens it will hold, and warns when encoding the
+  largest clip may not fit in the GPU's free memory beside the Sandbox's
+  model. Lower the size or frames per clip, or release the Sandbox first.
+
+RefMods made here are kept in `data/sandbox/refmods`, and listed apart from the
+jobs' in the RefMods menu.
+
+## Making one with a job
+
+For a dataset's images and clips, or for sound, choose **RefMod** under Make in
+Create Job (MiniMax H3 profiles, fl2va or ref2va), then what it's **Of**:
+*Pictures* or *Sound*. Nothing is trained; the job loads only a VAE and takes a
+few minutes or less. With one GPU, a queued job unloads the Sandbox first.
 
 **Pictures.** Every image and clip in the chosen datasets is a reference, in
 order. Captions, repeats and `_refs` aren't used.
@@ -47,10 +72,10 @@ makes it again with the changes.
 
 ## Using RefMods in the Sandbox
 
-Reference to Video with a ref2va profile takes up to 4 RefMods, beside reference
-images or instead of them. Each has a strength from 0 to 1; below 1, it guides
-the video less. As with the pack's Apply node, the text encoder doesn't see
-picture RefMods.
+Reference to Video takes up to 4 RefMods, beside reference images or instead of
+them. Each has a strength from 0 to 1; below 1, it guides the video less. As
+with the pack's Apply node, the text encoder doesn't see picture RefMods. Use a
+ref2va profile: fl2va takes RefMods too, but wasn't trained on references.
 
 ## Reference audio
 

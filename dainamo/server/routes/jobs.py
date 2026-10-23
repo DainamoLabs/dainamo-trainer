@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from ...engine.dataset import resolutions
 from ...engine.families import get_family
+from ...engine.families.base import takes_sources
 from .. import db
 from ..queue import CACHE_DIR, job_dir, job_folder, read_status, scheduler, send_control
 from ..validation import check_evaluation, check_resolution, check_settings
@@ -30,6 +31,9 @@ class JobDataset(BaseModel):
     resolution: int | list[int] | str | None = None  # its training resolution(s); None: the job's ``resolution``
     flip: bool | None = None  # None: the job's ``flip``
     caption_dropout: float | None = None  # None: the job's ``caption_dropout``
+    # source datasets (ids, in order) whose images its files pair with by name, for a model that trains with them
+    # (``FamilyInfo.sources``: an edit's source images); none: its _refs folder, if it has one
+    sources: list[str] = []
 
 
 class JobIn(BaseModel):
@@ -123,8 +127,11 @@ def list_jobs():
     return jobs
 
 
-def _job_config(body: JobIn) -> dict:
-    """A job's config (all but its id) from the Create Job form, checked and filled in."""
+def _job_config(body: JobIn, old: dict | None = None) -> dict:
+    """A job's config (all but its id) from the Create Job form, checked and filled in. ``old``: the config of the
+    job being edited, whose datasets (and source and validation datasets) it keeps as they were if they've been
+    removed from Datasets since."""
+    kept = _kept_datasets(old or {})
     prof = profile_or_404(body.profile_id)
     Family = get_family(prof["family"])
     audio = "audio" in Family.info.media
@@ -137,9 +144,12 @@ def _job_config(body: JobIn) -> dict:
         raise HTTPException(400, f"{Family.info.label} can't be finetuned yet")
     if not body.datasets and not settings["slider_enabled"]:  # a slider renders its own images without one
         raise HTTPException(400, "Select at least one dataset")
+    # a slider learns from its prompts, and a RefMod encodes the files themselves
+    paired = takes_sources(Family.info, prof["data"]) and not settings["slider_enabled"] and not settings["refmod_enabled"]
     dsets = []
     for jd in body.datasets:
-        d = dataset_or_404(jd.id)
+        d = _dataset(jd.id, kept)
+        sources = _sources(d, jd.sources, Family.info, kept) if paired else []
         try:
             res = None if audio else settings["resolution"] if jd.resolution is None else check_resolution(jd.resolution)
         except HTTPException as e:
@@ -149,7 +159,8 @@ def _job_config(body: JobIn) -> dict:
             raise HTTPException(400, f"{d['name']}: caption dropout must be 0–1")
         dsets.append({"id": d["id"], "name": d["name"], "path": d["path"], "trigger": d["trigger"],
                       "repeats": max(1, jd.repeats), "resolution": res,
-                      "flip": bool(settings.get("flip", False) if jd.flip is None else jd.flip), "caption_dropout": drop})
+                      "flip": bool(settings.get("flip", False) if jd.flip is None else jd.flip), "caption_dropout": drop,
+                      **({"sources": sources} if sources else {})})
     # the job's resolution is then all of its datasets' together (validation uses the largest)
     if dsets and not audio:
         every = sorted({r for d in dsets for r in resolutions(d["resolution"])})
@@ -161,11 +172,44 @@ def _job_config(body: JobIn) -> dict:
         raise HTTPException(400, f"Invalid GPU {body.gpu!r}")
     val_dsets = []
     if settings.get("picker_enabled") and settings.get("val_dataset"):
-        d = dataset_or_404(settings["val_dataset"])
+        d = _dataset(settings["val_dataset"], kept)
         val_dsets.append({"id": d["id"], "name": d["name"], "path": d["path"], "trigger": d["trigger"], "repeats": 1})
     return {"name": body.name.strip() or "job", "output_name": body.output_name.strip(),
             "family": prof["family"], "profile_name": prof["name"], "profile": prof["data"],
             "datasets": dsets, "validation_datasets": val_dsets, "settings": settings}
+
+
+def _kept_datasets(cfg: dict) -> dict[str, dict]:
+    """The datasets a job's config names, by id: its datasets, their source datasets and its validation datasets, as
+    it saved them."""
+    datasets = cfg.get("datasets") or []
+    every = [s for d in datasets for s in d.get("sources") or []] + (cfg.get("validation_datasets") or []) + datasets
+    return {d["id"]: d for d in every if d.get("id")}
+
+
+def _dataset(did: str, kept: dict[str, dict]) -> dict:
+    """The dataset ``did``; one removed from Datasets since an edited job saved it is the job's own entry of it in
+    ``kept`` (``_kept_datasets``), with the id, name, path and trigger it had. 404 if it's in neither."""
+    row = db.query_one("SELECT * FROM datasets WHERE id=?", (did,))
+    if row is None and did in kept:
+        d = kept[did]
+        return {"id": did, "name": d.get("name") or did, "path": d.get("path") or "", "trigger": d.get("trigger") or ""}
+    return row or not_found("Dataset not found")
+
+
+def _sources(d: dict, ids: list[str], info, kept: dict[str, dict]) -> list[dict]:
+    """A training dataset's source datasets, checked: {id, name, path} of each, in order (``kept``: ``_dataset``)."""
+    if len(ids) > info.sources["max"]:
+        raise HTTPException(400, f"{d['name']}: at most {info.sources['max']} {info.sources['label'].lower()}s")
+    if len(set(ids)) < len(ids):
+        raise HTTPException(400, f"{d['name']}: a {info.sources['label'].lower()} is chosen twice")
+    out = []
+    for sid in ids:
+        if sid == d["id"]:
+            raise HTTPException(400, f"{d['name']}: a dataset can't be its own {info.sources['label'].lower()}")
+        s = _dataset(sid, kept)
+        out.append({"id": s["id"], "name": s["name"], "path": s["path"]})
+    return out
 
 
 @router.post("/jobs")
@@ -233,7 +277,8 @@ def _restart_reasons(old: dict, new: dict) -> list[str]:
 
 def _dataset_choices(c: dict) -> list[tuple]:
     s = c.get("settings", {})  # a dataset from before per-dataset settings has the job's
-    return [(d["id"], d.get("repeats"), *(d.get(k, s.get(k)) for k in ("resolution", "flip", "caption_dropout")))
+    return [(d["id"], d.get("repeats"), *(d.get(k, s.get(k)) for k in ("resolution", "flip", "caption_dropout")),
+             tuple(src["id"] for src in d.get("sources") or []))
             for d in c.get("datasets", [])]
 
 
@@ -270,12 +315,13 @@ def edit_job(jid: str, body: JobEdit):
     from its last save with the changes (noted in its log), unless one is something it can't carry on with
     (``_restart_reasons``): then it starts again from step 0, which ``restart`` has to confirm (else 409). A RefMod
     job that's been made is queued to be made again with the changes."""
-    settings = job_or_404(jid)["config"]["settings"]
+    saved = job_or_404(jid)["config"]
+    settings = saved["settings"]
     if settings.get("extract_enabled"):
         raise HTTPException(400, "An extracted LoRA isn't edited: extract it again")
     if settings.get("merge_enabled"):
         raise HTTPException(400, "A merged LoRA isn't edited: merge again (Profiles, Merge & extract)")
-    new = _job_config(body)
+    new = _job_config(body, saved)  # a dataset removed from Datasets since stays as the job has it
     with scheduler.paused():  # so the queue doesn't start the job meanwhile
         j = job_or_404(jid)
         if j["status"] in ("running", "stopping"):
@@ -804,12 +850,14 @@ def queue_made(name: str, family: str, profile_name: str, profile: dict, setting
 
 @router.delete("/jobs/{jid}")
 def delete_job(jid: str, delete_files: bool = False):
-    j = job_or_404(jid)
-    if j["status"] in ("running", "stopping"):
-        raise HTTPException(400, "Stop the job first")
-    if delete_files:
-        shutil.rmtree(job_dir(jid), ignore_errors=True)
-    db.execute("DELETE FROM jobs WHERE id=?", (jid,))
+    with scheduler.paused():  # so the queue doesn't start the job between the check and the delete
+        j = job_or_404(jid)
+        if j["status"] in ("running", "stopping"):
+            raise HTTPException(400, "Stop the job first")
+        folder = job_dir(jid)  # named from the row, so before it goes
+        db.execute("DELETE FROM jobs WHERE id=?", (jid,))
+    if delete_files:  # after the lock, so a big folder doesn't hold the queue
+        shutil.rmtree(folder, ignore_errors=True)
     return {"ok": True}
 
 

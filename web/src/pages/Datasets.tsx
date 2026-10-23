@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { go } from "../App";
 import { api, byFamily, fmtTime, q, type Dataset, type Family, type Gpu, type Job, type MediaItem, type Profile, type Settings, type WhisperModel } from "../api";
-import { CheckIssues, useDatasetCheck } from "../components/DatasetCheck";
+import { CheckIssues, PairSummary, useDatasetCheck } from "../components/DatasetCheck";
+import { PairsDialog } from "../components/Pairs";
 import {
   IconAlert, IconArrowRight, IconCheck, IconCheckCircle, IconCheckSquare, IconCopy, IconDown, IconDownload, IconEdit, IconFile, IconFilm, IconFolder, IconGrid,
   IconImages, IconInfo, IconLayers, IconLeft, IconLink, IconList, IconPause, IconPlayFill, IconPlus, IconRight, IconScissors, IconSearch, IconSparkle, IconTrash,
@@ -81,15 +82,13 @@ function NewDataset({ onClose, onCreated }: { onClose: () => void; onCreated: (d
   );
 }
 
-/** A file's caption: a click (or ``editing``, set from outside) edits it; Ctrl+Enter or clicking away saves, Escape
+/** A file's caption: a click edits it; Ctrl+Enter or clicking away saves, Escape
  * cancels. ``grid``: the grid view's two lines, and a boxed editor. */
-function CaptionCell({ item, onSaved, editing: shown, onEditing, grid }: {
-  item: MediaItem; onSaved: (c: string) => void; editing?: boolean; onEditing?: (on: boolean) => void; grid?: boolean;
+function CaptionCell({ item, onSaved, grid }: {
+  item: MediaItem; onSaved: (c: string) => void; grid?: boolean;
 }) {
   const toast = useToast();
-  const [own, setOwn] = useState(false);
-  const editing = shown ?? own;
-  const setEditing = onEditing ?? setOwn;
+  const [editing, setEditing] = useState(false);
   const [val, setVal] = useState(item.caption);
   useEffect(() => setVal(item.caption), [item.caption]);
   const save = async () => {
@@ -119,8 +118,11 @@ const CHECK_FAMILY = "dainamo.check.family";
 const CHECK_OPEN = "dainamo.check.open"; // the health check left open
 
 /** The health check, for a chosen model and resolution; it runs when asked, then again as they change. Folded, its
- * bar says how the last check went. */
-function HealthCheck({ id, families, onOpen }: { id: string; families: Family[]; onOpen: (path: string) => void }) {
+ * bar says how the last check went. For a model that trains with reference images (an edit's source images), it
+ * also checks how the files pair with a chosen source dataset's images, or else the _refs folder's. */
+function HealthCheck({ id, name, datasets, families, onOpen }: {
+  id: string; name: string; datasets: Dataset[] | null; families: Family[]; onOpen: (path: string) => void;
+}) {
   const [familyId, setFamilyId] = useState(() => { try { return localStorage.getItem(CHECK_FAMILY) || ""; } catch { return ""; } });
   const family = families.find((f) => f.id === familyId) || families[0];
   const [resolution, setResolution] = useState("");
@@ -129,8 +131,12 @@ function HealthCheck({ id, families, onOpen }: { id: string; families: Family[];
   const [open, setOpenState] = useState(() => { try { return localStorage.getItem(CHECK_OPEN) === "1"; } catch { return false; } });
   const setOpen = (o: boolean) => { setOpenState(o); try { localStorage.setItem(CHECK_OPEN, o ? "1" : "0"); } catch { /* not remembered */ } };
   const music = !!family?.media.includes("audio");
+  const pairing = family?.sources || null;
+  const [source, setSource] = useState("");
+  const [showPairs, setShowPairs] = useState(false);
   const { result, error, loading, recheck } = useDatasetCheck(on ? id : null, {
-    resolution: music ? "" : resolution, family: family?.id, seconds: music && seconds.trim() !== "" ? Number(seconds) : undefined });
+    resolution: music ? "" : resolution, family: family?.id, seconds: music && seconds.trim() !== "" ? Number(seconds) : undefined,
+    references: !!pairing, sources: pairing && source ? [source] : [] });
   const pick = (v: string) => { setFamilyId(v); try { localStorage.setItem(CHECK_FAMILY, v); } catch { /* not remembered */ } };
   const counts = result ? (["error", "warning", "info"] as const).map((l) => [l, result.issues.filter((i) => i.level === l).length] as const) : [];
   const words = { error: ["error", "errors"], warning: ["warning", "warnings"], info: ["note", "notes"] };
@@ -168,12 +174,27 @@ function HealthCheck({ id, families, onOpen }: { id: string; families: Family[];
               <input value={resolution} onChange={(e) => setResolution(e.target.value)} aria-label="Resolution" style={{ width: 110 }}
                 placeholder={String(family?.training_defaults?.resolution ?? 1024)} title="Training resolution (several: 512, 1024)" />
             </>}
+            {pairing && <>
+              <span className="muted small">with {pairing.label.toLowerCase()}</span>
+              <select value={source} onChange={(e) => setSource(e.target.value)} aria-label={pairing.label} style={{ maxWidth: 220 }}>
+                <option value="">None (the _refs folder)</option>
+                {datasets?.filter((x) => x.id !== id).map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}
+              </select>
+            </>}
           </div>
           {!on && <div className="help" style={{ marginTop: 8 }}>{music
             ? "Looks for unreadable files, songs too short to use, low sample rates, mono files, missing or empty captions, and captions shared by two files."
-            : "Looks for unreadable files, images too small for the resolution, near-duplicates, missing, empty or over-long captions, and captions shared by two files."}</div>}
+            : "Looks for unreadable files, images too small for the resolution, near-duplicates, missing, empty or over-long captions, and captions shared by two files"
+              + (pairing ? `, and which files pair with a ${pairing.noun} (the ${pairing.label.toLowerCase()} chosen, or the _refs folder).` : ".")}</div>}
           {error && <div className="error-box small" style={{ marginTop: 10 }}>{error}</div>}
-          {result && <div style={{ marginTop: 12, opacity: loading ? 0.5 : 1 }}><CheckIssues result={result} onOpen={onOpen} /></div>}
+          {result && (
+            <div className="stack" style={{ gap: 10, marginTop: 12, opacity: loading ? 0.5 : 1 }}>
+              {pairing && result.pairs && <PairSummary pairs={result.pairs} info={pairing} onShow={() => setShowPairs(true)} />}
+              <CheckIssues result={result} onOpen={onOpen} />
+            </div>
+          )}
+          {showPairs && pairing && <PairsDialog id={id} name={name} sources={source ? [source] : []} video={!!family?.media.includes("video")}
+            info={pairing} onClose={() => setShowPairs(false)} />}
         </div>
       )}
     </div>
@@ -196,14 +217,13 @@ function PlayBar({ audio }: { audio: HTMLAudioElement }) {
 }
 
 /** A file in the grid view: its picture (a song's spectrogram, which plays here), name, caption and whether it has
- * one; ⋯ enlarges it, copies its path or deletes it. ``song``: it's the song playing (true) or paused (false).
+ * one (a click on the caption edits it); ⋯ enlarges it, copies its path or deletes it. ``song``: it's the song playing (true) or paused (false).
  * ``sel``: it can be picked (to delete), its box shown on hover. */
 function FileCard({ it, audio, song, onPlay, onOpen, onSaved, onDelete, sel }: {
   it: MediaItem; audio: HTMLAudioElement | null; song: boolean | null; onPlay: () => void; onOpen: () => void; onSaved: (c: string) => void;
   onDelete?: () => void; sel?: Selection;
 }) {
   const toast = useToast();
-  const [editing, setEditing] = useState(false);
   const picked = !!sel?.picked.has(it.path);
   const copy = () => navigator.clipboard.writeText(it.path).then(() => toast("Path copied"), () => toast("Couldn't copy the path", true));
   return (
@@ -221,11 +241,10 @@ function FileCard({ it, audio, song, onPlay, onOpen, onSaved, onDelete, sel }: {
       </div>
       <div className="file-body">
         <div className="file-name ellipsis" title={it.cut_from ? `${it.name}: cut from ${it.cut_from.source} at ${fmtClock(it.cut_from.start)}` : it.name}>{it.name}</div>
-        <CaptionCell item={it} onSaved={onSaved} editing={editing} onEditing={setEditing} grid />
+        <CaptionCell item={it} onSaved={onSaved} grid />
         <div className="file-foot">
           {it.caption ? <span className="file-state ok"><IconCheckCircle /> Captioned</span> : <span className="file-state none"><IconAlert /> No caption</span>}
           <span className="spacer" />
-          <button className="btn ghost sm" onClick={() => setEditing(true)}><IconEdit /> Edit caption</button>
           <Menu label={`More for ${it.name}`} items={[
             { label: "Enlarge", icon: <IconImages />, onClick: onOpen },
             { label: "Copy path", icon: <IconCopy />, onClick: copy },
@@ -341,9 +360,13 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
 
   const saveTrigger = async () => {
     if (!d || trigger === d.trigger) return;
-    await api.put(`/api/datasets/${id}`, { name: d.name, trigger });
-    toast("Trigger word saved");
-    reloadDs();
+    try {
+      await api.put(`/api/datasets/${id}`, { name: d.name, trigger });
+      toast("Trigger word saved");
+      reloadDs();
+    } catch (e: any) {
+      toast(e.message, true);
+    }
   };
 
   const removeFiles = async () => {
@@ -367,8 +390,12 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
 
   const [confirmRemove, setConfirmRemove] = useState(false);
   const removeDataset = async (files: boolean) => {
-    await api.del(`/api/datasets/${id}?delete_files=${files}`);
-    go("datasets");
+    try {
+      await api.del(`/api/datasets/${id}?delete_files=${files}`);
+      go("datasets");
+    } catch (e: any) {
+      toast(e.message, true);
+    }
   };
 
   const setLayout = (l: Layout) => {
@@ -536,7 +563,7 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
         )}
       </div>
 
-      <HealthCheck id={id} families={families} onOpen={(path) => { if (items?.some((x) => x.path === path)) open(path); }} />
+      <HealthCheck id={id} name={d?.name || ""} datasets={ds} families={families} onOpen={(path) => { if (items?.some((x) => x.path === path)) open(path); }} />
 
       {(over || uploading) && (
         <div className={"dropzone over"} style={{ marginBottom: 16 }}>{uploading || "Drop images, videos or audio to upload"}</div>

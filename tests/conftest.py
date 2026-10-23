@@ -12,6 +12,19 @@ import sys  # noqa: E402
 import pytest  # noqa: E402
 
 
+@pytest.fixture(autouse=True, scope="session")
+def no_launching():
+    """The queue reaps, reattaches and picks GPUs as in the app, but starts no trainer: one on a GPU that isn't
+    there fails within a second, and tests edit the jobs they've just queued. Tests of the launch logic stub
+    ``scheduler._spawn`` themselves."""
+    from dainamo.server.queue import Scheduler
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(Scheduler, "_spawn", lambda self, job, gpu: None)
+    yield
+    mp.undo()
+
+
 @pytest.fixture
 def fake_llama(tmp_path_factory):
     """A stand-in llama-server (tests/fake_llama_server.py, run by a shell script) with a model and a vision

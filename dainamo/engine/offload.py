@@ -142,7 +142,8 @@ class BlockSwapper:
         self.stream = torch.cuda.Stream(device=device) if torch.cuda.is_available() else None
         self.prefetched: dict[int, tuple] = {}  # i -> (event, [gpu tensors])
         self.resident: set[int] = set()  # swapped blocks currently pointed at GPU copies
-        self.last = -1
+        self.last = -1  # the streamed block that ran last
+        self.direction = 1  # the way the blocks ran then: 1 forward, -1 backward's recomputation
         self.handles = []
         self.owner: dict[int, int] = {}  # a streamed block's parameter (id) -> the block's index
         self.dirty: set[int] = set()  # streamed blocks stepped since they were copied in (a finetune's)
@@ -257,9 +258,13 @@ class BlockSwapper:
     def _make_pre(self, i: int):
         def hook(module, args):
             self._bring_in(i)
-            direction = -1 if i <= self.last else 1  # (the same block again: backward has begun)
+            # backward's recomputation starts on the block forward ended with, run again, then goes down a block at a
+            # time. Anything else is a forward pass, such as the next one starting on the first streamed block after
+            # a forward pass (which ended on the last block) or after backward (which ended on this one).
+            backward = i == self.last if self.direction > 0 else i == self.last - 1
+            self.direction = -1 if backward else 1
             self.last = i
-            self._prefetch(i + direction)
+            self._prefetch(i + self.direction)
         return hook
 
     def _make_post(self, i: int):

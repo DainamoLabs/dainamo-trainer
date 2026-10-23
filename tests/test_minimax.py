@@ -9,6 +9,7 @@ ai-toolkit) need the 40 GB of model files and are run by hand.
 import random
 
 import torch
+from PIL import Image
 
 from dainamo.engine.families.minimax_h3 import packing as P
 from dainamo.engine.families.minimax_h3.driver import MinimaxH3Driver
@@ -131,6 +132,132 @@ def test_ref2va_uses_reference_rows_when_present():
     assert m2.calls[0]["hidden_states"].shape[1] == per_frame * t
 
 
+class Echo(Recorder):
+    """Records its inputs and predicts them back, so each item's loss depends on its own rows."""
+
+    def forward(self, **kw):
+        super().forward(**kw)
+        return kw["hidden_states"].float(), kw["audio_hidden_states"].float()
+
+
+def test_ref2va_batch_runs_a_forward_per_reference_layout():
+    """Items with different references in one batch (one, two, none): a forward each, the loss the mean over all."""
+    d = MinimaxH3Driver({"variant": "ref2va"}, CPU)
+    d.dtype = torch.float32
+    one, two, none = video_payload(refs=1), video_payload(refs=2), video_payload()
+    two["refs"][1] = torch.randn(24, 1, 6, 4)  # a portrait reference
+    conds = [{"text": text_cond(), "ref": text_cond(7, vision=12)}, {"text": text_cond(), "ref": text_cond(7, vision=20)},
+             {"text": text_cond()}]
+    m = Echo()
+    loss = d.training_loss(m, [one, two, none], conds, {}, sigma=0.5, generator=torch.Generator().manual_seed(0))
+    per_frame, t = 2 * 3, P.video_latent_num_frames(22)
+    assert [tuple(c["hidden_states"].shape[:2]) for c in m.calls] == [
+        (1, per_frame * (1 + t)), (1, per_frame * (2 + t)), (1, per_frame * t)]
+    assert [c["encoder_hidden_states"].shape[1] for c in m.calls] == [19, 27, 7]
+    # the same draws by hand: the video and audio noise come first, for the whole batch
+    g = torch.Generator().manual_seed(0)
+    x0, xa = torch.stack([p["video"] for p in (one, two, none)]), torch.stack([p["audio"] for p in (one, two, none)])
+    noise, na = torch.randn(x0.shape, generator=g), torch.randn(xa.shape, generator=g)
+    sa = float(P.remap_sigma(torch.tensor(0.5), P.VIDEO_SIGMA_SHIFT, P.AUDIO_SIGMA_SHIFT))
+    want = (torch.mean((0.5 * x0 + 0.5 * noise - (x0 - noise)) ** 2)
+            + torch.mean(((1 - sa) * xa + sa * na - (xa - na)) ** 2))
+    assert torch.allclose(loss, want)
+
+
+class FakeAudioVAE:
+    """Encodes like the H3 audio VAE in shape: (B, 1, samples) -> (B, 32, ceil(samples / 800)), latent i of input b
+    holding 1000 * b + i, so the rows say where they came from."""
+
+    def encode(self, wav):
+        t = -(-wav.shape[-1] // 800)
+        return (1000.0 * torch.arange(wav.shape[0])[:, None, None] + torch.arange(t)).expand(-1, 32, -1).clone()
+
+
+def _encoding_driver(variant, monkeypatch):
+    """A driver whose VAEs are stand-ins: a clip's frames aren't read and its video encodes to zeros."""
+    from dainamo.engine import dataset as ds
+
+    d = MinimaxH3Driver({"variant": variant}, CPU)
+    d.video_vae = type("VAE", (), {"encode": staticmethod(
+        lambda px, sample=True, **kw: torch.zeros(1, 24, P.video_latent_num_frames(px.shape[2]) if px.shape[2] > 1
+                                                  else 1, px.shape[3] // 16, px.shape[4] // 16))})()
+    d.audio_vae = FakeAudioVAE()
+    monkeypatch.setattr(ds, "read_video_frames", lambda path, size, frames, fps, flip=False, *a, **kw:
+                        torch.zeros(1, 3, frames, size[1], size[0]))
+    return d
+
+
+def test_a_clips_audio_encodes_to_the_models_latent_count(tmp_path, monkeypatch):
+    """At 56 frames the VAE gives 94 latents a channel (74 667 samples, padded to 800s) to the model's 93: each
+    channel is cut before packing, so channel 1 starts at row a_lat."""
+    import subprocess
+
+    from dainamo.engine import dataset as ds
+
+    clip = tmp_path / "clip.wav"  # the soundtrack is all encode_item reads of the clip (its frames are stubbed)
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=330:duration=3", "-ac", "2",
+                    str(clip)], check=True)
+    d = _encoding_driver("fl2va", monkeypatch)
+    item = ds.Item(path=str(clip), caption="", size=(96, 64), frames=56, has_audio=True)
+    a_lat = P.audio_latent_num_frames(56)
+    assert a_lat == 93
+    rows = d.encode_item(item, {"train_audio": True})["audio"]
+    assert rows.shape == (2 * a_lat, 32)
+    assert torch.equal(rows[:, 0], torch.cat([torch.arange(a_lat), 1000 + torch.arange(a_lat)]).float())
+    # a payload cached before the cut (94 latents a channel) trains on the same rows
+    d.dtype = torch.float32
+    stale = {"video": torch.randn(24, P.video_latent_num_frames(56), 4, 6), "frames": 56,
+             "audio": P.pack_audio_latents(d.audio_vae.encode(torch.zeros(2, 1, 74667))[None])[0]}
+    assert stale["audio"].shape[0] == 2 * 94
+    m = Recorder()
+    d.training_loss(m, [stale], [{"text": text_cond()}], {}, sigma=0.0)
+    assert torch.equal(m.calls[0]["audio_hidden_states"][0], rows)
+
+
+def test_ref2va_mirrors_references_with_a_flipped_item(tmp_path, monkeypatch):
+    from dainamo.engine import dataset as ds
+    from dainamo.engine.trainer import cond_key
+
+    img, ref = tmp_path / "a.png", tmp_path / "a_ref.png"
+    Image.new("RGB", (96, 64)).save(img)
+    face = Image.new("RGB", (96, 64))
+    face.paste((255, 0, 0), (0, 0, 30, 64))  # red on the left only
+    face.save(ref)
+    d = _encoding_driver("ref2va", monkeypatch)
+    seen = []
+    d._encode_keyframe = lambda px: seen.append(px) or torch.zeros(1, 24, 1, 4, 6)
+    items = [ds.Item(path=str(img), caption="a", size=(96, 64), flip=f, refs=[str(ref)]) for f in (False, True)]
+    plain, flipped = (d.item_conditions(it, {})["ref"][1][0] for it in items)
+    assert flipped.tobytes() == plain.transpose(Image.Transpose.FLIP_LEFT_RIGHT).tobytes()
+    assert cond_key("a", [plain]) != cond_key("a", [flipped]) and items[0].key() != items[1].key()
+    for it in items:
+        d.encode_item(it, {})
+    assert torch.equal(seen[1], seen[0].flip(-1))
+
+
+def test_conditioning_pixels_reach_the_vision_tower_in_fp32():
+    """The text model runs in bf16 but the vision tower in fp32: the pixels aren't rounded to bf16 on the way."""
+    from dainamo.engine.families.minimax_h3.text_encoder import encode_minimax_h3_prompt
+
+    tok = type("Tok", (), {"__call__": lambda self, text, add_special_tokens=False: {"input_ids": [5] * len(text)},
+                           "convert_tokens_to_ids": lambda self, t: 1, "pad_token_id": 0})()
+    pixels = torch.randn(16, 8, dtype=torch.float32)
+    processor = type("Proc", (), {
+        "image_processor": type("IP", (), {"merge_size": 2, "__call__": lambda self, images, return_tensors: {
+            "pixel_values": pixels, "image_grid_thw": torch.tensor([[1, 4, 4]])}})(),
+        "create_mm_token_type_ids": staticmethod(lambda ids: [[0] * len(ids[0])])})()
+    seen = {}
+
+    def model(input_ids, pixel_values=None, **kw):
+        seen["pixels"] = pixel_values
+        return type("Out", (), {"hidden_states": [torch.zeros(1, input_ids.shape[1], 8)] * 51})()
+
+    cfg = type("Cfg", (), {"text_config": type("TC", (), {"num_hidden_layers": 50})()})()
+    te = type("TE", (), {"config": cfg, "device": CPU, "dtype": torch.bfloat16, "model": staticmethod(model)})()
+    encode_minimax_h3_prompt(te, tok, processor, "a cat", keyframes=[Image.new("RGB", (64, 64))])
+    assert seen["pixels"].dtype == torch.float32 and torch.equal(seen["pixels"], pixels)
+
+
 def test_sampler_steps_and_shapes():
     d = MinimaxH3Driver({"variant": "fl2va"}, CPU)
     m = Recorder()
@@ -141,6 +268,27 @@ def test_sampler_steps_and_shapes():
     assert len(m.calls) == 4
     still = d.sample(Recorder(), text_cond(), None, 96, 64, 2, 0, 7, frames=1)
     assert still["frames"] == 1 and still["video"].shape[2] == 1
+
+
+def test_fl2va_takes_references_with_reference_to_video(tmp_path):
+    """An fl2va render's image is its first frame, unless Reference-to-Video makes its images references."""
+    d = MinimaxH3Driver({"variant": "fl2va"}, CPU)
+    assert "r2v" in [w.id for w in d.info.workflows if not w.variants or "fl2va" in w.variants]
+    d.video_vae = object()  # the encode is stubbed
+    d._encode_keyframe = lambda px: torch.randn(1, 24, 1, 4, 6)
+    paths = []
+    for i in range(2):
+        Image.new("RGB", (96, 64)).save(tmp_path / f"{i}.png")
+        paths.append(str(tmp_path / f"{i}.png"))
+    spec = {"prompt": "a cat", "images": paths, "width": 96, "height": 64, "frames": 22}
+    assert len(d.sample_condition(spec)[1]) == 1
+    assert len(d.sample_condition({**spec, "references": True})[1]) == 2
+    per_frame, t = 2 * 3, P.video_latent_num_frames(22)
+    first, refs = Recorder(), Recorder()
+    d.sample(first, text_cond(), None, 96, 64, 1, 0, 7, frames=22, images=paths)
+    d.sample(refs, text_cond(), None, 96, 64, 1, 0, 7, frames=22, images=paths, references=True)
+    assert first.calls[0]["hidden_states"].shape[1] == per_frame * (1 + t)  # one keyframe
+    assert refs.calls[0]["hidden_states"].shape[1] == per_frame * (2 + t)  # two reference blocks
 
 
 class Oracle(torch.nn.Module):

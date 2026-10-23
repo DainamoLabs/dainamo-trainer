@@ -69,6 +69,9 @@ class SandboxManager:
         self.pending: list[str] = []
         self.last_used = 0.0
         self.yielding = False
+        # the RefMod being made, or the last one: {id, name, state (queued | running | done | failed | cancelled),
+        # message, made (its made.json, when done)}; it's queued with the generations, but isn't one
+        self.refmod: dict | None = None
         self.lock = threading.RLock()
 
     # --- status ------------------------------------------------------------
@@ -99,6 +102,7 @@ class SandboxManager:
             return {"state": self.state if self.alive() else "off", "gpu": self.gpu if self.alive() else None,
                     "message": self.message, "progress": self._progress_now(), "current": self.current,
                     "pending": list(self.pending), "yielding": self.yielding,
+                    "refmod": dict(self.refmod) if self.refmod else None,
                     "idle_seconds": int(time.time() - self.last_used) if self.alive() and self.last_used else None}
 
     # --- worker process ---------------------------------------------------------
@@ -152,16 +156,19 @@ class SandboxManager:
         with self.lock:
             if proc is not self.proc:
                 return
+            why = ("The Sandbox stopped before this finished (see data/sandbox/worker.log)" if not self.yielding
+                   else "Stopped: a training job needed the GPU")
             for rid in ([self.current] if self.current else []) + self.pending:
                 db.execute("UPDATE sandbox_runs SET status='failed', message=? WHERE id=? AND status IN "
-                           "('queued','running')", ("The Sandbox stopped before this finished (see "
-                                                    "data/sandbox/worker.log)" if not self.yielding else
-                                                    "Stopped: a training job needed the GPU", rid))
+                           "('queued','running')", (why, rid))
+            if self.refmod and self.refmod["state"] in ("queued", "running"):
+                self.refmod.update(state="failed", message=why)
             self.current, self.pending, self.progress = None, [], None
             self.state, self.message = "off", ""
 
     def _on_event(self, ev: dict):
         kind, rid = ev.get("event"), ev.get("id")
+        made = self.refmod if self.refmod and rid == self.refmod["id"] else None  # a RefMod's, not a run's
         if kind == "ready":
             self.state, self.message = "ready", "Ready"
         elif kind == "status":
@@ -171,7 +178,12 @@ class SandboxManager:
             if rid in self.pending:
                 self.pending.remove(rid)
             self.state, self.progress = "busy", None
-            db.execute("UPDATE sandbox_runs SET status='running', started=? WHERE id=?", (db.now(), rid))
+            if made:
+                made["state"] = "running"
+            else:
+                db.execute("UPDATE sandbox_runs SET status='running', started=? WHERE id=?", (db.now(), rid))
+        elif kind == "progress" and made:
+            made["message"] = self.message = ev.get("message") or ""
         elif kind == "progress":
             self.progress = {**{k: v for k, v in ev.items() if k not in ("event", "id", "message")}, "at": time.time()}
             if ev.get("message"):
@@ -183,9 +195,12 @@ class SandboxManager:
             db.execute("UPDATE sandbox_runs SET outputs=? WHERE id=?", (json.dumps(outputs), rid))
         elif kind in ("done", "error", "cancelled"):
             status = {"done": "done", "error": "failed", "cancelled": "cancelled"}[kind]
-            extra = json.dumps({"loras": ev.get("loras")}) if kind == "done" else None
-            db.execute("UPDATE sandbox_runs SET status=?, message=?, elapsed=?, report=? WHERE id=?",
-                       (status, ev.get("message", ""), ev.get("elapsed"), extra, rid))
+            if made:
+                made.update(state=status, message=ev.get("message", ""), made=ev.get("made"))
+            else:
+                extra = json.dumps({"loras": ev.get("loras")}) if kind == "done" else None
+                db.execute("UPDATE sandbox_runs SET status=?, message=?, elapsed=?, report=? WHERE id=?",
+                           (status, ev.get("message", ""), ev.get("elapsed"), extra, rid))
             if rid in self.pending:
                 self.pending.remove(rid)
             if self.current == rid:
@@ -211,11 +226,28 @@ class SandboxManager:
         return None
 
     def submit(self, run: dict, gpu: int, profile: dict):
+        self._enqueue(gpu, {"cmd": "generate", "id": run["id"], "out_dir": run_dir(run["id"]),
+                            "profile": {"id": profile["id"], "family": profile["family"], "data": profile["data"]},
+                            "params": run["params"]})
+
+    def submit_refmod(self, make: dict, gpu: int) -> bool:
+        """Make a RefMod after the generations queued before it: ``make`` is the worker's "refmod" command, less
+        its "cmd". False (nothing queued) while another is being made: one at a time, checked as it's queued."""
         with self.lock:
-            old = self.proc if self.alive() and self.gpu != gpu else None
-            if old is not None:
+            if self.refmod and self.refmod["state"] in ("queued", "running"):
+                return False
+            self.refmod = {"id": make["id"], "name": make["name"], "state": "queued", "message": "", "made": None}
+        self._enqueue(gpu, {"cmd": "refmod", **make})
+        return True
+
+    def _enqueue(self, gpu: int, msg: dict):
+        """Send the worker on ``gpu`` a command (started there if needed). One on another GPU is stopped first, and
+        one unloading (its stdin already closed) is let finish: either way a new one starts once it has exited."""
+        with self.lock:
+            old = self.proc if self.alive() and (self.gpu != gpu or self.state == "stopping") else None
+            if old is not None and self.state != "stopping":
                 self._stop()
-        if old is not None:  # moving to another GPU: wait outside the lock (the event reader needs it)
+        if old is not None:  # wait outside the lock (the event reader needs it)
             try:
                 old.wait(timeout=120)
             except subprocess.TimeoutExpired:
@@ -227,11 +259,9 @@ class SandboxManager:
         with self.lock:
             if not self.alive():
                 self._start(gpu)
-            self.pending.append(run["id"])
+            self.pending.append(msg["id"])
             self.last_used = time.time()
-            self._send({"cmd": "generate", "id": run["id"], "out_dir": run_dir(run["id"]),
-                        "profile": {"id": profile["id"], "family": profile["family"], "data": profile["data"]},
-                        "params": run["params"]})
+            self._send(msg)
 
     def cancel(self, run_id: str):
         with self.lock:

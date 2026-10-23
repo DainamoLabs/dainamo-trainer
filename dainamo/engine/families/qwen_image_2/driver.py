@@ -6,10 +6,10 @@ Loads ComfyUI-format files directly:
     before its final RMSNorm. The vision tower stays: edit prompts carry their reference images.
   * VAE: RGBA, 16x spatial, 64 latent channels, in ComfyUI's Wan-native layout
 
-Editing is not a separate mode. An item with reference images (``<dataset>/_refs/<stem>.png``,
-``<stem>_1.png``, ...) trains as an edit: the caption is the instruction, the references enter the
-Qwen3-VL prompt as ``<imageN>`` vision blocks, and their latents are dropped into the slots those
-blocks reserve. Items without references train text-to-image. Images with an alpha channel train as
+Editing is not a separate mode. An item with source images (the image of its name in each of its
+dataset's source datasets, or ``<dataset>/_refs/<stem>.png``, ``<stem>_1.png``, ...) trains as an edit:
+the caption is the instruction, the sources enter the Qwen3-VL prompt as ``<imageN>`` vision blocks, and
+their latents are dropped into the slots those blocks reserve. Items without sources train text-to-image. Images with an alpha channel train as
 RGBA unless ``keep_alpha`` is off.
 
 The prompt template, reference sizing, timestep convention (t = sigma, 1 = noise, target noise - clean)
@@ -159,16 +159,26 @@ class QwenImage2Driver(FamilyDriver):
         },
         workflows=[
             Workflow("t2i"),
-            Workflow("edit", images={
-                "label": "Reference images (edit)", "min": 1, "max": 6,
-                "help": "For edits, put each image's source image(s) in a _refs folder inside the dataset, named "
-                        "after it: _refs/photo.png, _refs/photo_1.png, … The caption is the edit instruction. "
-                        "Images without references train text-to-image."}),
+            Workflow("edit", images={"label": "Source images (edit)", "min": 1, "max": 6, "help": ""}),
         ],
         sliders=True,
+        sources={"label": "Source dataset", "noun": "source image", "max": 3, "variants": None,
+                 "without": "train text-to-image",
+                 "help": "For an edit LoRA: a dataset of the images before the edit, paired with this dataset's "
+                         "images (the results) by file name: photo.png pairs with photo.jpg. Each result's caption "
+                         "is then the edit instruction. A second or third source dataset adds more images to each "
+                         "edit. With none, or for an image without a source, it trains text-to-image, its caption "
+                         "a prompt."},
     )
     bucket_divisibility = VISION_PX
     block_list = "transformer_blocks"
+
+    @classmethod
+    def reference_tokens(cls, width, height):
+        """A source image is scaled to the target's pixels: as many latent tokens again (``sequence_tokens``
+        counts four latent tokens as one), and its vision tokens in the prompt, a quarter as many."""
+        return (width // VISION_PX) * (height // VISION_PX) * 5 // 4
+
     lora_targets = ["transformer_blocks.*.attn.to_q", "transformer_blocks.*.attn.to_k",
                     "transformer_blocks.*.attn.to_v", "transformer_blocks.*.attn.to_out.0",
                     "transformer_blocks.*.img_mlp.gate_up", "transformer_blocks.*.img_mlp.out"]
@@ -291,7 +301,7 @@ class QwenImage2Driver(FamilyDriver):
 
     def item_conditions(self, item, settings: dict):
         self.keep_alpha = bool(settings.get("keep_alpha", True))
-        refs = ds.reference_images(item.path)
+        refs = item.refs
         if not refs:
             return {"text": (item.caption, None)}
         w, h = item.size
@@ -368,7 +378,7 @@ class QwenImage2Driver(FamilyDriver):
         if item.flip:
             img = ImageOps.mirror(img)
         payload = {"latent": self.encode_image(to_tensor(img) * 2 - 1)}
-        refs = ds.reference_images(item.path)
+        refs = item.refs
         if refs:
             w, h = item.size
             payload["refs"] = [self.encode_image(r * 2 - 1) for r in self._references(refs, w * h, item.flip)]

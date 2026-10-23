@@ -1,7 +1,7 @@
 # LoKr
 
-**Network**, under Training in Create Job, trains a LoRA or a LoKr (LyCORIS's
-Kronecker-product adapter). A LoKr can make a full-rank change with fewer
+**LoKr**, under Training method in Create Job, trains a LoKr (LyCORIS's
+Kronecker-product adapter) instead of a LoRA. A LoKr can make a full-rank change with fewer
 weights than a LoRA.
 
 - **LoKr factor**: the lower it is, the more weights the LoKr trains. Auto uses

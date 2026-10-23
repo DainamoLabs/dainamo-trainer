@@ -64,7 +64,7 @@ download from any address, including ones on your local network.
 
 - [Profiles and model files](docs/profiles-and-model-files.md)
 - [Merge & extract](docs/merge-and-extract.md): LoRAs merged into one, LoRAs extracted from any finetuned model
-- [Datasets](docs/datasets.md): health check, caption edits, Split into clips and the clip editor, Add from URL
+- [Datasets](docs/datasets.md): edit datasets (sources and results), health check, caption edits, Split into clips and the clip editor, Add from URL
 - [Captions](docs/captions.md): Auto-Caption and the caption provider
 - [Jobs](docs/jobs.md): Create Job, the queue, editing and continuing jobs, the checkpoint picker, notifications
 - [Sandbox](docs/sandbox.md)

@@ -2,7 +2,7 @@
 
 A slider is a LoRA whose strength moves one attribute either way: a smile slider
 at +1 makes people smile, at -1 frown, and at 0.5 smile a little. Choose
-**Slider** under Train in Create Job (Krea 2, MOSS-Image and Qwen-Image 2.1; not
+**Slider** under Training method in Create Job (Krea 2, MOSS-Image and Qwen-Image 2.1; not
 the video models yet) and give it three prompts:
 
 - **Target**: what the slider changes, e.g. "a photo of a person". It works best

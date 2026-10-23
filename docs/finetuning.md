@@ -5,7 +5,7 @@ can learn more than a LoRA, which matters when one model should learn many
 concepts or a lot of data. Training several concepts together, each with its
 own trigger, also avoids the interference of stacking separate LoRAs.
 
-Choose **Finetune** under Train in Create Job (MOSS-Image and Krea 2 profiles).
+Choose **Finetune** under Training method in Create Job (MOSS-Image and Krea 2 profiles).
 It starts at a learning rate of 1e-5, with Adafactor, keeping the last 2 saves
 (Krea 2: the last one).
 

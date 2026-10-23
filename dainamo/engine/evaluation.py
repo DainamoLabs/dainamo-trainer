@@ -168,13 +168,22 @@ class BleedProbe:
     def base_file(self, j: int) -> str:
         return f"{self.prefix}_base_{j}.png"
 
+    def _reference_files(self) -> tuple[list[str], list[str]]:
+        n = len(self.specs)
+        return ([self._path(self.base_file(j)) for j in range(n)],
+                [self._path(f"{self.prefix}_alt_{j}.png") for j in range(n)])
+
+    def has_references(self) -> bool:
+        """Whether the base-model references are on disk already (``setup`` then doesn't render them)."""
+        return all(os.path.exists(f) for files in self._reference_files() for f in files)
+
     def setup(self, model, network, device, train_paths: list[str]):
         """Base-model references (rendered once, reused from disk when a job resumes) and the
-        training-set concept they're measured against."""
+        training-set concept they're measured against. They render at LoRA strength 0, which is the base
+        model only for a LoRA: a finetune's weights must still be the base model's (``has_references``)."""
         self.embed = DinoEmbedder(device)
-        base_files = [self._path(self.base_file(j)) for j in range(len(self.specs))]
-        alt_files = [self._path(f"{self.prefix}_alt_{j}.png") for j in range(len(self.specs))]
-        if not all(os.path.exists(f) for f in base_files + alt_files):
+        base_files, alt_files = self._reference_files()
+        if not self.has_references():
             self.log(f"Concept bleed: rendering {len(self.specs)} reference prompt(s) with the base model")
             base = [dict(sp, lora_scale=0.0) for sp in self.specs]
             alt = [dict(sp, lora_scale=0.0, seed=sp["seed"] + 100_000) for sp in self.specs]

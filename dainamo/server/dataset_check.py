@@ -17,8 +17,9 @@ from functools import lru_cache
 import numpy as np
 from PIL import Image
 
-from ..engine.dataset import (REFS_DIR, SMALL, caption_path, list_media, media_kind, probe_audio, probe_video,
-                              split_clips, split_lyrics, trains_small)
+from ..engine.dataset import (IMAGE_EXTS, REFS_DIR, SMALL, caption_path, inside, list_media, media_kind,
+                              nested_sources, paired_source, probe_audio, probe_video, reference_images, refers_to,
+                              source_index, split_clips, split_lyrics, trains_small)
 
 DUPLICATE_BITS = 4  # difference hashes this close (of 64 bits) are near-duplicates: resized, re-saved, lightly edited
 FPS = 24
@@ -118,23 +119,112 @@ def _plural(n: int, word: str, many: str | None = None) -> str:
     return f"{n} {word if n == 1 else many or word + 's'}"
 
 
+def pairing(root: str, files: list[str], sources: list[dict]) -> dict:
+    """How ``files`` of the dataset at ``root`` pair with reference images, as training pairs them
+    (``dataset.item_references``). With ``sources`` ([{name, path}], source datasets): {"from": "sources", "refs":
+    {file: [its image in each source dataset, or None]}, "unused": [the images of each that no file pairs with]}.
+    Without, from its _refs folders: {"from": "refs", "refs": {file: [references]}, "unused": [[files in _refs that
+    pair with none]]}, or {"from": None} when it has none."""
+    if sources:
+        indexes = [source_index(src["path"], root) for src in sources]
+        refs = {f: [paired_source(f, root, ix) for ix in indexes] for f in files}
+        unused = []
+        for i, ix in enumerate(indexes):
+            taken = {r[i] for r in refs.values()}
+            unused.append(sorted({p for p in ix.values() if p not in taken}))
+        return {"from": "sources", "refs": refs, "unused": unused}
+    folders = []
+    for dirpath, dirnames, _ in os.walk(root) if os.path.isdir(root) else []:
+        if REFS_DIR in dirnames:
+            folders.append(os.path.join(dirpath, REFS_DIR))
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d != REFS_DIR]
+    if not folders:
+        return {"from": None}
+    stems: dict[str, set[str]] = {}
+    for f in files:
+        stems.setdefault(os.path.dirname(f), set()).add(os.path.splitext(os.path.basename(f))[0])
+    unused = []
+    for folder in folders:
+        mine = stems.get(os.path.dirname(folder), set())
+        unused += [os.path.join(folder, n) for n in sorted(os.listdir(folder))
+                   if os.path.splitext(n)[1].lower() in IMAGE_EXTS and not any(refers_to(n, st) for st in mine)]
+    return {"from": "refs", "refs": {f: reference_images(f) for f in files}, "unused": [unused]}
+
+
+def _check_pairs(add, root: str, used: list[str], sources: list[dict], info: dict) -> dict | None:
+    """Findings on how a model that trains with reference images (``info``: its ``FamilyInfo.sources``) pairs the
+    files ``used`` with them; returns {with, of, from, most (the most a file has)} for the summary, or None when nothing pairs (text-to-image)."""
+    noun, label = info["noun"], info["label"].lower()
+    for src in sources:
+        if not os.path.isdir(src["path"]):
+            add("source_missing", "error", f"The folder of {label} “{src['name']}” wasn't found",
+                f"Nothing pairs from it: {src['path']}")
+        elif inside(src["path"], root):
+            add("source_inside", "info", f"{info['label']} “{src['name']}” is inside this dataset's folder",
+                f"Its images are {noun}s only; they don't train as results.")
+        elif os.path.abspath(src["path"]) == os.path.abspath(root):
+            add("source_same", "warning", f"{info['label']} “{src['name']}” is this dataset's own folder",
+                f"A file isn't its own {noun}, so nothing pairs from it. Choose the folder its {noun}s are in.")
+        elif inside(root, src["path"]):
+            add("source_contains", "info", f"{info['label']} “{src['name']}” holds this dataset's folder",
+                f"Its images outside this dataset's folder are the {noun}s; this dataset's own files train as results.")
+    p = pairing(root, used, sources)
+    if not p["from"]:
+        return None
+    refs = p["refs"]
+    paired = [f for f in used if any(refs[f])]
+    without = [f for f in used if not any(refs[f])]
+    where = (" or ".join(f"“{src['name']}”" for src in sources) if sources else f"its {REFS_DIR} folder")
+    if without:
+        add("no_source", "warning",
+            f"No file pairs with a {noun}" if not paired and used else
+            f"{_plural(len(without), 'file')} without a {noun}",
+            f"They {info['without']}. Files pair by name: photo.png with photo.jpg in {where}."
+            + (" Check the names match." if not paired else ""), without)
+    if sources and len(sources) > 1:
+        for i, src in enumerate(sources):
+            partly = [f for f in paired if refs[f][i] is None]
+            if partly:
+                add(f"no_source_{i}", "warning", f"{_plural(len(partly), 'file')} without a {noun} in “{src['name']}”",
+                    f"They train with their other {noun}s only.", partly)
+    for i, unused in enumerate(p["unused"]):
+        if unused:
+            name = f"“{sources[i]['name']}”" if sources else REFS_DIR
+            add(f"unused_source_{i}", "warning" if without else "info",
+                f"{_plural(len(unused), noun)} in {name} pair{'s' if len(unused) == 1 else ''} with no file",
+                "Nothing trains with them; maybe a name differs. They pair by name: photo.jpg with photo.png.",
+                unused, under=sources[i]["path"] if sources else root)
+    if sources and any(os.path.isdir(os.path.join(dp, REFS_DIR)) for dp, _, _ in os.walk(root)):
+        add("refs_unused", "info", f"Its {REFS_DIR} folder isn't used",
+            f"{'A ' + label + ' is' if len(sources) == 1 else info['label'] + 's are'} chosen, so files pair with "
+            f"those instead.")
+    return {"with": len(paired), "of": len(used), "from": p["from"],
+            "most": max((sum(1 for r in refs[f] if r) for f in used), default=0)}
+
+
 def check(root: str, trigger: str = "", resolution: list[int] | None = None, div: int = 16,
           video_frames: int | None = None, token_limit: int | None = None, clip_seconds: int | None = None,
-          clip_length: int | None = None, auto_frames: bool = False) -> dict:
+          clip_length: int | None = None, auto_frames: bool = False, references: dict | None = None,
+          sources: list[dict] | None = None) -> dict:
     """``resolution``: the sizes it will train at; ``video_frames``: the clip length when the model trains
     on clips (None: an image model), snapped to one it takes, and ``clip_length`` the one asked for (default
     ``video_frames``), or with ``auto_frames`` the longest a clip trains at, each training at its own length;
     ``token_limit``: caption tokens the model reads; ``clip_seconds``: a music model's clip length (0: whole
     songs; None: not a music model, which ``resolution`` etc. are then for). The result's ``longest_clip`` is
-    the longest clip's frames at 24 fps."""
-    files = list_media(root) if os.path.isdir(root) else []
+    the longest clip's frames at 24 fps. ``references``: the model's ``FamilyInfo.sources`` when it trains with
+    reference images, which come from ``sources`` ([{name, path}], source datasets) or else the _refs folder; the
+    result's ``pairs`` is then {with, of, from, most} (``_check_pairs``)."""
+    sources = (sources or []) if references else []
+    inner = nested_sources(root, sources)  # their files are sources, not this dataset's (as training reads them)
+    files = [f for f in (list_media(root) if os.path.isdir(root) else []) if not any(inside(f, p) for p in inner)]
     rel = {f: os.path.relpath(f, root) for f in files}
     issues: list[dict] = []
 
-    def add(id_, level, title, detail, paths=None, groups=None):
+    def add(id_, level, title, detail, paths=None, groups=None, under=None):
+        """``under``: the folder ``paths`` are named from, when it isn't this dataset's (a source dataset's)."""
         entry = {"id": id_, "level": level, "title": title, "detail": detail}
         if paths is not None:
-            entry.update(count=len(paths), files=[{"path": p, "name": rel.get(p, os.path.relpath(p, root))}
+            entry.update(count=len(paths), files=[{"path": p, "name": rel.get(p) or os.path.relpath(p, under or root)}
                                                   for p in paths[:MAX_LISTED]])
         if groups is not None:
             entry.update(count=len(groups), groups=[[{"path": p, "name": rel[p]} for p in g] for g in groups[:20]])
@@ -210,6 +300,7 @@ def check(root: str, trigger: str = "", resolution: list[int] | None = None, div
 
     if music:
         _check_songs(add, used, infos, clip_seconds)
+    pairs = _check_pairs(add, root, used, sources, references) if references and not music else None
 
     groups = _duplicate_groups([(f, infos[f]["hash"]) for f in used if "hash" in infos[f]])
     if groups:
@@ -260,8 +351,10 @@ def check(root: str, trigger: str = "", resolution: list[int] | None = None, div
                 f"“{trigger}” is added at the start of these when training.", without)
     media_stems = set(stems)
     orphans = []
+    skip = {os.path.abspath(p) for p in inner}  # a source dataset's captions are its own
     for dirpath, dirnames, names in os.walk(root):
-        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d != REFS_DIR]
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d != REFS_DIR
+                       and os.path.abspath(os.path.join(dirpath, d)) not in skip]
         orphans += [os.path.join(dirpath, n) for n in sorted(names)
                     if n.lower().endswith(".txt") and os.path.join(dirpath, n)[:-4] not in media_stems]
     if orphans:
@@ -271,7 +364,7 @@ def check(root: str, trigger: str = "", resolution: list[int] | None = None, div
     order = {"error": 0, "warning": 1, "info": 2}
     issues.sort(key=lambda i: order[i["level"]])
     return {"files": len(files), "images": sum(1 for f in ok if infos[f]["kind"] == "image"), "videos": len(clips),
-            "audio": len(songs), "issues": issues, "longest_clip": max(frames.values(), default=0)}
+            "audio": len(songs), "issues": issues, "longest_clip": max(frames.values(), default=0), "pairs": pairs}
 
 
 def _check_songs(add, songs: list[str], infos: dict, clip_seconds: int):

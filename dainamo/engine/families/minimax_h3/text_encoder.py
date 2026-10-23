@@ -259,18 +259,18 @@ def encode_minimax_h3_prompt(
     )
 
     # call the inner .model directly: the LM head's vocab projection is dead
-    # weight here and hidden_states[50] is all that is consumed
+    # weight here and hidden_states[50] is all that is consumed. The pixels
+    # stay fp32: the model casts them to the vision tower's own dtype (fp32 in
+    # the driver), and rounding them to the text model's bf16 first loses that
     outputs = text_encoder.model(
         input_ids=input_ids,
         attention_mask=torch.ones_like(input_ids),
         mm_token_type_ids=mm_token_type_ids,
-        pixel_values=None
-        if pixel_values is None
-        else pixel_values.to(device, text_encoder.dtype),
+        pixel_values=None if pixel_values is None else pixel_values.to(device),
         image_grid_thw=None if image_grid_thw is None else image_grid_thw.to(device),
         pixel_values_videos=None
         if pixel_values_videos is None
-        else pixel_values_videos.to(device, text_encoder.dtype),
+        else pixel_values_videos.to(device),
         video_grid_thw=None if video_grid_thw is None else video_grid_thw.to(device),
         use_cache=False,
         output_hidden_states=True,

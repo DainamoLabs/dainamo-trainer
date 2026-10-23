@@ -5,10 +5,12 @@ sampling time only. Commands arrive as JSON lines on stdin; events go out as JSO
 (library output is redirected to stderr, the worker log):
 
   in:  {"cmd": "generate", "id", "out_dir", "profile": {id, family, data}, "params": {...}}
+       {"cmd": "refmod", "id", "out_dir", "profile", "paths", "sheet", "name", "settings": {refmod_*}}
        {"cmd": "cancel", "id"}   {"cmd": "unload"}   {"cmd": "shutdown"}
   out: ready | status {message} | started {id}
        | progress {id, done, total, message, image, images, step, steps, sec_per_step, eta, started}
-       | output {id, item} | done {id, elapsed, loras} | error {id, message} | cancelled {id} | idle | exit
+       | output {id, item} | done {id, elapsed, loras; a RefMod's made} | error {id, message} | cancelled {id}
+       | idle | exit
 
 Memory: the diffusion model and VAE stay on the GPU, apart from the share of the diffusion model's
 blocks that the request's ``offload`` keeps in system RAM (changing it reloads the model, as does a request's
@@ -34,6 +36,10 @@ import traceback
 from collections import OrderedDict
 
 EVENTS = None
+# prompt encodings kept, the least recently used dropped beyond it. They wait in system RAM in bf16: LTX 2.5's are
+# 12 MB each, Qwen Image's with reference images tens of MB. A checkpoint grid or strength sweep reuses one prompt
+# (and its negative), so this is for going back and forth between prompts, at up to a GB or so.
+TEXTS_KEPT = 32
 
 
 def emit(event: str, **kw) -> None:
@@ -51,7 +57,7 @@ class Session:
         self.driver = self.model = self.adapters = None
         self.vae_loaded = False
         self.vae_parked: list | None = None  # what ``unpark`` puts back of a VAE waiting in system RAM
-        self.texts: dict = {}
+        self.texts: OrderedDict = OrderedDict()  # condition key -> its encoding, most recently used last
         self.te_where: str | None = None  # "gpu", "cpu" (parked) or None (not loaded)
         self.te_parked: list | None = None  # what ``unpark`` puts back of a parked, streamed text encoder
         self.lora_files: OrderedDict = OrderedDict()  # path -> (mtime, state dict), most recent last
@@ -61,8 +67,8 @@ class Session:
     # --- lifecycle -----------------------------------------------------------
     def unload_all(self):
         self.driver = self.model = self.adapters = None
-        self.vae_loaded, self.te_where, self.te_parked, self.texts, self.lora_key = False, None, None, {}, None
-        self.vae_parked = None
+        self.vae_loaded, self.te_where, self.te_parked, self.lora_key = False, None, None, None
+        self.vae_parked, self.texts = None, OrderedDict()
         self.profile_key = None
         gc.collect()
         if self.torch.cuda.is_available():
@@ -83,13 +89,20 @@ class Session:
 
     def use_model(self, path: str):
         """Generate with the diffusion model at ``path`` (the profile's, or a finetuned one in its place), reloading
-        only the diffusion model when it changes."""
+        only the diffusion model when it changes, and what came from its file with it (YuE2's composer and VAE)."""
         if path == self.driver.profile["diffusion_model"]:
             return
         if self.model is not None:
             emit("status", message="Switching diffusion model")
             self.drop_model()
         self.driver.profile["diffusion_model"] = path
+        bundled = self.driver.bundled  # parts loaded from the old file: from the new one when next needed
+        if "text_encoder" in bundled:  # (and what it encoded)
+            if self.te_where is not None:
+                self.driver.unload_text_encoder()
+            self.te_where, self.te_parked, self.texts = None, None, OrderedDict()
+        if "vae" in bundled:
+            self.vae_loaded, self.vae_parked = False, None
 
     def drop_model(self):
         """Unload the diffusion model only (e.g. to reload it with another offload setting)."""
@@ -175,9 +188,13 @@ class Session:
         return sum(t.numel() * t.element_size() for t in list(module.parameters()) + list(module.buffers()))
 
     def encode(self, conds: dict):
-        """Encode the conditions not cached yet: {key: (prompt, images)}."""
+        """Encode the conditions not cached yet: {key: (prompt, images)}. The cache keeps the ``TEXTS_KEPT`` most
+        recently used."""
         from .offload import park, unpark
 
+        for k in conds:
+            if k in self.texts:
+                self.texts.move_to_end(k)
         missing = {k: v for k, v in conds.items() if k not in self.texts}
         if not missing:
             return
@@ -204,6 +221,8 @@ class Session:
             emit("status", message=f"Encoding {len(missing)} prompt(s)")
             for k, (prompt, images) in missing.items():
                 self.texts[k] = self.driver.encode_condition(prompt, images)
+            while len(self.texts) > TEXTS_KEPT:  # (never this request's: they're the most recent)
+                self.texts.popitem(last=False)
             self._park_text_encoder()
         finally:
             if parked:
@@ -257,8 +276,11 @@ class Session:
         if key != self.lora_key:
             if loras:
                 emit("status", message=f"Applying {len(loras)} LoRA(s)")
-            self.lora_report = self.adapters.set(
-                [(os.path.basename(lr["path"]), self._lora_file(lr["path"]), float(lr["strength"])) for lr in loras])
+            files = [(os.path.basename(lr["path"]), self._lora_file(lr["path"]), float(lr["strength"])) for lr in loras]
+            # ``set`` clears what's applied before it can fail: if it does, nothing is applied, so a later request
+            # for the LoRAs applied before mustn't pass for done
+            self.lora_key, self.lora_report = None, []
+            self.lora_report = self.adapters.set(files)
             self.lora_key = key
         return self.lora_report
 
@@ -281,7 +303,10 @@ class Session:
             frames = d.snap_frames(frames)
         images = list(p.get("images") or [])
         audio = list(p.get("audio") or []) if frames > 1 else []
-        refs = {**({"refmods": p["refmods"]} if p.get("refmods") else {}), **({"audio": audio} if audio else {})}
+        refs = {**({"refmods": p["refmods"]} if p.get("refmods") else {}), **({"audio": audio} if audio else {}),
+                # Reference-to-Video's images are references whatever the model was trained for (MiniMax H3's fl2va
+                # would take one as its first frame)
+                **({"references": True} if p.get("workflow") == "r2v" else {})}
 
         prompt, cond_images = d.sample_condition({"prompt": p["prompt"], "width": w, "height": h,
                                                   "images": images, "frames": frames,
@@ -388,6 +413,73 @@ class Session:
         emit("done", id=rid, elapsed=round(time.time() - t0, 1), loras=report)
 
 
+    # --- RefMods -------------------------------------------------------------
+    def make_refmod(self, msg: dict, is_cancelled):
+        """A RefMod (``engine.refmod``) of ``paths``, images and clips (with ``sheet``, the images on one sheet
+        first, saved as sheet.png), through the VAE already loaded when the loaded profile's family and VAE are the
+        profile's (a RefMod needs only the VAE, so the diffusion model stays), else the profile's: <out_dir>/<name>
+        .safetensors, its preview (``refmod.save_preview``), and made.json describing it (the done event's
+        ``made``), copied to ``refmod_copy_to`` if set."""
+        from . import refmod
+        from .offload import park
+        from .sampling import Cancelled
+
+        rid, out_dir, s, profile = msg["id"], msg["out_dir"], msg["settings"], msg["profile"]
+        os.makedirs(out_dir, exist_ok=True)
+        t0 = time.time()
+        emit("started", id=rid)
+        d = self.driver
+        if d is None or d.info.id != profile["family"] or d.profile.get("vae") != profile["data"].get("vae"):
+            self.ensure_driver(profile)
+            d = self.driver
+
+        def check():
+            if is_cancelled():
+                raise Cancelled()
+
+        def log(text):
+            emit("progress", id=rid, message=str(text).strip())
+
+        parked = self.vae_parked is not None  # low VRAM keeps it in system RAM between renders
+        if not self.vae_loaded:
+            log("Loading the VAE")
+        self.vae_to_gpu()
+        try:
+            paths = list(msg["paths"])
+            if msg.get("sheet"):
+                log(f"Putting {len(paths)} images on a sheet")
+                refmod.make_sheet(paths, int(s["refmod_size"])).save(os.path.join(out_dir, "sheet.png"))
+                paths = [os.path.join(out_dir, "sheet.png")]
+            latent, meta = refmod.make(d, paths, s, log=log, check=check)
+            fname = msg["name"] + ".safetensors"
+            meta["name"] = msg["name"]
+            out = refmod.save(os.path.join(out_dir, fname), latent, meta)
+            copy_to = str(s.get("refmod_copy_to") or "").strip()
+            copied = None
+            if copy_to:
+                import shutil
+
+                try:
+                    os.makedirs(os.path.expanduser(copy_to), exist_ok=True)
+                    shutil.copyfile(out, os.path.join(os.path.expanduser(copy_to), fname))
+                    copied = copy_to
+                except OSError as e:
+                    log(f"Couldn't copy it to {copy_to}: {e}")
+            t, h, w = (int(x) for x in latent.shape[2:])
+            log(f"Decoding a preview of {min(t, refmod.PREVIEW_FRAMES)} frame(s)")
+            made = {"name": msg["name"], "file": fname, "path": out, "family": profile["family"], "kind": meta["kind"],
+                    "mode": s["refmod_mode"], "references": len(msg["paths"]), "sheet": bool(msg.get("sheet")),
+                    "tokens": refmod.tokens(latent), "bytes": os.path.getsize(out), "frames": t, "height": h,
+                    "width": w, "copied_to": copied, "created": time.time(),
+                    "preview": refmod.save_preview(d, latent, out_dir, check)}
+            with open(os.path.join(out_dir, "made.json"), "w", encoding="utf-8") as f:
+                json.dump(made, f)
+        finally:
+            if parked:
+                self.vae_parked = park(self._vae_modules())
+        emit("done", id=rid, elapsed=round(time.time() - t0, 1), made=made)
+
+
 def main():
     global EVENTS
     # events get the real stdout; anything libraries print goes to stderr (the worker log)
@@ -426,19 +518,20 @@ def main():
         if cmd == "unload":
             session.unload_all()
             emit("idle")
-        elif cmd == "generate":
+        elif cmd in ("generate", "refmod"):
             rid = msg.get("id")
             try:
                 if rid in cancelled:
                     raise Cancelled()
-                session.generate(msg, lambda: rid in cancelled)
+                (session.generate if cmd == "generate" else session.make_refmod)(msg, lambda: rid in cancelled)
             except Cancelled:
                 emit("cancelled", id=rid)
             except Exception as e:  # report and keep serving
                 traceback.print_exc()
                 text = f"{type(e).__name__}: {e}"
                 if "out of memory" in str(e).lower():
-                    text = "Out of GPU memory. Try a smaller size, fewer frames, or fewer LoRAs. " + text
+                    text = ("Out of GPU memory. Try a smaller size, fewer frames, or fewer LoRAs. " if cmd == "generate"
+                            else "Out of GPU memory: lower the size or the frames per clip. ") + text
                 emit("error", id=rid, message=text)
                 if session.torch.cuda.is_available():
                     session.torch.cuda.empty_cache()

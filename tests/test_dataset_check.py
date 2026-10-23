@@ -56,6 +56,36 @@ def test_each_problem_is_found(tmp_path, monkeypatch):
     assert dataset_check._duplicate_groups([("x", 0), ("y", 0b111), ("z", 0xFF00FF00FF)]) == [["x", "y"]]
 
 
+def test_source_datasets_nested_either_way(tmp_path):
+    from dainamo.engine.families import get_family
+
+    info = get_family("qwen_image_2").info.sources
+    for i, n in enumerate(("photos/cat.jpg", "photos/dog.png", "photos/edited/cat.png", "photos/edited/dog.png",
+                           "photos/edited/owl.png", "results/cat.png", "results/dog.png", "results/before/cat.jpg")):
+        (tmp_path / n).parent.mkdir(parents=True, exist_ok=True)
+        _photo(i, (64, 64)).save(tmp_path / n)
+    (tmp_path / "results/before/cat.txt").write_text("a source image's own caption")
+
+    # the sources in photos/, the results in photos/edited/: the results are checked, and pair with the sources
+    r = dataset_check.check(str(tmp_path / "photos/edited"), "", [64], 16, references=info,
+                            sources=[{"name": "Photos", "path": str(tmp_path / "photos")}])
+    issues = {i["id"]: i for i in r["issues"]}
+    assert r["files"] == 3 and r["pairs"] == {"with": 2, "of": 3, "from": "sources", "most": 1}
+    assert issues["source_contains"]["level"] == "info"
+    assert [f["name"] for f in issues["no_source"]["files"]] == ["owl.png"]  # not its own source
+    assert "unused_source_0" not in issues  # the results aren't counted as sources
+    # the other way round: sources in results/before/, which are only sources, captions and all
+    r = dataset_check.check(str(tmp_path / "results"), "", [64], 16, references=info,
+                            sources=[{"name": "Before", "path": str(tmp_path / "results/before")}])
+    issues = {i["id"]: i for i in r["issues"]}
+    assert r["files"] == 2 and r["pairs"]["with"] == 1 and "source_inside" in issues
+    assert "orphan_caption" not in issues
+    # its own folder: nothing pairs
+    r = dataset_check.check(str(tmp_path / "results"), "", [64], 16, references=info,
+                            sources=[{"name": "Results", "path": str(tmp_path / "results")}])
+    assert r["pairs"]["with"] == 0 and next(i for i in r["issues"] if i["id"] == "source_same")["level"] == "warning"
+
+
 def test_files_are_read_once(tmp_path, monkeypatch):
     _photo(5).save(tmp_path / "a.png")
     dataset_check.check(str(tmp_path))

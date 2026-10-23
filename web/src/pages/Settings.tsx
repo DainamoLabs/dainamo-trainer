@@ -196,13 +196,21 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
     }
   };
   const signOut = async () => {
-    await api.post("/api/auth/logout");
-    onSignOut();
+    try {
+      await api.post("/api/auth/logout");
+      onSignOut();
+    } catch (e: any) {
+      toast(e.message, true);
+    }
   };
   const runTest = async () => {
     setTest("Testing…");
-    const r = await api.post<{ ok: boolean; models?: string[]; error?: string }>("/api/captioner/test", s.captioner);
-    setTest(r.ok ? `✓ Connected${r.models?.length ? ` · models: ${r.models.join(", ")}` : ""}` : `✗ ${r.error}`);
+    try {
+      const r = await api.post<{ ok: boolean; models?: string[]; error?: string }>("/api/captioner/test", s.captioner);
+      setTest(r.ok ? `✓ Connected${r.models?.length ? ` · models: ${r.models.join(", ")}` : ""}` : `✗ ${r.error}`);
+    } catch (e: any) {
+      setTest(`✗ ${e.message}`);
+    }
   };
 
   return (

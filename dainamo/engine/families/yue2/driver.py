@@ -116,6 +116,9 @@ class YuE2Driver(FamilyDriver):
         self.tokenizer: M.TextTokenizer | None = None
         self.text_encoder: M.Composer | None = None  # the composer (the Sandbox parks it in RAM between runs)
         self.vae: M.VAE | None = None
+        # the checkpoint each part ("tokenizer", "composer", "vae") was loaded from: the Sandbox may point the profile
+        # at another one (``Session.use_model``), whose parts are loaded in their place
+        self.loaded_from: dict[str, str] = {}
 
     # --- settings -------------------------------------------------------------------------------------
     def cot(self) -> str:
@@ -134,19 +137,23 @@ class YuE2Driver(FamilyDriver):
 
     # --- the composer (text encoder) ------------------------------------------------------------------
     def _tokenizer(self) -> M.TextTokenizer:
-        if self.tokenizer is None:
-            with safe_open(self.profile["diffusion_model"], "pt") as f:
+        path = self.profile["diffusion_model"]
+        if self.tokenizer is None or self.loaded_from.get("tokenizer") != path:
+            with safe_open(path, "pt") as f:
                 blob = f.get_tensor("text_encoders.yue2_tokenizer_json").numpy().tobytes().decode("utf-8")
             self.tokenizer = M.TextTokenizer(blob)
+            self.loaded_from["tokenizer"] = path
         return self.tokenizer
 
     def load_text_encoder(self):
         """The composer on the GPU, expanded to bf16 (it samples token by token, where expanding quantized
         weights per token would dominate)."""
-        if self.text_encoder is not None:
-            self.text_encoder.to(self.device)
-            return
         path = self.profile["diffusion_model"]
+        if self.text_encoder is not None:
+            if self.loaded_from.get("composer") == path:
+                self.text_encoder.to(self.device)
+                return
+            self.unload_text_encoder()  # another checkpoint's: freed before this one's loads
         self.log(f"Loading the composer from {path}")
         self._tokenizer()
         with torch.device("meta"):
@@ -157,6 +164,7 @@ class YuE2Driver(FamilyDriver):
         del weights
         assert_materialized(comp)
         self.text_encoder = comp.eval()
+        self.loaded_from["composer"] = path
 
     def training_prefix(self, style: str, lyrics: str) -> list[int]:
         """The conditioning a training item is shown: planning off, no semantic tokens."""
@@ -184,16 +192,18 @@ class YuE2Driver(FamilyDriver):
         return {"files": [self.profile["diffusion_model"]]}  # the composer and the VAE are in the checkpoint
 
     def load_vae(self):
-        if self.vae is not None:
+        path = self.profile["diffusion_model"]
+        if self.vae is not None and self.loaded_from.get("vae") == path:
             return
-        weights = comfy_io.load_state_dict(self.profile["diffusion_model"], strip_prefix="vae.", only_prefixed=True,
-                                           device=self.device).tensors
+        self.vae = None  # another checkpoint's
+        weights = comfy_io.load_state_dict(path, strip_prefix="vae.", only_prefixed=True, device=self.device).tensors
         with torch.device("meta"):
             vae = M.VAE()
         vae.load_state_dict(M.fold_weight_norm(weights), assign=True)
         del weights
         self.vae = vae.to(self.device).eval().requires_grad_(False)
         assert_materialized(self.vae)
+        self.loaded_from["vae"] = path
 
     def unload_vae(self):
         """With the VAE goes the composer, which sampling loaded: training continues without either."""
@@ -254,7 +264,7 @@ class YuE2Driver(FamilyDriver):
         ``to_media``. ``callback(step, total)`` follows the acoustic model's steps."""
         d = self.device
         self.load_text_encoder()
-        tok, comp, cot = self.tokenizer, self.text_encoder, self.cot()
+        tok, comp, cot = self._tokenizer(), self.text_encoder, self.cot()
         style, lyrics = cond.get("style", ""), cond.get("lyrics", "")
         seconds = min(MAX_SECONDS, max(1.0, float(cond.get("seconds") or 30)))
         prefix = M.prefix_ids(tok, cot, style, lyrics)

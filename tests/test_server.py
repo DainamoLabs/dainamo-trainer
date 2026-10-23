@@ -726,6 +726,66 @@ def test_editing_a_job(client, tmp_path, monkeypatch):
     db.execute("UPDATE jobs SET status='stopped' WHERE id=?", (jid,))
 
 
+def test_a_job_keeps_its_datasets_once_theyre_removed(client, tmp_path, monkeypatch):
+    from dainamo.server.queue import scheduler
+
+    monkeypatch.setattr(scheduler, "_launch", lambda: None)  # its jobs stay queued
+    for n in ("after", "before"):
+        (tmp_path / n).mkdir()
+    pid = client.post("/api/profiles", json={"name": "rm", "family": "qwen_image_2", "data": {}}).json()["id"]
+    did, sid = (client.post("/api/datasets", json={"name": n, "path": str(tmp_path / n), "trigger": t}).json()["id"]
+                for n, t in (("after", "ohwx"), ("before", "")))
+    body = {"name": "rm", "profile_id": pid, "settings": {}, "datasets": [{"id": did, "sources": [sid]}]}
+    jid = client.post("/api/jobs", json=body).json()["id"]
+    for i in (did, sid):
+        client.delete(f"/api/datasets/{i}")
+    # renamed and given another learning rate, it keeps them as it had them
+    r = client.put(f"/api/jobs/{jid}", json={**body, "name": "rm v2", "settings": {"learning_rate": 5e-5}})
+    assert r.status_code == 200, r.text
+    d = r.json()["config"]["datasets"][0]
+    assert (d["id"], d["name"], d["path"], d["trigger"]) == (did, "after", str(tmp_path / "after"), "ohwx")
+    assert d["sources"] == [{"id": sid, "name": "before", "path": str(tmp_path / "before")}]
+    assert (r.json()["name"], r.json()["config"]["settings"]["learning_rate"]) == ("rm v2", 5e-5)
+    # one it never had is still not found, and so is the removed one for a new job
+    assert client.put(f"/api/jobs/{jid}", json={**body, "datasets": [{"id": "nope"}]}).status_code == 404
+    assert client.post("/api/jobs", json=body).status_code == 404
+    client.post(f"/api/jobs/{jid}/action", json={"action": "stop"})
+
+
+def test_a_job_stopping_when_the_server_restarted_is_still_forced(client, monkeypatch):
+    import time
+
+    from dainamo.server import db, procs
+    from dainamo.server.queue import STOP_GRACE, scheduler
+
+    jid = db.new_id()
+    db.execute("INSERT INTO jobs (id, name, status, family, gpu, position, created, pid, config) VALUES "
+               "(?,?,?,?,?,?,?,?,?)", (jid, "slow to stop", "stopping", "krea2", "99", 0.0, db.now(), os.getpid(), "{}"))
+    monkeypatch.setattr(procs, "is_trainer", lambda pid, job_id: job_id == jid)  # its trainer outlived the server
+    killed = []
+    monkeypatch.setattr(procs, "kill_tree", killed.append)
+    with scheduler._lock:  # the queue's loop leaves it alone meanwhile
+        scheduler._reattach()
+        assert time.time() < scheduler.stop_deadline[jid] <= time.time() + STOP_GRACE
+        scheduler._reap()
+        assert killed == []  # still has time to save
+        scheduler.stop_deadline[jid] = time.time() - 1
+        scheduler._reap()
+        assert killed == [os.getpid()]
+        del scheduler.procs[jid], scheduler.stop_deadline[jid]
+    db.execute("DELETE FROM jobs WHERE id=?", (jid,))
+
+
+def test_a_missing_file_or_a_folder_in_a_dataset(client):
+    d = client.post("/api/datasets", json={"name": "uploads"}).json()  # uploaded files: deleted from disk
+    folder = os.path.join(d["path"], "sub")
+    os.makedirs(folder)
+    assert client.delete("/api/media", params={"path": folder}).status_code == 400 and os.path.isdir(folder)
+    assert client.get("/api/thumb", params={"path": os.path.join(d["path"], "gone.png")}).status_code == 404
+    assert client.get("/api/thumb", params={"path": folder}).status_code == 404
+    client.delete(f"/api/datasets/{d['id']}", params={"delete_files": True})
+
+
 def test_clearing_the_shared_cache_spares_what_running_jobs_use(client):
     import json
     import os

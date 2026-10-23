@@ -14,9 +14,10 @@ Offloading saves little in training without gradient checkpointing.
 
 ## VRAM projection
 
-Next to the slider, Dainamo projects the peak VRAM of each phase of the job
-(encoding captions and images, training steps, sampling) and compares the
-highest with the selected GPU (with "Auto", the smallest). **Fit to GPU** picks
+Dainamo projects the peak VRAM of each phase of the job (encoding captions and
+images, training steps, sampling) and compares the highest with the selected
+GPU (with "Auto", the smallest): in Create Job's **Memory estimate**, with each
+phase under **Memory breakdown**, and next to the Sandbox's slider. **Fit to GPU** picks
 the lowest offload that fits, with about 0.75 GB to spare.
 
 The projection reads tensor sizes from the model files' headers and adds each

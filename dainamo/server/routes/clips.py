@@ -46,7 +46,7 @@ def _video(rel: str, s: dict, m: dict) -> dict:
     side = m["settings"]["max_side"]
     cut = {c["id"]: {"start": c["start"], "frames": c["frames"], "crop": c.get("crop")}
            for c in m["clips"].values() if c.get("source") == rel and "id" in c and c.get("max_side") == side}
-    return {"rel": rel, "path": path if os.path.isfile(path) else None, "looked": "duration" in v,
+    return {"rel": rel, "path": path if os.path.isfile(path) else None, "looked": "duration" in v, "stem": v.get("stem"),
             "duration": v.get("duration"), "fps": v.get("fps"), "width": v.get("width"), "height": v.get("height"),
             "has_audio": bool(v.get("has_audio")), "cuts": v.get("cuts") or [], "clips": v.get("clips") or [],
             "next": v.get("next", 1), "note": v.get("note") or "", "cut": cut}

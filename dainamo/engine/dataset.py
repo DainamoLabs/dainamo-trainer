@@ -8,7 +8,7 @@ import math
 import os
 import random
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -17,7 +17,9 @@ from PIL import Image, ImageOps
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 VIDEO_EXTS = {".mp4", ".webm", ".mov", ".mkv", ".avi"}
 AUDIO_EXTS = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".opus", ".aac"}
-REFS_DIR = "_refs"  # per-clip reference images for reference-conditioned families; never trained on directly
+# per-item reference images (an edit's source images, a clip's references) kept inside the dataset, for when no
+# source datasets are chosen; never trained on directly
+REFS_DIR = "_refs"
 # written by Split into clips: which video each clip was cut from ({"clips": {relative clip path: {source, ...}}})
 CLIPS_MANIFEST = ".clips.json"
 
@@ -220,12 +222,59 @@ def reference_images(media_path: str) -> list[str]:
     if not os.path.isdir(folder):
         return []
     stem = os.path.splitext(os.path.basename(media_path))[0]
-    out = []
-    for f in sorted(os.listdir(folder)):
-        base, ext = os.path.splitext(f)
-        if ext.lower() in IMAGE_EXTS and (base == stem or (base.startswith(stem + "_") and base[len(stem) + 1:].isdigit())):
-            out.append(os.path.join(folder, f))
-    return out
+    return [os.path.join(folder, f) for f in sorted(os.listdir(folder)) if refers_to(f, stem)]
+
+
+def refers_to(name: str, stem: str) -> bool:
+    """Whether a file in a _refs folder is a reference of the file named ``stem``: ``<stem>.png``, ``<stem>_1.png``."""
+    base, ext = os.path.splitext(name)
+    return ext.lower() in IMAGE_EXTS and (base == stem or (base.startswith(stem + "_") and base[len(stem) + 1:].isdigit()))
+
+
+def _name(path: str, root: str) -> str:
+    """A file's path in ``root`` without its extension, "/"-separated: what it pairs by."""
+    return os.path.splitext(os.path.relpath(path, root))[0].replace(os.sep, "/")
+
+
+def source_index(root: str, dataset: str | None = None) -> dict[str, str]:
+    """A source dataset's images by the name they pair with: their path in ``root`` without the extension
+    ("sub/photo"), and their file name alone ("photo") where no other image has it, so sources kept in one folder
+    pair with images in subfolders. ``dataset``: the folder of the dataset that pairs with it; when that's ``root``
+    or inside it, its files aren't sources (a file doesn't pair with itself)."""
+    holds = dataset is not None and (os.path.abspath(dataset) == os.path.abspath(root) or inside(dataset, root))
+    by_path, by_name = {}, {}
+    for f in list_media(root) if os.path.isdir(root) else []:
+        if media_kind(f) == "image" and not (holds and inside(f, dataset)):
+            name = _name(f, root)
+            by_path[name] = f
+            by_name.setdefault(name.rsplit("/", 1)[-1], []).append(f)
+    return {**{k: v[0] for k, v in by_name.items() if len(v) == 1}, **by_path}
+
+
+def paired_source(path: str, root: str, index: dict[str, str]) -> str | None:
+    """The image of a source dataset (its ``source_index``) that a file of the dataset at ``root`` pairs with: the
+    one of the same name, of any image type, in the same subfolder if it has subfolders."""
+    name = _name(path, root)
+    return index.get(name) or index.get(name.rsplit("/", 1)[-1])
+
+
+def item_references(path: str, root: str, indexes: list[dict[str, str]]) -> list[str]:
+    """The reference images a file of the dataset at ``root`` trains with: the image of its name in each source
+    dataset (``source_index``) that has one, in order; with no source datasets, those in its _refs folder."""
+    if indexes:
+        return [s for s in (paired_source(path, root, ix) for ix in indexes) if s]
+    return reference_images(path)
+
+
+def inside(path: str, folder: str) -> bool:
+    return os.path.abspath(path).startswith(os.path.abspath(folder) + os.sep)
+
+
+def nested_sources(root: str, sources: list[dict]) -> list[str]:
+    """The folders of ``sources`` (source datasets) inside the dataset at ``root``: their files are sources only,
+    never trained on. (A source dataset whose folder holds the dataset's is the other way round: ``source_index``
+    leaves the dataset's files out of it, and they train.)"""
+    return [src["path"] for src in sources if inside(src["path"], root)]
 
 
 @dataclass
@@ -244,6 +293,7 @@ class Item:
     lyrics: str = ""         # audio: lyrics the item trains with (whole songs only)
     source: str = ""         # a clip cut from a longer video (``clip_sources``): that video
     group: str = ""          # items of which an epoch trains one, picked at random: a source's clips at one size
+    refs: list[str] = field(default_factory=list)  # reference images it trains with (``item_references``)
 
     @property
     def is_video(self) -> bool:
@@ -262,17 +312,21 @@ class Item:
             raw += f"|{self.frames}"
         if self.seconds:
             raw += f"|{self.start}|{self.seconds}"
-        for ref in reference_images(self.path):  # editing a reference re-encodes the item
+        for ref in self.refs:  # editing or pairing another reference re-encodes the item
             raw += f"|{ref}|{os.stat(ref).st_mtime_ns}"
         return hashlib.sha1(raw.encode()).hexdigest()
 
 
 def build_items(datasets: list[dict], resolution: int | list[int], div: int, flip: bool, log=print,
                 video_frames: int | None = None, snap_frames=None, fps: int = 24,
-                caption_dropout: float = 0.0) -> list[Item]:
-    """``datasets``: [{path, trigger, repeats, resolution?, flip?, caption_dropout?, name?}] -> list of Items
-    (repeats expanded). A dataset's own ``resolution`` (one or several), ``flip`` and ``caption_dropout`` are
+                caption_dropout: float = 0.0, references: bool = False) -> list[Item]:
+    """``datasets``: [{path, trigger, repeats, resolution?, flip?, caption_dropout?, name?, sources?}] -> list of
+    Items (repeats expanded). A dataset's own ``resolution`` (one or several), ``flip`` and ``caption_dropout`` are
     used instead of the arguments of those names.
+    With ``references`` (the model trains with per-item references: an edit's source images), each item has the
+    reference images it pairs with (``item_references``): from the dataset's ``sources`` ([{path, name?}], source
+    datasets, whose files never train as items themselves; ``nested_sources``, ``source_index``), or else its _refs
+    folder.
     With several resolutions, each file is an item at each of them, except where a small image gives
     the same bucket at two (it isn't upscaled), which would only count it twice.
     With ``video_frames`` set (video families), clips are included at up to that many frames,
@@ -281,12 +335,19 @@ def build_items(datasets: list[dict], resolution: int | list[int], div: int, fli
     items = []
     for ds in datasets:
         res_list = resolutions(ds.get("resolution") or resolution)
-        files = [f for f in list_media(ds["path"]) if media_kind(f) == "image" or (video_frames and media_kind(f) == "video")]
+        sources = (ds.get("sources") or []) if references else []
+        for src in sources:
+            if not os.path.isdir(src["path"]):
+                log(f"Warning: the folder of source dataset {src.get('name') or src['path']} wasn't found: {src['path']}")
+        indexes = [source_index(src["path"], ds["path"]) for src in sources]
+        inner = nested_sources(ds["path"], sources)  # source datasets in a subfolder
+        files = [f for f in list_media(ds["path"]) if (media_kind(f) == "image" or (video_frames and media_kind(f) == "video"))
+                 and not any(inside(f, p) for p in inner)]
         if not files:
             log(f"Warning: no usable images{' or videos' if video_frames else ''} found in {ds['path']}")
             continue
-        start, used, small = len(items), {"image": 0, "clip": 0}, 0
-        sources, cut_from, n_cut = clip_sources(ds["path"]), set(), 0
+        start, used, small, paired = len(items), {"image": 0, "clip": 0}, 0, 0
+        cuts, cut_from, n_cut = clip_sources(ds["path"]), set(), 0
         for f in files:
             frames, has_audio = 1, False
             if media_kind(f) == "video":
@@ -308,13 +369,15 @@ def build_items(datasets: list[dict], resolution: int | list[int], div: int, fli
             for res in res_list:
                 sizes.setdefault(bucket_size(w, h, res, div), res)
             used["clip" if frames > 1 else "image"] += 1
-            cut = sources.get(os.path.normpath(f)) if frames > 1 else None
+            cut = cuts.get(os.path.normpath(f)) if frames > 1 else None
             source = f"{ds['path']}|{cut}" if cut else ""
             if source:
                 cut_from.add(source)
                 n_cut += 1
             small += len(sizes) < len(res_list)
             cap = apply_trigger(read_caption(f), ds.get("trigger", ""))
+            refs = item_references(f, ds["path"], indexes) if references else []
+            paired += bool(refs)
             variants = [False, True] if ds.get("flip", flip) else [False]
             drop = float(ds.get("caption_dropout", caption_dropout))
             for size, res in sizes.items():
@@ -323,7 +386,7 @@ def build_items(datasets: list[dict], resolution: int | list[int], div: int, fli
                     for rep in range(max(1, int(ds.get("repeats", 1)))):
                         group = f"{source}|{res}|{fl}|{rep}" if source else ""
                         items.append(Item(f, cap, size, fl, frames, has_audio, res, drop, small_at,
-                                          source=source, group=group))
+                                          source=source, group=group, refs=refs))
         repeats = max(1, int(ds.get("repeats", 1)))
         counts = " and ".join(f"{n} {kind}{'' if n == 1 else 's'}" for kind, n in used.items() if n)
         mine = items[start:]
@@ -336,6 +399,11 @@ def build_items(datasets: list[dict], resolution: int | list[int], div: int, fli
             + ", ".join(map(str, res_list)) + (f", {repeats} repeats" if repeats > 1 else "")
             + f" -> {len(mine)} items" + (f", {per_epoch} per epoch" if per_epoch < len(mine) else "")
             + (f" ({small} too small for the larger sizes train at fewer of them)" if small else ""))
+        if sources or paired:
+            n = sum(used.values())
+            log(f"  {paired} of {n} with references"
+                + (f" from {', '.join(src.get('name') or os.path.basename(os.path.normpath(src['path'])) for src in sources)}"
+                   if sources else f" in {REFS_DIR}") + (f"; {n - paired} without" if paired < n else ""))
     return items
 
 

@@ -416,17 +416,21 @@ def sandbox_models(family: str):
 
 @router.get("/refmods")
 def sandbox_refmods(family: str):
-    """The RefMods this family's jobs made, newest first."""
-    out = []
-    for j in db.query("SELECT id, name, config FROM jobs WHERE family=? ORDER BY created DESC", (family,)):
+    """The RefMods this family's jobs and the Sandbox made, newest first."""
+    from .refmods import made_refmods
+
+    keys = ("kind", "mode", "frames", "seconds", "tokens", "references")
+    out = [{"job_id": None, "job_name": m["name"], "file": m["file"], "path": m["path"], "created": m.get("created", 0),
+            "sheet": bool(m.get("sheet")), **{k: m.get(k) for k in keys}} for m in made_refmods(family)]
+    for j in db.query("SELECT id, name, config, created FROM jobs WHERE family=?", (family,)):
         if not (j["config"] or {}).get("settings", {}).get("refmod_enabled"):
             continue
         made = read_status(j["id"]).get("refmod") or {}
         path = os.path.join(job_dir(j["id"]), "output", made.get("file") or "")
         if made.get("file") and os.path.exists(path):
             out.append({"job_id": j["id"], "job_name": j["name"], "file": made["file"], "path": path,
-                        **{k: made.get(k) for k in ("kind", "mode", "frames", "seconds", "tokens", "references")}})
-    return out
+                        "created": j["created"], **{k: made.get(k) for k in keys}})
+    return sorted(out, key=lambda r: -(r["created"] or 0))
 
 
 @router.post("/generate")

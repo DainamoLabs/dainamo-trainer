@@ -271,15 +271,16 @@ function ExtractForm({ profile, family }: { profile: Profile; family: Family }) 
   const [trigger, setTrigger] = useState("");
   const [busy, setBusy] = useState(false);
   const settled = useSettled({ tuned: tuned.trim(), original: original.trim() });
+  // fresh: the check of the paths as they are now, none once the finetuned model is cleared
   const [plan, , err] = usePoll<ExtractPlan>(settled.tuned
-    ? `/api/tools/extract/sizes?profile_id=${profile.id}&path=${q(settled.tuned)}&base=${q(settled.original)}` : null, 0);
+    ? `/api/tools/extract/sizes?profile_id=${profile.id}&path=${q(settled.tuned)}&base=${q(settled.original)}` : null, 0, [], true);
   const jobs = useMemo(() => byJob(models), [models]);
   // a finetune job's checkpoint, extracted as its job's Extract LoRA does (linked to it, with its trigger words)
   const ckpt = !original.trim() ? models?.find((m) => m.path === tuned) : undefined;
   const auto = tuned.trim() ? `${stem(tuned.trim())}_r${rank}` : "extracted";
   const why = !tuned.trim() ? "Choose a finetuned model to continue."
     : err && settled.tuned ? "Fix the problem above to continue."
-    : !plan || settled.tuned !== tuned.trim() ? "Checking the model…"
+    : !plan || settled.tuned !== tuned.trim() || settled.original !== original.trim() ? "Checking the model…"
     : !plan.base_found ? "Fix the base model to continue."
     : "";
 
