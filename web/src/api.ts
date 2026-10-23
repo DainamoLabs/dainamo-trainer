@@ -66,6 +66,7 @@ export type Dataset = {
   audio: number;
   captioned: number;
   video_sources: number; // what its videos count as per epoch: clips split from one video count once
+  split: { source: { id: string; name: string }; changes: number } | null; // made by Split into clips: changes not cut yet
   exists: boolean;
   cover: string | null;
   caption_options: CaptionOptions | null; // the Auto-Caption choices it was last captioned with

@@ -25,7 +25,7 @@ dainamo/
       ltx2/               LTX 2.5: diffusers' LTX-2 classes loaded from ComfyUI files, and the driver
   server/
     app.py                FastAPI app: middleware, routers, the built web UI
-    routes/               the API, one module per area (system, profiles, models, datasets, jobs, sandbox, llm, tools)
+    routes/               the API, one module per area (system, profiles, models, datasets, clips, jobs, sandbox, llm, tools)
     validation.py         job settings checks
     db.py                 SQLite store and its schema migrations
     queue.py              job queue: launches training processes onto GPUs
@@ -37,7 +37,7 @@ dainamo/
     captioner.py          Auto-Caption and Enhance prompt requests
     llama_server.py       the caption server Dainamo runs (llama-server or textgen)
     dataset_check.py      the dataset health check
-    clip_split.py         Split into clips
+    clip_split.py         Split into clips, and the plan the clip editor changes
     media_download.py     Add from URL (yt-dlp)
     model_files.py        Model files: finding model files, and downloading them
   webui.py                whether web/dist is up to date with its source (for the launchers)
@@ -121,6 +121,7 @@ only the header matters.
 | `test_model_files.py` | the families' download lists, the models folder setting, finding files by their contents, downloads pausing, resuming and checking their checksum, gated and impossible downloads, the Turbo-without-adapter warning |
 | `test_dataset_check.py` | each kind of health check problem, and that a file is read once |
 | `test_clip_split.py` | Split into clips: planning inside shots, cutting at 24 fps with sound, captions and references, cancelling, each video once per epoch |
+| `test_clip_editor.py` | the clip editor: a reviewed split cut as planned, then again only where it changed (captions kept, removed clips gone, deleted ones not brought back), crops, splits from before the editor, replanning, checks on edits, and its frames being the clips' own |
 | `test_captioner.py` | reading LLM replies: thinking left out, cut-off replies retried, errors reported, the contact sheet fallback |
 | `test_llama_server.py` | the caption server against a stand-in (`tests/fake_llama_server.py`): command lines, waiting while loading, GPU choice, failed starts with hints, idle stops, handing over the GPU; the text encoder server's GPU rules |
 | `test_textgen.py` | which text encoders can write (from header-only copies), OpenAI messages to chat templates, the server's answers, quantized layers expanded only while there's room. With a GPU, a tiny random Qwen3-VL end to end |

@@ -58,6 +58,7 @@ def list_datasets():
         d["video_sources"] = len({cut[f]["source"] for f in videos if f in cut}) + sum(1 for f in videos if f not in cut)
         d["exists"] = os.path.isdir(d["path"])
         d["cover"] = files[0] if files else None
+        d["split"] = clip_split.summary(d["path"]) if d["exists"] else None  # made by Split into clips
         out.append(d)
     return out
 
@@ -441,6 +442,7 @@ class SplitIn(BaseModel):
     keep_short: bool = True  # a shot too short for a clip gives a shorter one
     max_side: int = 1024  # shrink to this shorter side; 0 keeps the size
     captions: str = "copy"  # "copy": each clip gets its video's caption; "none"
+    review: bool = False  # only plan the clips, to change them in the clip editor before they're cut
 
 
 @router.post("/datasets/{did}/split")
@@ -468,7 +470,8 @@ def split_dataset(did: str, body: SplitIn):
     target = create_dataset(DatasetIn(name=body.name, trigger=d["trigger"]))
     if d.get("caption_options"):
         db.execute("UPDATE datasets SET caption_options=? WHERE id=?", (json.dumps(d["caption_options"]), target["id"]))
-    clip_split.split_jobs[did] = clip_split.SplitJob(d, target, F, body.model_dump())
+    clip_split.split_jobs[did] = clip_split.SplitJob(d, target, F, body.model_dump(), cut=not body.review,
+                                                     fresh=not body.review)
     return clip_split.split_jobs[did].to_json()
 
 

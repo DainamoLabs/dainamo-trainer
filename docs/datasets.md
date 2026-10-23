@@ -76,6 +76,40 @@ left as it is.
 
 Cancelling a split removes the partial copy.
 
+### Clip editor
+
+**Review first**, in the Split into clips dialog, plans the clips without
+cutting them and opens the clip editor. **Edit clips**, on a dataset Split into
+clips made, opens it later. Each video of the original is listed with its
+clips; pick one to see it:
+
+- **The timeline** shows the video's frames, its shot cuts (dashed lines), its
+  clips and where the player is. Drag a clip to move it (a cut pulls its start
+  or end a frame clear of it), or one of its ends to change its length (only to
+  lengths the model takes). Double-click, or **Add a clip here**, for a new clip
+  of the length beside it. **Plan again** replans the video as Split into clips
+  does, at that length. Zoom in for long videos.
+- **The player** plays the selected clip, looping, with its sound. A browser
+  can't play every file (an `.avi`, say); the editor then shows still frames
+  from the server.
+- **A clip** can start anywhere a frame clear of the video's end, and be
+  cropped: choose an aspect (or Free) and drag the box on the video, or its
+  corners. **All clips** gives every clip of the video that crop. A clip that
+  crosses a shot cut is outlined red, and one overlapping another is noted.
+- **First and last frame** are taken from the video as the cut takes them (the
+  same seek and resampling to 24 fps), so they're exactly the clip's ends; the
+  browser's player is only close.
+- Keys: Space plays, ←/→ move the clip a frame (Shift: a second), N adds a clip
+  at the player, Delete removes the selected one, Esc deselects.
+
+Changes save as you make them. **Cut** cuts only what changed: new clips, and
+clips moved, resized or cropped (which keep their captions), and removes the
+clips taken out, with their captions. The rest are left as they are. A clip
+deleted from the dataset's page leaves the plan, so cutting again doesn't bring
+it back. Videos added to the original since are found and planned when the
+editor opens. A split made before the clip editor opens in it too: its clips
+are read from the dataset, and its videos looked at again for their shots.
+
 ## Add from URL (experimental)
 
 **Add from URL**, on a dataset's page, downloads a video, or only its sound,

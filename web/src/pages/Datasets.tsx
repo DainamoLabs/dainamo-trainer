@@ -4,9 +4,10 @@ import { api, byFamily, fmtTime, q, type Dataset, type Family, type Gpu, type Me
 import { CheckIssues, useDatasetCheck } from "../components/DatasetCheck";
 import { IconDownload, IconEdit, IconImages, IconPlus, IconScissors, IconSparkle, IconTrash, IconUpload, IconX } from "../components/icons";
 import { ConfirmDialog, Info, Lightbox, Modal, PathInput, ProfileOptions, fmtSize, usePoll, useToast } from "../components/ui";
+import ClipEditor from "./ClipEditor";
 
 type SplitStatus = {
-  running: boolean; total: number; done: number; clips: number; current?: string; message?: string; errors: string[];
+  running: boolean; mode?: "cut" | "plan"; fresh?: boolean; total: number; done: number; clips: number; removed?: number; current?: string; message?: string; errors: string[];
   cancelled?: boolean; target: { id: string; name: string } | null;
 };
 type ClipFit = { frames: number | null; fps: number; lengths: { frames: number; seconds: number; peak_gb: number }[]; error?: string };
@@ -265,7 +266,11 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
           <button className="btn" onClick={() => setDlOpen(true)} disabled={dl?.running}
             title="Download a video, or only its sound, from a web page into this dataset (experimental)"><IconDownload /> Add from URL</button>
           <button className="btn" onClick={() => setEditOpen(true)} disabled={!items?.length} title="Find and replace, add or remove words in every caption"><IconEdit /> Edit captions</button>
-          {items?.some((i) => i.kind === "video") && (
+          {d?.split && (
+            <button className="btn" onClick={() => go("datasets", id, "clips")} title={`Move, resize, crop, add or remove the clips cut from ${d.split.source.name}'s videos`}>
+              <IconScissors /> Edit clips</button>
+          )}
+          {items?.some((i) => i.kind === "video") && !d?.split && (
             <button className="btn" onClick={() => setSplitOpen(true)} disabled={split?.running}
               title="Make a copy of this dataset with each video cut into clips a video model trains on whole">
               <IconScissors /> Split into clips</button>
@@ -307,14 +312,23 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
             {cap.errors.length > 0 && <div className="error-box" style={{ marginTop: 8 }}>{cap.errors.slice(-3).map((e) => <div key={e}>{e}</div>)}</div>}
           </div>
         )}
+        {d?.split && d.split.changes > 0 && (
+          <div className="validation warning" style={{ marginTop: 12 }}>
+            {d.split.changes} change{d.split.changes === 1 ? "" : "s"} to the clips {d.split.changes === 1 ? "isn't" : "aren't"} cut yet:
+            <a href={`#/datasets/${id}/clips`}>open the clip editor</a>
+          </div>
+        )}
         {split?.target && (split.running || split.done > 0) && (
           <div style={{ marginTop: 14 }}>
             <div className="row small" style={{ marginBottom: 6 }}>
               <IconScissors width={14} style={{ color: "var(--accent)" }} />
               {split.running
-                ? <span>Splitting {split.done} / {split.total} files · {split.clips} clips <span className="faint">{split.current}{split.message ? ` · ${split.message}` : ""}</span></span>
-                : split.cancelled ? <span>Split cancelled; the partial copy was removed</span>
-                : <span>Split finished: {split.clips} clips in <a href={`#/datasets/${split.target.id}`}>{split.target.name}</a></span>}
+                ? <span>{split.mode === "plan" ? "Planning clips in" : "Splitting"} {split.done} / {split.total} files{split.mode === "plan" ? "" : ` · ${split.clips} clips`}{" "}
+                  <span className="faint">{split.current}{split.message ? ` · ${split.message}` : ""}</span>
+                  {split.mode === "plan" && <> · <a href={`#/datasets/${split.target.id}/clips`}>open the clip editor</a></>}</span>
+                : split.mode === "plan" ? <span>Clips planned for <a href={`#/datasets/${split.target.id}/clips`}>{split.target.name}</a>: review them in the clip editor, then cut them</span>
+                : split.cancelled ? <span>{split.fresh ? "Split cancelled; the partial copy was removed" : "Stopped; the clips cut so far stay"}</span>
+                : <span>Split finished: {split.clips} clip{split.clips === 1 ? "" : "s"} cut{split.removed ? `, ${split.removed} removed` : ""} in <a href={`#/datasets/${split.target.id}`}>{split.target.name}</a></span>}
               <span className="spacer" />
               {split.running && <button className="btn sm" onClick={() => api.del(`/api/datasets/${id}/split`).then(reloadSplit)}><IconX /> Cancel</button>}
             </div>
@@ -610,14 +624,15 @@ function SplitModal({ dataset, families, onClose, onStarted }: { dataset: Datase
     return () => { live = false; };
   }, [profileId, resolution, offload, lowVram, gpuGb]);
   const chosen = fit?.lengths.find((l) => l.frames === frames);
-  const start = async () => {
+  const start = async (review: boolean) => {
     try {
-      await api.post(`/api/datasets/${dataset.id}/split`, {
-        name, family: family!.id, frames, max_clips: maxClips, scenes, keep_short: keepShort, max_side: maxSide, captions,
+      const job = await api.post<SplitStatus>(`/api/datasets/${dataset.id}/split`, {
+        name, family: family!.id, frames, max_clips: maxClips, scenes, keep_short: keepShort, max_side: maxSide, captions, review,
       });
-      toast("Splitting started");
       onStarted();
       onClose();
+      if (review) go("datasets", job.target!.id, "clips");
+      else toast("Splitting started");
     } catch (e: any) {
       toast(e.message, true);
     }
@@ -626,7 +641,9 @@ function SplitModal({ dataset, families, onClose, onStarted }: { dataset: Datase
     <Modal title="Split into clips" onClose={onClose} footer={
       <>
         <button className="btn ghost" onClick={onClose}>Cancel</button>
-        <button className="btn primary" onClick={start} disabled={!family || !(frames > 1) || !name.trim()}><IconScissors /> Split</button>
+        <button className="btn" onClick={() => start(true)} disabled={!family || !(frames > 1) || !name.trim()}
+          title="Plan the clips, then move, resize, crop, add or remove them in the clip editor before they're cut">Review first</button>
+        <button className="btn primary" onClick={() => start(false)} disabled={!family || !(frames > 1) || !name.trim()}><IconScissors /> Split</button>
       </>
     }>
       <div className="stack">
@@ -634,6 +651,8 @@ function SplitModal({ dataset, families, onClose, onStarted }: { dataset: Datase
           Makes a new dataset with each video cut into clips of one length, inside one shot each and spread over the
           video. This dataset stays as it is. Images and sound files are copied as they are. Each video then trains
           once per epoch, as one of its clips picked at random, so a long video counts no more than a short one.
+          <strong style={{ color: "var(--text)" }}> Review first</strong> opens the clip editor before anything is cut;
+          the clips can be changed there later too.
         </p>
         <label className="field">
           <span>New dataset name</span>
@@ -958,9 +977,10 @@ function AutoCaptionModal({ dataset, missing, hasVideo, onClose }: { dataset: Da
   );
 }
 
-export default function Datasets({ datasetId, families }: { datasetId: string; families: Family[] }) {
+export default function Datasets({ datasetId, view, families }: { datasetId: string; view: string; families: Family[] }) {
   const [datasets, reload] = usePoll<Dataset[]>("/api/datasets", 0, [datasetId]);
   const [creating, setCreating] = useState(false);
+  if (datasetId && view === "clips") return <ClipEditor key={datasetId} id={datasetId} />;
   if (datasetId) return <DatasetDetail key={datasetId} id={datasetId} families={families} />; // fresh state per dataset
   return (
     <div className="page">
