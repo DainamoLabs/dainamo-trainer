@@ -65,6 +65,7 @@ export type Dataset = {
   videos: number;
   audio: number;
   captioned: number;
+  bytes: number; // its images, videos and sound files
   video_sources: number; // what its videos count as per epoch: clips split from one video count once
   split: { source: { id: string; name: string }; changes: number } | null; // made by Split into clips: changes not cut yet
   exists: boolean;
@@ -124,6 +125,7 @@ export type SandboxOutput = {
 };
 export type SandboxRun = {
   id: string; created: number; started: number | null; status: "queued" | "running" | "done" | "failed" | "cancelled";
+  n?: number; // its number: Run 1 is the first made
   profile_id: string; profile_name: string; family: string; workflow: string; gpu: number; params: SandboxParams;
   outputs: SandboxOutput[]; report: { loras: { label: string; matched: number; total: number }[] | null } | null;
   message: string | null; elapsed: number | null;

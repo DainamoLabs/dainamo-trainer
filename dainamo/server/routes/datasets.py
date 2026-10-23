@@ -9,10 +9,10 @@ import re
 import shutil
 import subprocess
 import time
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from fastapi import APIRouter, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 
@@ -20,7 +20,7 @@ from ...engine.dataset import caption_path, list_media, media_kind, read_caption
 from ...engine.families import get_family
 from ...engine.media import spectrogram
 from ...engine.transcribe import MODELS as WHISPER_MODELS
-from .. import captioner, clip_split, dataset_check, db, media_download
+from .. import captioner, clip_split, dataset_check, db, export, media_download
 from ..llama_server import describe, provider
 from ..validation import MAX_FRAMES, check_resolution
 from .common import dataset_or_404, family_or_400, not_found, profile_or_404
@@ -52,6 +52,7 @@ def list_datasets():
         d["audio"] = sum(1 for f in files if media_kind(f) == "audio")
         d["images"] = d["count"] - d["videos"] - d["audio"]
         d["captioned"] = sum(1 for f in files if os.path.exists(caption_path(f)))
+        d["bytes"] = sum(_size(f) for f in files)  # the media files'
         # what a video model trains on per epoch: clips split from one video count as one
         cut = split_clips(d["path"]) if d["videos"] else {}
         videos = [os.path.normpath(f) for f in files if media_kind(f) == "video"]
@@ -61,6 +62,29 @@ def list_datasets():
         d["split"] = clip_split.summary(d["path"]) if d["exists"] else None  # made by Split into clips
         out.append(d)
     return out
+
+
+def _size(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+@router.get("/export/datasets")
+def export_datasets(ids: str, trigger: bool = False):
+    """The datasets ``ids`` (comma-separated) as one .zip (``export.zip_datasets``), with each caption as training
+    reads it if ``trigger`` (the dataset's trigger word in it, for another trainer)."""
+    rows = [dataset_or_404(i) for i in dict.fromkeys(x.strip() for x in ids.split(",") if x.strip())]
+    if not rows:
+        raise HTTPException(400, "Choose the datasets to export")
+    missing = [d["name"] for d in rows if not os.path.isdir(d["path"])]
+    if missing:
+        raise HTTPException(400, f"The folder of {', '.join(missing)} is missing")
+    name = export.folder_name(rows[0]["name"] if len(rows) == 1 else f"datasets_{time.strftime('%Y-%m-%d')}", set()) + ".zip"
+    ascii_name = re.sub(r'[^A-Za-z0-9._ ()-]+', "_", name)
+    return StreamingResponse(export.zip_datasets(rows, trigger), media_type="application/zip", headers={
+        "Content-Disposition": f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(name, safe='')}"})
 
 
 @router.post("/datasets")

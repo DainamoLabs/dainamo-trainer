@@ -343,6 +343,11 @@ def image_size(path: str):
     return {"width": w, "height": h}
 
 
+# a run with ``n``, its number: runs are numbered in the order they were made (Run 1 first), and a deleted run's
+# number isn't given to another (unless it was the latest)
+RUN_COLUMNS = "rowid AS n, *"
+
+
 @router.get("")
 def sandbox_status():
     from ...engine.sampling import SAMPLERS, SCHEDULERS
@@ -352,7 +357,7 @@ def sandbox_status():
             "blocked": sbx.sandbox.check_gpu(0) if m == "idle" else None, "session": sbx.sandbox.snapshot(),
             "samplers": SAMPLERS, "schedulers": SCHEDULERS,
             "idle_minutes": db.get_settings().get("sandbox", {}).get("idle_minutes", 15),
-            "runs": db.query("SELECT * FROM sandbox_runs ORDER BY created DESC LIMIT 60")}
+            "runs": db.query(f"SELECT {RUN_COLUMNS} FROM sandbox_runs ORDER BY created DESC LIMIT 60")}
 
 
 @router.get("/defaults")
@@ -436,7 +441,7 @@ def sandbox_generate(body: SandboxIn):
                (run["id"], db.now(), "queued", profile["id"], profile["name"], profile["family"], params["workflow"],
                 gpu, json.dumps(params), "[]"))
     sbx.sandbox.submit(run, gpu, profile)
-    return db.query_one("SELECT * FROM sandbox_runs WHERE id=?", (run["id"],))
+    return db.query_one(f"SELECT {RUN_COLUMNS} FROM sandbox_runs WHERE id=?", (run["id"],))
 
 
 @router.post("/runs/{rid}/cancel")

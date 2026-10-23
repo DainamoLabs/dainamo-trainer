@@ -71,6 +71,13 @@ export function gpuTarget(gpus: Gpu[] | undefined, chosen: string | number | nul
 }
 
 const MARGIN_GB = 0.75; // headroom "Fit to GPU" leaves for estimate error and other processes
+
+/** Whether the peak fits the GPU at this offload: "over", "tight" (within the margin), "fits", or "" (not known). */
+export function offloadFit(proj: VramProjection | null, value: number, gpu: GpuTarget): "over" | "tight" | "fits" | "" {
+  const peak = proj && !proj.error && proj.blocks > 0 ? peakOf(proj, streamedFor(proj, value)) : null;
+  const total = gpu?.totalGb ?? 0;
+  return !peak || !total ? "" : peak.total > total ? "over" : peak.total > total - MARGIN_GB ? "tight" : "fits";
+}
 const COLORS = ["var(--accent)", "#c0703a", "#8e6be8", "#3f9fd8", "#3ccf6e", "#d0d0d0"];
 
 /** The "Low VRAM" switch: the text encoder's layers stream from system RAM too, and so do training's saved
@@ -93,7 +100,7 @@ export function OffloadControl(props: {
   const ramPeak = valid ? ramPeakOf(proj, streamed) : null;
   const ramOver = !!ram && !!ramPeak && ramPeak.total > ram.available_gb;
   const total = gpu?.totalGb ?? 0;
-  const state = !peak || !total ? "" : peak.total > total ? "over" : peak.total > total - MARGIN_GB ? "tight" : "fits";
+  const state = offloadFit(proj, value, gpu);
 
   const fit = () => {
     if (!valid || !total) return;

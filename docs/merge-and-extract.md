@@ -7,20 +7,24 @@ in the Sandbox with the family's others. Neither loads a model or trains
 anything.
 
 Choose the profile first. The LoRAs' layers are checked against its diffusion
-model (read from the file's header only), and what's made is listed with its
-family.
+model, shown beside it as **Base model** (read from the file's header only), and
+what's made is listed with its family. Each form's **Output name** is the file's
+name, `.safetensors` added; left empty, it's named after its inputs. **How
+merging works** and **How extraction works** fold the details away. The button
+under each form says what's missing until it can be queued.
 
 ## Merge LoRAs
 
 Merging saves what several LoRAs do together as one LoRA, each at its own
-strength. A negative strength takes a LoRA's change away. The line under each
+strength. Choose a job's LoRAs from the list, or **Browse files** (or **Other
+file…**) for others. A negative strength takes a LoRA's change away. The line under each
 LoRA says its rank and how many of its layers the profile's model has. Layers
 the model doesn't have are left out, and a LoRA that matches none of them is
 refused, since it's for another model. Dainamo's LoRAs and LoKrs work, and so do
 other trainers' (PEFT `lora_A`/`lora_B` or kohya `lora_unet_…` keys). DoRAs
 don't.
 
-**Rank** sets what's kept:
+**Output rank** sets what's kept:
 
 - **Exact** keeps all of every LoRA. Their ranks add up: a rank 16 and a rank 32
   LoRA merge into a rank 48 one, about as big as the two files together. In the
@@ -45,8 +49,8 @@ job's checkpoints does ([Full finetuning](finetuning.md#lora-from-a-finetune)),
 for any finetuned file: choose one of the family's finetune checkpoints, or
 **Other file…** for another trainer's.
 
-**Finetuned from** is the original model. Leave it empty to use the profile's
-diffusion model. The two have to be the same kind of model, with tensors named
+**Base model** (an optional override) is the original model. Leave it empty to
+use the profile's diffusion model. The two have to be the same kind of model, with tensors named
 the same way, or extracting is refused. Add the finetune's trigger words if it
 has any: they're saved in the LoRA, as a trained LoRA's are.
 

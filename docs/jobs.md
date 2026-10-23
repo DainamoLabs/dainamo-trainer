@@ -46,6 +46,10 @@ Each job's card shows a small loss curve once it has 10 steps, so you can spot a
 run going wrong without opening it. **Settings** sets the queue mode (one job at
 a time, several on one GPU, or spread across GPUs) and which GPUs to use.
 
+**Select** puts a checkbox on each job, to delete several at once, optionally
+with their files (LoRAs or finetuned models, samples and training state). A
+running job must be stopped first.
+
 ## The job page
 
 The tabs are **Samples**, **Loss**, **Checkpoints** and **Log**. In Samples,
@@ -87,9 +91,11 @@ and settings, and encodes only new or changed files and captions. A copy of a
 model file elsewhere counts as the same file; another precision or a fine-tune
 doesn't.
 
-The Queue page shows each job's disk use and the shared cache's, and clears the
-cache of everything no queued or running job uses. A completed job's training
-state can be deleted, after which it can't continue.
+Each job's card on the Queue page shows its disk use. Below the jobs, the
+Queue shows the total: everything the jobs keep, the cache, and the LoRAs.
+**Manage cache** shows how much of the cache queued or running jobs use, and
+clears the rest. A completed job's training state can be deleted on its page,
+after which the job can't continue.
 
 ## Checkpoint picker and concept bleed
 

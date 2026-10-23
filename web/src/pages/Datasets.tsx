@@ -1,9 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { go } from "../App";
-import { api, byFamily, fmtTime, q, type Dataset, type Family, type Gpu, type MediaItem, type Profile, type Settings, type WhisperModel } from "../api";
+import { api, byFamily, fmtTime, q, type Dataset, type Family, type Gpu, type Job, type MediaItem, type Profile, type Settings, type WhisperModel } from "../api";
 import { CheckIssues, useDatasetCheck } from "../components/DatasetCheck";
-import { IconDownload, IconEdit, IconImages, IconPlus, IconScissors, IconSparkle, IconTrash, IconUpload, IconX } from "../components/icons";
-import { ConfirmDialog, Info, Lightbox, Modal, PathInput, ProfileOptions, fmtSize, usePoll, useToast } from "../components/ui";
+import {
+  IconAlert, IconArrowRight, IconCheck, IconCheckCircle, IconCheckSquare, IconCopy, IconDown, IconDownload, IconEdit, IconFile, IconFilm, IconFolder, IconGrid,
+  IconImages, IconInfo, IconLayers, IconLeft, IconLink, IconList, IconPause, IconPlayFill, IconPlus, IconRight, IconScissors, IconSearch, IconSparkle, IconTrash,
+  IconUpload, IconWave, IconX,
+} from "../components/icons";
+import { ConfirmDialog, Empty, Info, Lightbox, Menu, Modal, PathInput, ProfileOptions, SelectBar, fmtSize, someNames, usePoll, useSelection, useToast, type Selection } from "../components/ui";
 import ClipEditor from "./ClipEditor";
 
 type SplitStatus = {
@@ -77,9 +81,15 @@ function NewDataset({ onClose, onCreated }: { onClose: () => void; onCreated: (d
   );
 }
 
-function CaptionCell({ item, onSaved }: { item: MediaItem; onSaved: (c: string) => void }) {
+/** A file's caption: a click (or ``editing``, set from outside) edits it; Ctrl+Enter or clicking away saves, Escape
+ * cancels. ``grid``: the grid view's two lines, and a boxed editor. */
+function CaptionCell({ item, onSaved, editing: shown, onEditing, grid }: {
+  item: MediaItem; onSaved: (c: string) => void; editing?: boolean; onEditing?: (on: boolean) => void; grid?: boolean;
+}) {
   const toast = useToast();
-  const [editing, setEditing] = useState(false);
+  const [own, setOwn] = useState(false);
+  const editing = shown ?? own;
+  const setEditing = onEditing ?? setOwn;
   const [val, setVal] = useState(item.caption);
   useEffect(() => setVal(item.caption), [item.caption]);
   const save = async () => {
@@ -94,63 +104,166 @@ function CaptionCell({ item, onSaved }: { item: MediaItem; onSaved: (c: string) 
   };
   if (editing)
     return (
-      <textarea autoFocus value={val} onChange={(e) => setVal(e.target.value)} onBlur={save}
-        onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) save(); if (e.key === "Escape") { setVal(item.caption); setEditing(false); } }}
-        style={{ border: 0, borderRadius: 0, minHeight: 110, fontSize: 12 }} />
+      <textarea autoFocus value={val} onChange={(e) => setVal(e.target.value)} onBlur={save} className={grid ? "file-cap-edit" : undefined}
+        onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) save(); if (e.key === "Escape") { e.stopPropagation(); setVal(item.caption); setEditing(false); } }}
+        style={grid ? undefined : { border: 0, borderRadius: 0, minHeight: 110, fontSize: 12 }} />
     );
   return (
-    <div className={"media-cap" + (item.caption ? "" : " none")} onClick={() => setEditing(true)} title="Click to edit">
+    <div className={(grid ? "file-cap" : "media-cap") + (item.caption ? "" : " none")} onClick={() => setEditing(true)} title="Click to edit">
       {item.caption || "No caption — click to write one"}
     </div>
   );
 }
 
 const CHECK_FAMILY = "dainamo.check.family";
+const CHECK_OPEN = "dainamo.check.open"; // the health check left open
 
-/** The health check, for a chosen model and resolution; it runs when asked, then again as they change. */
+/** The health check, for a chosen model and resolution; it runs when asked, then again as they change. Folded, its
+ * bar says how the last check went. */
 function HealthCheck({ id, families, onOpen }: { id: string; families: Family[]; onOpen: (path: string) => void }) {
   const [familyId, setFamilyId] = useState(() => { try { return localStorage.getItem(CHECK_FAMILY) || ""; } catch { return ""; } });
   const family = families.find((f) => f.id === familyId) || families[0];
   const [resolution, setResolution] = useState("");
   const [seconds, setSeconds] = useState("");
   const [on, setOn] = useState(false);
+  const [open, setOpenState] = useState(() => { try { return localStorage.getItem(CHECK_OPEN) === "1"; } catch { return false; } });
+  const setOpen = (o: boolean) => { setOpenState(o); try { localStorage.setItem(CHECK_OPEN, o ? "1" : "0"); } catch { /* not remembered */ } };
   const music = !!family?.media.includes("audio");
   const { result, error, loading, recheck } = useDatasetCheck(on ? id : null, {
     resolution: music ? "" : resolution, family: family?.id, seconds: music && seconds.trim() !== "" ? Number(seconds) : undefined });
   const pick = (v: string) => { setFamilyId(v); try { localStorage.setItem(CHECK_FAMILY, v); } catch { /* not remembered */ } };
   const counts = result ? (["error", "warning", "info"] as const).map((l) => [l, result.issues.filter((i) => i.level === l).length] as const) : [];
   const words = { error: ["error", "errors"], warning: ["warning", "warnings"], info: ["note", "notes"] };
+  const n = Object.fromEntries(counts) as Record<string, number>;
+  const state = loading ? "busy" : error ? "error" : !result ? "" : n.error ? "error" : n.warning ? "warning" : "ok";
+  const summary = loading ? "Checking…" : error ? "The check failed"
+    : result ? counts.filter(([, k]) => k).map(([l, k]) => `${k} ${words[l][k === 1 ? 0 : 1]}`).join(" · ") || "All good" : "";
   return (
-    <div className="card card-pad" style={{ marginBottom: 16 }}>
-      <div className="row wrap health-head">
-        <h2 style={{ margin: 0 }}>Health check</h2>
-        <span className="muted small">for</span>
-        <select value={family?.id || ""} onChange={(e) => pick(e.target.value)} aria-label="Model">
-          {families.map((f) => <option key={f.id} value={f.id}>{f.label}</option>)}
-        </select>
-        {music ? <>
-          <span className="muted small">in clips of</span>
-          <input type="number" min={0} value={seconds} onChange={(e) => setSeconds(e.target.value)} aria-label="Clip length" style={{ width: 80 }}
-            placeholder={String(family?.training_defaults?.clip_seconds ?? 30)} title="Clip length in seconds (0: whole songs)" />
-          <span className="muted small">s</span>
-        </> : <>
-          <span className="muted small">at</span>
-          <input value={resolution} onChange={(e) => setResolution(e.target.value)} aria-label="Resolution" style={{ width: 110 }}
-            placeholder={String(family?.training_defaults?.resolution ?? 1024)} title="Training resolution (several: 512, 1024)" />
-        </>}
-        <span className="spacer" />
-        {result && !loading && (
-          <span className="small muted">{counts.filter(([, n]) => n).map(([l, n]) => `${n} ${words[l][n === 1 ? 0 : 1]}`).join(" · ") || "All good"}</span>
-        )}
-        <button className="btn sm" disabled={loading} onClick={() => (on ? recheck() : setOn(true))}>{loading ? "Checking…" : on ? "Check again" : "Check dataset"}</button>
+    <div className={"card health" + (open ? " open" : "")}>
+      <div className="health-bar">
+        <button className="health-toggle" aria-expanded={open} onClick={() => setOpen(!open)}>
+          <IconDown className="health-chev" />
+          <span className={"health-state " + state}>{state === "ok" ? <IconCheckCircle /> : state === "error" || state === "warning" ? <IconAlert /> : <IconInfo />}</span>
+          <span className="health-title">Dataset health check</span>
+          {summary && <span className={"health-summary " + state}>{summary}</span>}
+        </button>
+        {open
+          ? <button className="btn" disabled={loading} onClick={() => (on ? recheck() : setOn(true))}>{loading ? "Checking…" : on ? "Check again" : "Check dataset"}</button>
+          : <button className="btn" onClick={() => setOpen(true)}>Configure check</button>}
       </div>
-      {!on && <div className="help" style={{ marginTop: 8 }}>{music
-        ? "Looks for unreadable files, songs too short to use, low sample rates, mono files, missing or empty captions, and captions shared by two files."
-        : "Looks for unreadable files, images too small for the resolution, near-duplicates, missing, empty or over-long captions, and captions shared by two files."}</div>}
-      {error && <div className="error-box small" style={{ marginTop: 10 }}>{error}</div>}
-      {result && <div style={{ marginTop: 12, opacity: loading ? 0.5 : 1 }}><CheckIssues result={result} onOpen={onOpen} /></div>}
+      {open && (
+        <div className="health-body">
+          <div className="row wrap health-head">
+            <span className="muted small">Check for</span>
+            <select value={family?.id || ""} onChange={(e) => pick(e.target.value)} aria-label="Model">
+              {families.map((f) => <option key={f.id} value={f.id}>{f.label}</option>)}
+            </select>
+            {music ? <>
+              <span className="muted small">in clips of</span>
+              <input type="number" min={0} value={seconds} onChange={(e) => setSeconds(e.target.value)} aria-label="Clip length" style={{ width: 80 }}
+                placeholder={String(family?.training_defaults?.clip_seconds ?? 30)} title="Clip length in seconds (0: whole songs)" />
+              <span className="muted small">s</span>
+            </> : <>
+              <span className="muted small">at</span>
+              <input value={resolution} onChange={(e) => setResolution(e.target.value)} aria-label="Resolution" style={{ width: 110 }}
+                placeholder={String(family?.training_defaults?.resolution ?? 1024)} title="Training resolution (several: 512, 1024)" />
+            </>}
+          </div>
+          {!on && <div className="help" style={{ marginTop: 8 }}>{music
+            ? "Looks for unreadable files, songs too short to use, low sample rates, mono files, missing or empty captions, and captions shared by two files."
+            : "Looks for unreadable files, images too small for the resolution, near-duplicates, missing, empty or over-long captions, and captions shared by two files."}</div>}
+          {error && <div className="error-box small" style={{ marginTop: 10 }}>{error}</div>}
+          {result && <div style={{ marginTop: 12, opacity: loading ? 0.5 : 1 }}><CheckIssues result={result} onOpen={onOpen} /></div>}
+        </div>
+      )}
     </div>
   );
+}
+
+const PAGE = 24; // files on a page of the grid view
+const LAYOUT = "dainamo.dataset.layout";
+type Layout = "grid" | "list";
+
+/** How far the song playing in a card is: a line along the bottom of its spectrogram. */
+function PlayBar({ audio }: { audio: HTMLAudioElement }) {
+  const [at, setAt] = useState(0);
+  useEffect(() => {
+    const tick = () => setAt(audio.duration ? audio.currentTime / audio.duration : 0);
+    audio.addEventListener("timeupdate", tick);
+    return () => audio.removeEventListener("timeupdate", tick);
+  }, [audio]);
+  return <div className="file-progress" style={{ width: `${100 * at}%` }} />;
+}
+
+/** A file in the grid view: its picture (a song's spectrogram, which plays here), name, caption and whether it has
+ * one; ⋯ enlarges it, copies its path or deletes it. ``song``: it's the song playing (true) or paused (false).
+ * ``sel``: it can be picked (to delete), its box shown on hover. */
+function FileCard({ it, audio, song, onPlay, onOpen, onSaved, onDelete, sel }: {
+  it: MediaItem; audio: HTMLAudioElement | null; song: boolean | null; onPlay: () => void; onOpen: () => void; onSaved: (c: string) => void;
+  onDelete?: () => void; sel?: Selection;
+}) {
+  const toast = useToast();
+  const [editing, setEditing] = useState(false);
+  const picked = !!sel?.picked.has(it.path);
+  const copy = () => navigator.clipboard.writeText(it.path).then(() => toast("Path copied"), () => toast("Couldn't copy the path", true));
+  return (
+    <div className={"file-card" + (sel?.on ? " selecting" : "") + (picked ? " picked" : "")}>
+      <div className={"file-thumb " + it.kind} style={{ backgroundImage: `url(/api/thumb?path=${q(it.path)})` }}
+        onClick={() => (sel?.on ? sel.toggle(it.path) : onOpen())}>
+        {it.kind !== "image" && !sel?.on && (
+          <button className="file-play" aria-label={song ? `Pause ${it.name}` : `Play ${it.name}`}
+            onClick={(e) => { e.stopPropagation(); if (it.kind === "audio") onPlay(); else onOpen(); }}>{song ? <IconPause /> : <IconPlayFill />}</button>
+        )}
+        {it.kind === "video" && <span className="badge">VIDEO</span>}
+        {sel && <input type="checkbox" className="file-pick" checked={picked} aria-label={`Select ${it.name}`}
+          onClick={(e) => e.stopPropagation()} onChange={() => { if (!sel.on) sel.start(); sel.toggle(it.path); }} />}
+        {song != null && audio && <PlayBar audio={audio} />}
+      </div>
+      <div className="file-body">
+        <div className="file-name ellipsis" title={it.cut_from ? `${it.name}: cut from ${it.cut_from.source} at ${fmtClock(it.cut_from.start)}` : it.name}>{it.name}</div>
+        <CaptionCell item={it} onSaved={onSaved} editing={editing} onEditing={setEditing} grid />
+        <div className="file-foot">
+          {it.caption ? <span className="file-state ok"><IconCheckCircle /> Captioned</span> : <span className="file-state none"><IconAlert /> No caption</span>}
+          <span className="spacer" />
+          <button className="btn ghost sm" onClick={() => setEditing(true)}><IconEdit /> Edit caption</button>
+          <Menu label={`More for ${it.name}`} items={[
+            { label: "Enlarge", icon: <IconImages />, onClick: onOpen },
+            { label: "Copy path", icon: <IconCopy />, onClick: copy },
+            ...(onDelete ? [{ label: "Delete", icon: <IconTrash />, onClick: onDelete, danger: true }] : []),
+          ]} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Pages 1 … 4 5 6 … 20: the first and last, and those next to this one. */
+function Pager({ page, pages, onPage }: { page: number; pages: number; onPage: (p: number) => void }) {
+  const lo = Math.max(2, Math.min(page - 1, pages - 3));
+  const hi = Math.min(pages - 1, Math.max(page + 1, 4));
+  const nums: (number | string)[] = [1, ...(lo > 2 ? ["gap-lo"] : [])];
+  for (let p = lo; p <= hi; p++) nums.push(p);
+  nums.push(...(hi < pages - 1 ? ["gap-hi"] : []), ...(pages > 1 ? [pages] : []));
+  return (
+    <nav className="pager" aria-label="Pages">
+      <button onClick={() => onPage(page - 1)} disabled={page <= 1} aria-label="Previous page"><IconLeft /></button>
+      {nums.map((n) => typeof n === "number"
+        ? <button key={n} className={n === page ? "on" : ""} aria-current={n === page ? "page" : undefined} onClick={() => onPage(n)}>{n}</button>
+        : <span key={n} className="pager-gap">…</span>)}
+      <button onClick={() => onPage(page + 1)} disabled={page >= pages} aria-label="Next page"><IconRight /></button>
+    </nav>
+  );
+}
+
+/** What a dataset holds, for the badge by its name. */
+function datasetKind(d: Dataset): { label: string; kind: string; icon: React.ReactNode } | null {
+  const kinds = (["images", "videos", "audio"] as const).filter((k) => d[k] > 0);
+  if (kinds.length !== 1) return kinds.length ? { label: "Mixed dataset", kind: "mixed", icon: <IconLayers /> } : null;
+  return {
+    images: { label: "Image dataset", kind: "images", icon: <IconImages /> },
+    videos: { label: "Video dataset", kind: "videos", icon: <IconFilm /> },
+    audio: { label: "Audio dataset", kind: "audio", icon: <IconWave /> },
+  }[kinds[0]];
 }
 
 function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
@@ -159,6 +272,17 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
   const d = ds?.find((x) => x.id === id);
   const [items, setItems] = useState<MediaItem[] | null>(null);
   const [filter, setFilter] = useState<"all" | "missing">("all");
+  const [search, setSearch] = useState("");
+  const [layout, setLayoutState] = useState<Layout>(() => { try { return localStorage.getItem(LAYOUT) === "list" ? "list" : "grid"; } catch { return "grid"; } });
+  const [page, setPage] = useState(1);
+  const toolbar = useRef<HTMLDivElement>(null);
+  // the song playing (or paused) in its grid card
+  const player = useRef<HTMLAudioElement>(null);
+  const [song, setSong] = useState<{ path: string; on: boolean } | null>(null);
+  // Select files (or ⋯ on one): deleted together
+  const sel = useSelection();
+  const [deleting, setDeleting] = useState<string[] | null>(null);
+  const [exporting, setExporting] = useState(false);
   // the file in the enlarged view, and the files previous and next step through: the grid's, as it was when it opened
   const [light, setLight] = useState<{ path: string; order: string[] } | null>(null);
   const [capOpen, setCapOpen] = useState(false);
@@ -193,6 +317,7 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
     else if (wasRunning.current) { wasRunning.current = false; loadItems(); reloadDs(); }
     if (cap?.running && cap.done % 5 === 0) loadItems();
   }, [cap?.running, cap?.done]);
+  useEffect(() => setPage(1), [search, filter]);
 
   const upload = async (files: FileList | File[]) => {
     const arr = Array.from(files);
@@ -221,14 +346,23 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
     reloadDs();
   };
 
-  const removeFile = async (it: MediaItem) => {
-    if (!confirm(`Delete ${it.name} and its caption from disk?`)) return;
-    try {
-      await api.del(`/api/media?path=${q(it.path)}`);
-      loadItems();
-    } catch (e: any) {
-      toast(e.message, true);
+  const removeFiles = async () => {
+    const paths = deleting || [];
+    let removed = 0;
+    const failed: string[] = [];
+    for (const path of paths) {
+      try {
+        await api.del(`/api/media?path=${q(path)}`);
+        removed++;
+      } catch (e: any) {
+        failed.push(e.message);
+      }
     }
+    if (paths.length > 1 || failed.length) toast(`Deleted ${removed} file${removed === 1 ? "" : "s"}${failed.length ? `; ${failed[0]}` : ""}`, failed.length > 0);
+    if (song && paths.includes(song.path)) player.current?.pause();
+    sel.stop();
+    loadItems();
+    reloadDs();
   };
 
   const [confirmRemove, setConfirmRemove] = useState(false);
@@ -237,67 +371,110 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
     go("datasets");
   };
 
+  const setLayout = (l: Layout) => {
+    setLayoutState(l);
+    player.current?.pause();
+    try { localStorage.setItem(LAYOUT, l); } catch { /* not remembered */ }
+  };
+  const play = (path: string) => {
+    const a = player.current;
+    if (!a) return;
+    if (song?.path === path && !a.paused) return a.pause();
+    document.querySelectorAll("audio").forEach((x) => x !== a && x.pause());
+    if (song?.path !== path) a.src = `/api/media?path=${q(path)}`;
+    setSong({ path, on: true });
+    a.play().catch(() => setSong(null));
+  };
+  const goPage = (p: number) => {
+    setPage(p);
+    toolbar.current?.scrollIntoView({ block: "nearest" });
+  };
+
   if (ds && !d) return <div className="page"><div className="empty"><strong>Dataset not found</strong><a href="#/datasets">Back to datasets</a></div></div>;
-  const shown = (items || []).filter((i) => filter === "all" || !i.caption);
+  const words = search.toLowerCase().split(/\s+/).filter(Boolean);
+  const shown = (items || []).filter((i) => (filter === "all" || !i.caption) && words.every((w) => `${i.name} ${i.caption}`.toLowerCase().includes(w)));
+  const pages = Math.max(1, Math.ceil(shown.length / PAGE));
+  const at = Math.min(page, pages);
+  const paged = layout === "grid" ? shown.slice((at - 1) * PAGE, at * PAGE) : shown;
   const open = (path: string) => {
+    player.current?.pause();
     const from = shown.some((x) => x.path === path) ? shown : items || []; // the health check can open a filtered-out one
     setLight({ path, order: from.map((x) => x.path) });
+  };
+  const closeLight = () => {
+    // the grid shows the page of the file last enlarged
+    const i = light ? shown.findIndex((x) => x.path === light.path) : -1;
+    if (layout === "grid" && i >= 0) setPage(Math.floor(i / PAGE) + 1);
+    setLight(null);
   };
   const lit = light && items?.find((x) => x.path === light.path);
   const captionSaved = (path: string, c: string) =>
     setItems((xs) => xs!.map((x) => (x.path === path ? { ...x, caption: c, has_caption: true } : x)));
   const missing = (items || []).filter((i) => !i.caption).length;
+  const captioned = (items?.length || 0) - missing;
+  const done = !!items?.length && !missing;
   const onlyAudio = !!items?.length && items.every((i) => i.kind === "audio");
+  const kind = d && datasetKind(d);
+  const picked = shown.filter((i) => sel.picked.has(i.path));
+  const canDelete = !!d?.managed; // a linked folder's files are only deleted in the folder itself
 
   return (
-    <div className="page"
+    <div className="page dataset"
       onDragOver={(e) => { e.preventDefault(); setOver(true); }}
       onDragLeave={(e) => { if (e.currentTarget === e.target) setOver(false); }}
       onDrop={(e) => { e.preventDefault(); setOver(false); upload(e.dataTransfer.files); }}>
-      <div className="page-head">
+      <div className="page-head dd-head">
         <div style={{ minWidth: 0 }}>
-          <div className="small"><a href="#/datasets">Datasets</a> <span className="faint">/</span></div>
-          <h1>{d?.name}</h1>
-          <p className="mono ellipsis">{d?.path}</p>
+          <div className="crumbs"><a href="#/datasets">Datasets</a><span className="faint">/</span><span>{d?.name}</span></div>
+          <div className="dd-title">
+            <h1 className="ellipsis">{d?.name}</h1>
+            {kind && <span className={"ds-kind lg " + kind.kind}>{kind.icon}{kind.label}</span>}
+          </div>
+          <p className="ellipsis" title={d?.path}>{d?.path}</p>
         </div>
-        <div className="row">
-          <button className="btn danger" onClick={() => setConfirmRemove(true)}><IconTrash /> Remove</button>
-          <button className="btn" onClick={() => fileRef.current?.click()}><IconUpload /> Upload</button>
-          <button className="btn" onClick={() => setDlOpen(true)} disabled={dl?.running}
-            title="Download a video, or only its sound, from a web page into this dataset (experimental)"><IconDownload /> Add from URL</button>
-          <button className="btn" onClick={() => setEditOpen(true)} disabled={!items?.length} title="Find and replace, add or remove words in every caption"><IconEdit /> Edit captions</button>
+        <div className="row wrap dd-actions">
+          <button className="btn lg" onClick={() => fileRef.current?.click()}><IconUpload /> Upload</button>
+          <button className="btn lg" onClick={() => setDlOpen(true)} disabled={dl?.running}
+            title="Download a video, or only its sound, from a web page into this dataset (experimental)"><IconLink /> Add from URL</button>
+          <button className="btn lg" onClick={() => setEditOpen(true)} disabled={!items?.length} title="Find and replace, add or remove words in every caption"><IconEdit /> Edit captions</button>
           {d?.split && (
-            <button className="btn" onClick={() => go("datasets", id, "clips")} title={`Move, resize, crop, add or remove the clips cut from ${d.split.source.name}'s videos`}>
+            <button className="btn lg" onClick={() => go("datasets", id, "clips")} title={`Move, resize, crop, add or remove the clips cut from ${d.split.source.name}'s videos`}>
               <IconScissors /> Edit clips</button>
           )}
-          {items?.some((i) => i.kind === "video") && !d?.split && (
-            <button className="btn" onClick={() => setSplitOpen(true)} disabled={split?.running}
-              title="Make a copy of this dataset with each video cut into clips a video model trains on whole">
-              <IconScissors /> Split into clips</button>
-          )}
-          <button className="btn primary" onClick={() => setCapOpen(true)} disabled={!items?.length || onlyAudio}
+          <button className="btn primary lg" onClick={() => setCapOpen(true)} disabled={!items?.length || onlyAudio}
             title={onlyAudio ? "Auto-Caption describes images and clips; write each song's style tags yourself (lyrics go after a [Lyrics] line)" : undefined}>
             <IconSparkle /> Auto-Caption</button>
+          <Menu label="More" boxed items={[
+            ...(items?.some((i) => i.kind === "video") && !d?.split ? [{ label: "Split into clips", icon: <IconScissors />, onClick: () => setSplitOpen(true),
+              disabled: !!split?.running, title: "Make a copy of this dataset with each video cut into clips a video model trains on whole" }] : []),
+            { label: "Export", icon: <IconDownload />, onClick: () => setExporting(true), disabled: !items?.length, title: "Download it as a .zip" },
+            { label: "Remove dataset", icon: <IconTrash />, onClick: () => setConfirmRemove(true), danger: true },
+          ]} />
           <input ref={fileRef} type="file" multiple hidden accept="image/*,video/*,audio/*,.txt" onChange={(e) => e.target.files && upload(e.target.files)} />
         </div>
       </div>
 
-      <div className="card card-pad" style={{ marginBottom: 16 }}>
-        <div className="row wrap" style={{ gap: 18 }}>
-          <label className="field" style={{ width: 260 }}>
+      <div className="card dd-stats">
+        <div className="dd-stats-row">
+          <label className="field dd-trigger">
             <span>Trigger word</span>
-            <input value={trigger} onChange={(e) => setTrigger(e.target.value)} onBlur={saveTrigger} onKeyDown={(e) => e.key === "Enter" && saveTrigger()} placeholder="none" />
+            <span className="input-icon">
+              <input value={trigger} onChange={(e) => setTrigger(e.target.value)} onBlur={saveTrigger} onKeyDown={(e) => e.key === "Enter" && saveTrigger()} placeholder="none" />
+              <IconEdit />
+            </span>
           </label>
-          <div className="stat"><div className="k">Files</div><div className="v">{items?.length ?? "…"}</div></div>
-          <div className="stat"><div className="k">Captioned</div><div className="v">{items ? items.length - missing : "…"}</div></div>
-          <div className="spacer" />
-          <div className="seg">
-            <button className={filter === "all" ? "on" : ""} onClick={() => setFilter("all")}>All</button>
-            <button className={filter === "missing" ? "on" : ""} onClick={() => setFilter("missing")}>Missing captions ({missing})</button>
+          <div className="dd-stat">
+            <IconFile />
+            <div><b>{items?.length ?? "…"}</b><span>file{items?.length === 1 ? "" : "s"}</span></div>
+          </div>
+          <div className="dd-stat">
+            <span className={"dd-cap-icon" + (done ? " ok" : missing && captioned ? " part" : "")}>{done ? <IconCheckCircle /> : <IconAlert />}</span>
+            <div><b>{items ? `${captioned} / ${items.length}` : "…"}</b><span>captioned</span></div>
+            <div className={"bar dd-bar" + (done ? " ok" : "")}><div style={{ width: `${items?.length ? (100 * captioned) / items.length : 0}%` }} /></div>
           </div>
         </div>
         {cap && (cap.running || cap.errors.length > 0) && (
-          <div style={{ marginTop: 14 }}>
+          <div className="dd-task">
             <div className="row small" style={{ marginBottom: 6 }}>
               <IconSparkle width={14} style={{ color: "var(--accent)" }} />
               {!cap.running ? <span>Captioning finished</span> : cap.phase === "transcribing"
@@ -313,13 +490,13 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
           </div>
         )}
         {d?.split && d.split.changes > 0 && (
-          <div className="validation warning" style={{ marginTop: 12 }}>
+          <div className="validation warning dd-task">
             {d.split.changes} change{d.split.changes === 1 ? "" : "s"} to the clips {d.split.changes === 1 ? "isn't" : "aren't"} cut yet:
             <a href={`#/datasets/${id}/clips`}>open the clip editor</a>
           </div>
         )}
         {split?.target && (split.running || split.done > 0) && (
-          <div style={{ marginTop: 14 }}>
+          <div className="dd-task">
             <div className="row small" style={{ marginBottom: 6 }}>
               <IconScissors width={14} style={{ color: "var(--accent)" }} />
               {split.running
@@ -337,7 +514,7 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
           </div>
         )}
         {dl && (dl.running || dl.count > 0 || dl.errors.length > 0 || dl.cancelled) && (
-          <div style={{ marginTop: 14 }}>
+          <div className="dd-task">
             <div className="row small" style={{ marginBottom: 6 }}>
               <IconDownload width={14} style={{ color: "var(--accent)" }} />
               {dl.running ? (
@@ -374,25 +551,79 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
         </div>
       )}
 
-      <div className="media-grid">
-        {shown.map((it) => (
-          <div className="media-card" key={it.path}>
-            <div className={"media-thumb" + (it.kind === "audio" ? " audio" : "")} style={{ backgroundImage: `url(/api/thumb?path=${q(it.path)})` }} onClick={() => open(it.path)}>
-              {it.kind === "video" && <span className="badge">VIDEO</span>}
-              {it.kind === "audio" && <span className="badge">AUDIO</span>}
-              {!it.caption && <span className="nocap" title="No caption" />}
-            </div>
-            <CaptionCell item={it} onSaved={(c) => captionSaved(it.path, c)} />
-            <div className="row small" style={{ padding: "0 10px 8px" }}>
-              <span className="faint ellipsis" title={it.cut_from ? `${it.name}: cut from ${it.cut_from.source} at ${fmtClock(it.cut_from.start)}` : it.name}>{it.name}</span>
-              <span className="spacer" />
-              {d?.managed ? <button className="btn ghost icon sm" title="Delete file" onClick={() => removeFile(it)}><IconTrash /></button> : null}
-            </div>
+      {!!items?.length && (
+        <div className="dd-toolbar" ref={toolbar}>
+          <label className="search">
+            <IconSearch />
+            <input type="search" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search files or captions…" aria-label="Search files or captions"
+              onKeyDown={(e) => e.key === "Escape" && search && (e.stopPropagation(), setSearch(""))} />
+          </label>
+          <div className="seg dd-filter">
+            <button className={filter === "all" ? "on" : ""} onClick={() => setFilter("all")}>All <span>{items.length}</span></button>
+            <button className={filter === "missing" ? "on" : ""} onClick={() => setFilter("missing")}>Missing captions <span>{missing}</span></button>
           </div>
-        ))}
-      </div>
+          <span className="spacer" />
+          <div className="view-toggle" role="group" aria-label="View">
+            <button aria-pressed={layout === "grid"} title="Grid: bigger cards, a page at a time" onClick={() => setLayout("grid")}><IconGrid /></button>
+            <button aria-pressed={layout === "list"} title="List: every file on one page" onClick={() => setLayout("list")}><IconList /></button>
+          </div>
+          {canDelete && !sel.on && <button className="btn lg" onClick={sel.start}><IconCheckSquare /> Select files</button>}
+        </div>
+      )}
+      {sel.on && (
+        <SelectBar sel={sel} ids={shown.map((i) => i.path)} noun={["file", "files"]}
+          info={<span className="muted small">{fmtSize(picked.reduce((n, i) => n + (i.size || 0), 0))}</span>}>
+          <button className="btn danger" onClick={() => setDeleting(picked.map((i) => i.path))} disabled={!picked.length}><IconTrash /> Delete</button>
+        </SelectBar>
+      )}
+      {!!items?.length && !shown.length && (
+        <div className="empty">
+          <strong>{filter === "missing" && !words.length ? "Every file has a caption" : "No files match"}</strong>
+          {!!words.length && <button className="btn ghost" onClick={() => setSearch("")}>Clear the search</button>}
+        </div>
+      )}
 
-      {light && lit && <Lightbox src={`/api/media?path=${q(lit.path)}`} video={lit.kind === "video"} onClose={() => setLight(null)}
+      {layout === "grid" ? (
+        <div className="file-grid">
+          {paged.map((it) => (
+            <FileCard key={it.path} it={it} audio={player.current} song={song?.path === it.path ? song.on : null} onPlay={() => play(it.path)} onOpen={() => open(it.path)}
+              onSaved={(c) => captionSaved(it.path, c)} onDelete={canDelete ? () => setDeleting([it.path]) : undefined} sel={canDelete ? sel : undefined} />
+          ))}
+        </div>
+      ) : (
+        <div className="media-grid">
+          {paged.map((it) => {
+            const on = sel.picked.has(it.path);
+            return (
+              <div className={"media-card" + (on ? " picked" : "")} key={it.path}>
+                <div className={"media-thumb" + (it.kind === "audio" ? " audio" : "")} style={{ backgroundImage: `url(/api/thumb?path=${q(it.path)})` }}
+                  onClick={() => (sel.on ? sel.toggle(it.path) : open(it.path))}>
+                  {it.kind === "video" && <span className="badge">VIDEO</span>}
+                  {it.kind === "audio" && <span className="badge">AUDIO</span>}
+                  {sel.on ? <input type="checkbox" className="pick media-pick" checked={on} aria-label={`Select ${it.name}`} onClick={(e) => e.stopPropagation()} onChange={() => sel.toggle(it.path)} />
+                    : !it.caption && <span className="nocap" title="No caption" />}
+                </div>
+                <CaptionCell item={it} onSaved={(c) => captionSaved(it.path, c)} />
+                <div className="row small" style={{ padding: "0 10px 8px" }}>
+                  <span className="faint ellipsis" title={it.cut_from ? `${it.name}: cut from ${it.cut_from.source} at ${fmtClock(it.cut_from.start)}` : it.name}>{it.name}</span>
+                  <span className="spacer" />
+                  {canDelete ? <button className="btn ghost icon sm" title="Delete file" onClick={() => setDeleting([it.path])}><IconTrash /></button> : null}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {layout === "grid" && shown.length > 0 && (
+        <div className="pager-row">
+          <span className="muted">Showing {(at - 1) * PAGE + 1}–{Math.min(at * PAGE, shown.length)} of {shown.length}</span>
+          {pages > 1 && <Pager page={at} pages={pages} onPage={goPage} />}
+        </div>
+      )}
+      <audio ref={player} hidden onEnded={() => setSong(null)}
+        onPlay={() => setSong((x) => x && { ...x, on: true })} onPause={() => setSong((x) => x && { ...x, on: !player.current?.paused })} />
+
+      {light && lit && <Lightbox src={`/api/media?path=${q(lit.path)}`} video={lit.kind === "video"} onClose={closeLight}
         audio={lit.kind === "audio" ? { poster: `/api/thumb?size=1024&path=${q(lit.path)}` } : undefined}
         nav={{ at: light.order.indexOf(lit.path), count: light.order.length,
           go: (s) => setLight((l) => l && { ...l, path: l.order[l.order.indexOf(l.path) + s] ?? l.path }) }}
@@ -403,6 +634,13 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
           await api.put("/api/caption", { path: lit.path, caption: c });
           captionSaved(lit.path, c.trim());
         } }} />}
+      {deleting && (
+        <ConfirmDialog title={deleting.length === 1 ? "Delete file" : `Delete ${deleting.length} files`} danger confirmLabel="Delete"
+          onClose={() => setDeleting(null)} onConfirm={removeFiles}
+          message={<>Delete <strong style={{ color: "var(--text)" }}>{deleting.length === 1 ? items?.find((i) => i.path === deleting[0])?.name : `${deleting.length} files`}</strong>{" "}
+            and {deleting.length === 1 ? "its caption" : "their captions"} from disk? This can't be undone.</>} />
+      )}
+      {exporting && d && <ExportDialog datasets={[d]} onClose={() => setExporting(false)} />}
       {confirmRemove && d && (
         <ConfirmDialog title="Remove dataset" danger confirmLabel="Remove" onClose={() => setConfirmRemove(false)} onConfirm={removeDataset}
           message={d.managed ? <>Remove <strong style={{ color: "var(--text)" }}>{d.name}</strong> from Dainamo?</>
@@ -977,42 +1215,242 @@ function AutoCaptionModal({ dataset, missing, hasVideo, onClose }: { dataset: Da
   );
 }
 
-export default function Datasets({ datasetId, view, families }: { datasetId: string; view: string; families: Family[] }) {
-  const [datasets, reload] = usePoll<Dataset[]>("/api/datasets", 0, [datasetId]);
-  const [creating, setCreating] = useState(false);
-  if (datasetId && view === "clips") return <ClipEditor key={datasetId} id={datasetId} />;
-  if (datasetId) return <DatasetDetail key={datasetId} id={datasetId} families={families} />; // fresh state per dataset
+/** Several datasets as one .zip (``/api/export/datasets``): a folder each, with captions and reference images. */
+function ExportDialog({ datasets, onClose }: { datasets: Dataset[]; onClose: () => void }) {
+  const toast = useToast();
+  const triggers = datasets.filter((d) => d.trigger);
+  const [withTrigger, setWithTrigger] = useState(triggers.length > 0);
+  const files = datasets.reduce((n, d) => n + d.count, 0);
+  const download = () => {
+    const a = document.createElement("a");
+    a.href = `/api/export/datasets?ids=${datasets.map((d) => d.id).join(",")}&trigger=${withTrigger}`;
+    a.download = "";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    toast("The download has started");
+    onClose();
+  };
   return (
-    <div className="page">
-      <div className="page-head">
-        <div>
-          <h1>Datasets</h1>
-          <p>Upload images, videos or music, or link an existing folder. Captions live next to each file as .txt.</p>
-        </div>
-        <button className="btn primary" onClick={() => setCreating(true)}><IconPlus /> New dataset</button>
+    <Modal title={datasets.length === 1 ? `Export ${datasets[0].name}` : `Export ${datasets.length} datasets`} onClose={onClose} footer={
+      <>
+        <button className="btn ghost" onClick={onClose}>Cancel</button>
+        <button className="btn primary" autoFocus onClick={download}><IconDownload /> Download .zip</button>
+      </>
+    }>
+      <div className="stack">
+        <p className="muted" style={{ margin: 0 }}>
+          A .zip with {datasets.length === 1 ? "the dataset's folder" : "a folder for each dataset"}: its {files} file{files === 1 ? "" : "s"}{" "}
+          ({fmtSize(datasets.reduce((n, d) => n + d.bytes, 0))}) in their subfolders, each with its caption .txt beside it, plus
+          reference images and a split's clip list. Nothing is compressed again, so the download starts right away.
+        </p>
+        {triggers.length > 0 && (
+          <div className="field">
+            <label className="check"><input type="checkbox" checked={withTrigger} onChange={(e) => setWithTrigger(e.target.checked)} /> Put the trigger word in each caption</label>
+            <span className="help">Dainamo adds {someNames([...new Set(triggers.map((d) => `"${d.trigger}"`))])} to the captions when it trains; another trainer reads
+              them as they are. A file without a caption gets one with just the trigger word. Off: the captions as they are on disk.</span>
+          </div>
+        )}
       </div>
-      {datasets && datasets.length === 0 && (
-        <div className="empty">
-          <strong>No datasets yet</strong>
-          Link a folder of images or upload some to get started.
-          <div style={{ marginTop: 14 }}><button className="btn primary" onClick={() => setCreating(true)}><IconPlus /> New dataset</button></div>
+    </Modal>
+  );
+}
+
+const MEDIA: [Media, string][] = [["all", "All media"], ["images", "Images"], ["videos", "Videos"], ["audio", "Audio"]];
+type Media = "all" | "images" | "videos" | "audio";
+const MEDIA_FILTER = "dainamo.datasets.media";
+
+/** What a dataset holds, for its badge: "Images", "Images & videos", "Mixed" (all three), or nothing while it's empty. */
+function mediaBadge(d: Dataset): { label: string; kind: string } | null {
+  const kinds = (["images", "videos", "audio"] as const).filter((k) => d[k] > 0);
+  const name = { images: "Images", videos: "Videos", audio: "Audio" };
+  if (kinds.length === 1) return { label: name[kinds[0]], kind: kinds[0] };
+  if (kinds.length === 2) return { label: `${name[kinds[0]]} & ${name[kinds[1]].toLowerCase()}`, kind: "mixed" };
+  return kinds.length ? { label: "Mixed", kind: "mixed" } : null;
+}
+
+/** A long path's last folders, "…/loras/set_a", so the folder's own name shows. */
+const tailPath = (p: string, max = 44) => {
+  if (p.length <= max) return p;
+  const sep = p.includes("\\") ? "\\" : "/"; // Windows'
+  const parts = p.split(sep).filter(Boolean);
+  let out = parts.pop() || p;
+  while (parts.length && out.length + parts[parts.length - 1].length + 1 <= max - 2) out = `${parts.pop()}${sep}${out}`;
+  return `…${sep}${out}`;
+};
+
+/** A dataset in the list: its cover, name, what it holds and where it came from, how much is captioned, its trigger
+ * word and (linked) folder. A click opens it, or picks it while selecting; ⋯ exports or deletes it. */
+function DatasetCard({ d, sel, onExport, onDelete }: { d: Dataset; sel: Selection; onExport: () => void; onDelete: () => void }) {
+  const picked = sel.picked.has(d.id);
+  const badge = mediaBadge(d);
+  const done = d.count > 0 && d.captioned === d.count;
+  const status = !d.exists ? <span className="danger-text">Its folder is missing</span>
+    : !d.count ? <span className="muted">No files yet</span>
+    : done ? <span className="ok-text">All files captioned</span>
+    : !d.captioned ? <span className="muted">No captions yet</span>
+    : <span className="muted">{d.count - d.captioned} without a caption</span>;
+  return (
+    <div className={"card ds-card" + (sel.on ? " selecting" : "") + (picked ? " picked" : "")}
+      onClick={() => (sel.on ? sel.toggle(d.id) : go("datasets", d.id))}>
+      <div className="ds-card-top">
+        <div className="ds-cover" style={d.cover ? { backgroundImage: `url(/api/thumb?size=192&path=${q(d.cover)})` } : {}}>
+          {!d.cover && <IconImages width={26} />}
+        </div>
+        <div className="ds-title">
+          <div className="ds-name">
+            <h3 className="ellipsis" title={d.name}>{d.name}</h3>
+            {badge && <span className={"ds-kind " + badge.kind}>{badge.label}</span>}
+          </div>
+          {d.split ? <span className="ds-source" title={`Clips cut from ${d.split.source.name}'s videos`}><IconScissors /><span className="ellipsis">Clips of {d.split.source.name}</span></span>
+            : d.managed ? <span className="ds-source"><IconUpload /> Uploaded</span>
+            : <span className="ds-source"><IconFolder /> Linked folder</span>}
+        </div>
+        {sel.on
+          ? <input type="checkbox" className="pick" checked={picked} aria-label={`Select ${d.name}`} onClick={(e) => e.stopPropagation()} onChange={() => sel.toggle(d.id)} />
+          : <Menu label={`More for ${d.name}`} items={[
+            { label: "Export", icon: <IconDownload />, onClick: onExport, disabled: !d.exists, title: d.exists ? "Download it as a .zip" : "Its folder is missing" },
+            { label: "Delete", icon: <IconTrash />, onClick: onDelete, danger: true },
+          ]} />}
+      </div>
+      <div className="ds-progress">
+        <div className="ds-progress-row"><span>{d.count} file{d.count === 1 ? "" : "s"}</span><span>{d.captioned} / {d.count} captioned</span></div>
+        <div className={"bar" + (done ? " ok" : "")}><div style={{ width: `${d.count ? (100 * d.captioned) / d.count : 0}%` }} /></div>
+        <div className="ds-status">{status}</div>
+      </div>
+      {(d.trigger || !d.managed) && (
+        <div className="ds-facts">
+          {d.trigger && <div><div className="ds-fact">Trigger word</div><code className="ds-chip">{d.trigger}</code></div>}
+          {!d.managed && <div><div className="ds-fact">Folder</div><code className="ds-chip ellipsis" title={d.path}>{tailPath(d.path)}</code></div>}
         </div>
       )}
-      <div className="grid cols-3">
-        {datasets?.map((d) => (
-          <div className="card ds-card" key={d.id} onClick={() => go("datasets", d.id)}>
-            <div className="ds-cover" style={d.cover ? { backgroundImage: `url(/api/thumb?size=160&path=${q(d.cover)})` } : {}}>
-              {!d.cover && <IconImages width={22} />}
-            </div>
-            <div style={{ minWidth: 0 }}>
-              <div style={{ fontWeight: 600 }} className="ellipsis">{d.name}</div>
-              <div className="muted small">{d.count} files · {d.captioned} captioned</div>
-              <div className="faint small ellipsis mono" title={d.path}>{d.exists ? (d.managed ? "uploaded" : d.path) : "⚠ folder missing"}</div>
-              {d.trigger && <span className="pill" style={{ marginTop: 5 }}>{d.trigger}</span>}
-            </div>
-          </div>
+      <div className="ds-foot">
+        <a className="btn ds-open" href={`#/datasets/${encodeURIComponent(d.id)}`} tabIndex={sel.on ? -1 : undefined}
+          onClick={(e) => { e.stopPropagation(); if (sel.on) { e.preventDefault(); sel.toggle(d.id); } }}>Open dataset <IconArrowRight /></a>
+      </div>
+    </div>
+  );
+}
+
+export default function Datasets({ datasetId, view, families }: { datasetId: string; view: string; families: Family[] }) {
+  const toast = useToast();
+  const [datasets, reload] = usePoll<Dataset[]>("/api/datasets", 0, [datasetId]);
+  const [creating, setCreating] = useState(false);
+  const [search, setSearch] = useState("");
+  const [media, setMediaState] = useState<Media>(() => {
+    try {
+      const m = localStorage.getItem(MEDIA_FILTER);
+      return MEDIA.find(([v]) => v === m)?.[0] || "all";
+    } catch {
+      return "all";
+    }
+  });
+  const setMedia = (m: Media) => {
+    setMediaState(m);
+    try {
+      localStorage.setItem(MEDIA_FILTER, m);
+    } catch { /* not kept */ }
+  };
+  // Select (or ⋯ on one): exported or deleted together
+  const sel = useSelection();
+  const [dialog, setDialog] = useState<{ kind: "export" | "delete"; ids: string[] } | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [jobs] = usePoll<Job[]>(dialog?.kind === "delete" ? "/api/jobs" : null, 0);
+  if (datasetId && view === "clips") return <ClipEditor key={datasetId} id={datasetId} />;
+  if (datasetId) return <DatasetDetail key={datasetId} id={datasetId} families={families} />; // fresh state per dataset
+  const words = search.toLowerCase().split(/\s+/).filter(Boolean);
+  const shown = (datasets || []).filter((d) => (media === "all" || d[media] > 0)
+    && words.every((w) => `${d.name} ${d.trigger} ${d.managed ? "" : d.path}`.toLowerCase().includes(w)));
+  const picked = shown.filter((d) => sel.picked.has(d.id)); // what Select acts on: only those in view
+  const chosen = (datasets || []).filter((d) => dialog?.ids.includes(d.id));
+  const uploaded = chosen.filter((d) => d.managed);
+  const names = new Set(chosen.map((d) => d.name));
+  const using = (jobs || []).filter((j) => ["queued", "running", "stopping"].includes(j.status) && j.datasets.some((n) => names.has(n)));
+  const removeMany = async (files: boolean) => {
+    setDeleting(true);
+    let removed = 0;
+    const failed: string[] = [];
+    for (const d of chosen) {
+      try {
+        await api.del(`/api/datasets/${d.id}?delete_files=${files}`);
+        removed++;
+      } catch (e: any) {
+        failed.push(`${d.name}: ${e.message}`);
+      }
+    }
+    toast(`Deleted ${removed} dataset${removed === 1 ? "" : "s"}${failed.length ? `; couldn't delete ${failed.join("; ")}` : ""}`, failed.length > 0);
+    setDeleting(false);
+    sel.stop();
+    reload();
+  };
+  const filtered = !!words.length || media !== "all";
+  return (
+    <div className="page narrow">
+      <div className="page-head">
+        <div>
+          <h1>Datasets{!!datasets?.length && <span className="count-pill">{datasets.length}</span>}</h1>
+          <p>Organize images, videos and music for training.</p>
+        </div>
+        <div className="row">
+          {!!datasets?.length && !sel.on && <button className="btn lg" onClick={sel.start}><IconCheck /> Select</button>}
+          <button className="btn primary lg" onClick={() => setCreating(true)}><IconPlus /> New dataset</button>
+        </div>
+      </div>
+      {!!datasets?.length && (
+        <div className="ds-toolbar">
+          <label className="search">
+            <IconSearch />
+            <input type="search" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search datasets…" aria-label="Search datasets"
+              onKeyDown={(e) => e.key === "Escape" && search && (e.stopPropagation(), setSearch(""))} />
+          </label>
+          <select value={media} onChange={(e) => setMedia(e.target.value as Media)} aria-label="Media">
+            {MEDIA.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
+          </select>
+        </div>
+      )}
+      {sel.on && (
+        <SelectBar sel={sel} ids={shown.map((d) => d.id)} noun={["dataset", "datasets"]}
+          info={<span className="muted small">{fmtSize(picked.reduce((n, d) => n + d.bytes, 0))}</span>}>
+          <button className="btn" onClick={() => setDialog({ kind: "export", ids: picked.map((d) => d.id) })} disabled={!picked.length || picked.some((d) => !d.exists)}
+            title={picked.some((d) => !d.exists) ? "A selected dataset's folder is missing" : "Download them as a .zip"}><IconDownload /> Export</button>
+          <button className="btn danger" onClick={() => setDialog({ kind: "delete", ids: picked.map((d) => d.id) })} disabled={!picked.length || deleting}><IconTrash /> {deleting ? "Deleting…" : "Delete"}</button>
+        </SelectBar>
+      )}
+      {dialog?.kind === "export" && <ExportDialog datasets={chosen} onClose={() => setDialog(null)} />}
+      {dialog?.kind === "delete" && (
+        <ConfirmDialog title={chosen.length === 1 ? `Delete ${chosen[0].name}` : `Delete ${chosen.length} datasets`} danger confirmLabel="Delete"
+          onClose={() => setDialog(null)} onConfirm={removeMany}
+          message={<>
+            Remove <strong style={{ color: "var(--text)" }}>{someNames(chosen.map((d) => d.name))}</strong> from Dainamo?
+            {uploaded.length < chosen.length && ` ${chosen.length === 1 ? "The linked folder and its files are" : "Linked folders and their files are"} left as they are.`}
+            {using.length > 0 && <div className="validation warning" style={{ marginTop: 10 }}>
+              {someNames(using.map((j) => j.name))} {using.length === 1 ? "is" : "are"} queued or running with {chosen.length === 1 ? "it" : "some of them"}:
+              deleting the files makes {using.length === 1 ? "that job" : "those jobs"} fail.</div>}
+          </>}
+          checkbox={uploaded.length ? `Also delete the uploaded files and captions${uploaded.length < chosen.length ? ` of ${someNames(uploaded.map((d) => d.name))}` : ""}` : undefined} />
+      )}
+      {datasets && datasets.length === 0 && (
+        <Empty icon={<IconImages />} title="No datasets yet" action={<button className="btn primary lg" onClick={() => setCreating(true)}><IconPlus /> New dataset</button>}>
+          Upload images, videos or music, or link a folder you already have.
+        </Empty>
+      )}
+      {!!datasets?.length && !shown.length && (
+        <div className="empty">
+          <strong>No datasets match</strong>
+          <button className="btn ghost" onClick={() => { setSearch(""); setMedia("all"); }}>Clear the search{media !== "all" ? " and filter" : ""}</button>
+        </div>
+      )}
+      <div className="grid cols-2 ds-grid">
+        {shown.map((d) => (
+          <DatasetCard key={d.id} d={d} sel={sel} onExport={() => setDialog({ kind: "export", ids: [d.id] })} onDelete={() => setDialog({ kind: "delete", ids: [d.id] })} />
         ))}
       </div>
+      {!!datasets?.length && !filtered && (
+        <>
+          <div className="card ds-note"><IconInfo /> Captions are stored beside each file as .txt files.</div>
+          <p className="muted small" style={{ margin: "12px 0 0" }}>Add files by uploading media or linking an existing folder.</p>
+        </>
+      )}
       {creating && <NewDataset onClose={() => setCreating(false)} onCreated={(d) => { setCreating(false); reload(); go("datasets", d.id); }} />}
     </div>
   );

@@ -5,8 +5,8 @@ import { EvalPanel } from "../components/EvalPanel";
 import { EvaluateDialog } from "../components/EvalSettings";
 import { HardwareCards } from "../components/Hardware";
 import { LossChart, Spark, useMetrics } from "../components/LossChart";
-import { IconCamera, IconCopy, IconDown, IconDownload, IconEdit, IconImages, IconLayers, IconPlay, IconRefresh, IconSave, IconStop, IconTarget, IconTrash, IconUp } from "../components/icons";
-import { AudioCard, ConfirmDialog, Lightbox, Modal, StatusPill, fmtSize, usePoll, useToast } from "../components/ui";
+import { IconCamera, IconCheck, IconCopy, IconDatabase, IconDown, IconDownload, IconDrive, IconEdit, IconFile, IconImages, IconLayers, IconPlay, IconPlus, IconRefresh, IconRight, IconSave, IconServer, IconStop, IconTarget, IconTrash, IconUp } from "../components/icons";
+import { AudioCard, ConfirmDialog, Empty, Lightbox, Modal, SelectBar, StatusPill, fmtSize, someNames, usePoll, useSelection, useToast, type Selection } from "../components/ui";
 import { SamplesPanel } from "../components/Samples";
 import { Terminal } from "../components/Terminal";
 import { CLONE_KEY, formOf } from "./CreateJob";
@@ -87,7 +87,7 @@ function DiskCard({ job }: { job: JobDetail }) {
       {disk.shared > 0 && (
         <div className="help" style={{ marginTop: 10 }}>
           It also uses {fmtSize(disk.shared)} of encoded captions and latents in the cache jobs share (not counted above). Any
-          job encoding the same files the same way reuses them; Clear caches on the Queue page frees what no queued or running job uses.
+          job encoding the same files the same way reuses them; Manage cache on the Queue page clears what no queued or running job uses.
         </div>
       )}
       {confirm === "cache" && (
@@ -102,7 +102,7 @@ function DiskCard({ job }: { job: JobDetail }) {
   );
 }
 
-function JobRow({ j, reload, queuedIndex, queuedCount, size }: { j: Job; reload: () => void; queuedIndex: number; queuedCount: number; size?: number }) {
+function JobRow({ j, reload, queuedIndex, queuedCount, size, sel }: { j: Job; reload: () => void; queuedIndex: number; queuedCount: number; size?: number; sel: Selection }) {
   const act = useJobAction();
   const toast = useToast();
   const p = j.progress;
@@ -112,14 +112,21 @@ function JobRow({ j, reload, queuedIndex, queuedCount, size }: { j: Job; reload:
   const remove = async (files: boolean) => {
     try { await api.del(`/api/jobs/${j.id}?delete_files=${files}`); reload(); } catch (e: any) { toast(e.message, true); }
   };
+  // picking jobs to delete: the card picks it; a running one can't be deleted
+  const picked = sel.on && sel.picked.has(j.id);
   return (
-    <div className="card job-card">
-      <div className="job-thumb" style={j.last_sample ? { backgroundImage: `url(/api/jobs/${j.id}/file/samples/${j.last_sample.poster || j.last_sample.file})`, cursor: "pointer" } : {}} onClick={() => go("queue", j.id)}>
+    <div className={"card job-card" + (sel.on ? " selecting" : "") + (picked ? " picked" : "") + (sel.on && active ? " locked" : "")}
+      onClick={sel.on && !active ? () => sel.toggle(j.id) : undefined}>
+      {sel.on && <input type="checkbox" className="pick" checked={picked} disabled={active} aria-label={`Select ${j.name}`}
+        title={active ? "Stop it before deleting it" : undefined} onClick={(e) => e.stopPropagation()} onChange={() => sel.toggle(j.id)} />}
+      <div className="job-thumb" style={j.last_sample ? { backgroundImage: `url(/api/jobs/${j.id}/file/samples/${j.last_sample.poster || j.last_sample.file})`, cursor: "pointer" } : {}}
+        onClick={sel.on ? undefined : () => go("queue", j.id)}>
         {!j.last_sample && <IconImages width={26} />}
       </div>
       <div style={{ minWidth: 0 }}>
         <div className="row">
-          <a className="job-title ellipsis" href={`#/queue/${j.id}`} style={{ color: "var(--text)" }}>{j.name}</a>
+          {sel.on ? <span className="job-title ellipsis">{j.name}</span>
+            : <a className="job-title ellipsis" href={`#/queue/${j.id}`} style={{ color: "var(--text)" }}>{j.name}</a>}
           <StatusPill status={j.status} />
         </div>
         <div className="job-meta">
@@ -160,7 +167,7 @@ function JobRow({ j, reload, queuedIndex, queuedCount, size }: { j: Job; reload:
         )}
         {j.status === "failed" && p.message && <div className="error-box small" style={{ marginTop: 8 }}>{p.message}</div>}
       </div>
-      <div className="row">
+      {!sel.on && <div className="row">
         {j.status === "queued" && <>
           <button className="btn icon" title="Move up" disabled={queuedIndex === 0} onClick={() => act(j, "up", reload)}><IconUp /></button>
           <button className="btn icon" title="Move down" disabled={queuedIndex === queuedCount - 1} onClick={() => act(j, "down", reload)}><IconDown /></button>
@@ -170,7 +177,7 @@ function JobRow({ j, reload, queuedIndex, queuedCount, size }: { j: Job; reload:
         {["stopped", "failed", "interrupted"].includes(j.status) && <button className="btn primary" onClick={() => act(j, "resume", reload)}><IconPlay /> {j.refmod ? "Make again" : j.extract ? "Extract again" : j.merge ? "Merge again" : "Resume"}</button>}
         {!active && j.status !== "queued" && !j.extract && !j.merge && <button className="btn icon" title="Duplicate settings into a new job" onClick={() => cloneJob(j.id)}><IconCopy /></button>}
         {!active && <button className="btn icon danger" title="Delete" onClick={() => setConfirmDel(true)}><IconTrash /></button>}
-      </div>
+      </div>}
       {confirmDel && (
         <ConfirmDialog title="Delete job" danger confirmLabel="Delete job" onClose={() => setConfirmDel(false)} onConfirm={remove}
           message={<>Remove <strong style={{ color: "var(--text)" }}>{j.name}</strong> from the queue?</>}
@@ -649,58 +656,151 @@ export default function Queue({ jobId, view }: { jobId: string; view?: string })
   return <QueueList jobs={jobs} reload={reload} />;
 }
 
-function QueueList({ jobs, reload }: { jobs: Job[] | null; reload: () => void }) {
+type SharedCache = { total: number; in_use: number };
+type QueueDisk = { jobs: Record<string, DiskUse>; total: DiskUse; shared_cache: SharedCache };
+
+/** The cache of encoded captions and latents: how much there is, how much queued and running jobs use, and clearing
+ * the rest (with finished jobs' own caches, from before the cache was shared). */
+function CacheDialog({ disk, jobs, onClose, onCleared }: { disk: QueueDisk; jobs: Job[]; onClose: () => void; onCleared: () => void }) {
   const toast = useToast();
-  type SharedCache = { total: number; in_use: number };
-  const [disk, reloadDisk] = usePoll<{ jobs: Record<string, DiskUse>; total: DiskUse; shared_cache: SharedCache }>("/api/disk", 0, [jobs?.length]);
-  const [confirmClean, setConfirmClean] = useState(false);
-  const shared = disk?.shared_cache || { total: 0, in_use: 0 };
-  // what clearing would free: the shared cache but what queued and running jobs use, and finished jobs' own caches
-  const clearable = shared.total - shared.in_use + (jobs || []).filter((j) => FINISHED.includes(j.status) && !j.evaluating)
-    .reduce((n, j) => n + (disk?.jobs[j.id]?.cache || 0), 0);
-  const clean = async () => {
+  const [busy, setBusy] = useState(false);
+  const shared = disk.shared_cache;
+  const own = jobs.filter((j) => FINISHED.includes(j.status) && !j.evaluating).reduce((n, j) => n + (disk.jobs[j.id]?.cache || 0), 0);
+  const clearable = shared.total - shared.in_use + own;
+  const clear = async () => {
+    setBusy(true);
     try {
-      const r = await api.post<{ freed: number; jobs: number }>("/api/disk/clean", { parts: ["cache"] });
+      const r = await api.post<{ freed: number }>("/api/disk/clean", { parts: ["cache"] });
       toast(`Freed ${fmtSize(r.freed)}`);
-      reloadDisk();
+      onCleared();
+      onClose();
     } catch (e: any) {
       toast(e.message, true);
+    } finally {
+      setBusy(false);
     }
   };
+  return (
+    <Modal title="Cache" onClose={onClose} footer={
+      <>
+        <button className="btn ghost" onClick={onClose}>Close</button>
+        <button className="btn primary" autoFocus disabled={busy || clearable <= 0} onClick={clear}>
+          <IconTrash /> {clearable > 0 ? `Clear ${fmtSize(clearable)}` : "Nothing to clear"}
+        </button>
+      </>
+    }>
+      <div className="stack" style={{ gap: 12 }}>
+        <p className="muted" style={{ margin: 0 }}>
+          Captions and training files are encoded once and kept here. Jobs share them: a job encoding the same files the same
+          way reuses them instead of encoding them again.
+        </p>
+        <div>
+          <div className="kv"><span>Cached captions and latents</span><span>{fmtSize(disk.total.cache + shared.total)}</span></div>
+          <div className="kv"><span>Used by queued or running jobs</span><span>{fmtSize(shared.in_use)}</span></div>
+          <div className="kv"><span>Can be cleared</span><span>{fmtSize(clearable)}</span></div>
+        </div>
+        <p className="help" style={{ margin: 0 }}>
+          Clearing deletes what no queued or running job uses; a job that needs it again encodes it again first. LoRAs,
+          samples and training state stay. Training state ({fmtSize(disk.total.state)} now) is what a job resumes or
+          continues from; a completed job's can be deleted on its page, under Checkpoints.
+        </p>
+      </div>
+    </Modal>
+  );
+}
+
+function QueueList({ jobs, reload }: { jobs: Job[] | null; reload: () => void }) {
+  const toast = useToast();
+  const [disk, reloadDisk] = usePoll<QueueDisk>("/api/disk", 0, [jobs?.length]);
+  const [manage, setManage] = useState(false);
+  const shared = disk?.shared_cache || { total: 0, in_use: 0 };
   const running = jobs?.filter((j) => j.status === "running" || j.status === "stopping") || [];
   const queued = jobs?.filter((j) => j.status === "queued") || [];
+  // Select: several jobs deleted at once (not running ones)
+  const sel = useSelection();
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const deletable = (jobs || []).filter((j) => !running.includes(j)).map((j) => j.id);
+  const chosen = (jobs || []).filter((j) => sel.picked.has(j.id) && deletable.includes(j.id));
+  const removeMany = async (files: boolean) => {
+    setDeleting(true);
+    let deleted = 0;
+    const failed: string[] = [];
+    for (const j of chosen) {
+      try {
+        await api.del(`/api/jobs/${j.id}?delete_files=${files}`);
+        deleted++;
+      } catch (e: any) {
+        failed.push(`${j.name}: ${e.message}`);
+      }
+    }
+    toast(`Deleted ${deleted} job${deleted === 1 ? "" : "s"}${failed.length ? `; couldn't delete ${failed.join("; ")}` : ""}`, failed.length > 0);
+    setDeleting(false);
+    sel.stop();
+    reload();
+    reloadDisk();
+  };
+  const queuedChosen = chosen.filter((j) => j.status === "queued").length;
   const done = (jobs?.filter((j) => !["running", "stopping", "queued"].includes(j.status)) || []).sort((a, b) => (b.finished || b.created) - (a.finished || a.created));
   return (
     <div className="page">
       <div className="page-head">
         <div>
           <h1>Queue</h1>
-          <p>Running, queued and finished training jobs. Queue mode and GPUs are set in <a href="#/settings">Settings</a>.</p>
+          <p>Manage your training jobs.</p>
         </div>
       </div>
       <HardwareCards />
-      {disk && disk.total.total + shared.total > 0 && (
-        <div className="row wrap small queue-disk">
-          <span className="muted">Jobs use {fmtSize(disk.total.total + shared.total)} on disk: {fmtSize(disk.total.output)} of LoRAs, {fmtSize(shared.total + disk.total.cache)} of
-            cached captions and latents (shared between jobs that encode them the same way), {fmtSize(disk.total.state)} of training state.</span>
-          {clearable > 0 && <button className="btn sm" onClick={() => setConfirmClean(true)}>Clear caches</button>}
-        </div>
+      <div className="section-head">
+        <h2>Training jobs</h2>
+        {jobs && <span className="count-pill">{jobs.length}</span>}
+        <span className="spacer" />
+        {!!jobs?.length && !sel.on && <button className="btn" onClick={sel.start}><IconCheck /> Select</button>}
+      </div>
+      {jobs && jobs.length === 0 && (
+        <Empty icon={<IconServer />} title="No training jobs yet" action={<a className="btn primary lg" href="#/create"><IconPlus /> New job</a>}>
+          Create a training job to get started.
+        </Empty>
       )}
-      {confirmClean && (
-        <ConfirmDialog title="Clear caches" confirmLabel={`Free ${fmtSize(clearable)}`} onClose={() => setConfirmClean(false)} onConfirm={clean}
-          message="The encoded captions and images that no queued or running job is using are deleted. A job that needs them again encodes them again first. Checkpoints, samples and training state stay." />
+      {sel.on && (
+        <SelectBar sel={sel} ids={deletable} noun={["job", "jobs"]}
+          info={<span className="muted small">{fmtSize(chosen.reduce((n, j) => n + (disk?.jobs[j.id]?.total || 0), 0))} on disk</span>}>
+          <button className="btn danger" onClick={() => setConfirmDelete(true)} disabled={!chosen.length || deleting}><IconTrash /> {deleting ? "Deleting…" : "Delete"}</button>
+        </SelectBar>
       )}
-      {jobs && jobs.length === 0 && <div className="empty"><strong>Nothing in the queue</strong><a href="#/create">Create a job →</a></div>}
+      {confirmDelete && (
+        <ConfirmDialog title={`Delete ${chosen.length} job${chosen.length === 1 ? "" : "s"}`} danger confirmLabel="Delete"
+          onClose={() => setConfirmDelete(false)} onConfirm={removeMany}
+          message={<>Remove <strong style={{ color: "var(--text)" }}>{someNames(chosen.map((j) => j.name))}</strong> from the queue?
+            {queuedChosen > 0 && ` ${queuedChosen === chosen.length ? (queuedChosen === 1 ? "It's" : "They're") : `${queuedChosen} of them ${queuedChosen === 1 ? "is" : "are"}`} queued, and won't run.`}</>}
+          checkbox={`Also delete their files from disk (${fmtSize(chosen.reduce((n, j) => n + (disk?.jobs[j.id]?.total || 0), 0))}): LoRAs or finetuned models, samples and training state`} />
+      )}
       {[["In progress", running], ["Queued", queued], ["Finished", done]].map(([title, list]) =>
         (list as Job[]).length > 0 && (
-          <div key={title as string} style={{ marginBottom: 26 }}>
+          <div key={title as string} className="job-group">
             <div className="section-title">{title as string} · {(list as Job[]).length}</div>
             <div className="stack" style={{ gap: 10 }}>
-              {(list as Job[]).map((j, i) => <JobRow key={j.id} j={j} reload={reload} queuedIndex={i} queuedCount={(list as Job[]).length} size={disk?.jobs[j.id]?.total} />)}
+              {(list as Job[]).map((j, i) => <JobRow key={j.id} j={j} reload={reload} queuedIndex={i} queuedCount={(list as Job[]).length} size={disk?.jobs[j.id]?.total} sel={sel} />)}
             </div>
           </div>
         ),
       )}
+      {disk && (
+        <div className="card disk-bar">
+          <span className="disk-item" title="Everything the jobs keep on disk: LoRAs and finetuned models, samples, training state, logs, and the cache">
+            <IconDrive /><span>Storage</span><b>{fmtSize(disk.total.total + shared.total)}</b>
+          </span>
+          <span className="disk-item" title="Encoded captions and latents, shared between jobs that encode the same files the same way">
+            <IconDatabase /><span>Cache</span><b>{fmtSize(disk.total.cache + shared.total)}</b>
+          </span>
+          <span className="disk-item" title="The LoRAs, finetuned models and RefMods the jobs made">
+            <IconFile /><span>LoRAs</span><b>{fmtSize(disk.total.output)}</b>
+          </span>
+          <span className="spacer" />
+          <button className="btn" onClick={() => setManage(true)}>Manage cache <IconRight /></button>
+        </div>
+      )}
+      {manage && disk && <CacheDialog disk={disk} jobs={jobs || []} onClose={() => setManage(false)} onCleared={reloadDisk} />}
     </div>
   );
 }

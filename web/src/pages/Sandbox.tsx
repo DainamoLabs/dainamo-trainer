@@ -4,9 +4,9 @@ import {
   type SandboxOutput, type SandboxParams, type SandboxProgress, type SandboxRun, type SandboxStatus, type SystemRam,
   type Workflow,
 } from "../api";
-import { IconPlay, IconPlus, IconRefresh, IconStop, IconTrash, IconX } from "../components/icons";
-import { AudioCard, ImagesInput, Info, Lightbox, PathInput, ProfileOptions, StatusPill, usePoll, useToast } from "../components/ui";
-import { OffloadControl, gpuTarget, useVramProjection } from "../components/Vram";
+import { IconPlayFill, IconPlus, IconRefresh, IconRight, IconSparkle, IconStop, IconTrash, IconX } from "../components/icons";
+import { AudioPlayer, Empty, ImagesInput, Info, Lightbox, PathInput, ProfileOptions, StatusPill, usePoll, useToast } from "../components/ui";
+import { OffloadControl, gpuTarget, offloadFit, useVramProjection } from "../components/Vram";
 
 type LoraRow = { path: string; strength: number; custom: boolean };
 // compare checkpoints: a job's checkpoints (paths) at some strengths
@@ -30,6 +30,8 @@ type Form = {
 };
 
 const STORE = "dainamo.sandbox.form";
+const ADVANCED = "dainamo.sandbox.advanced"; // Advanced settings left open
+const SESSION: Record<string, string> = { off: "Model unloaded", starting: "Loading model", ready: "Model loaded", busy: "Generating", stopping: "Unloading" };
 // a training sample to re-create, left by "Open in Sandbox" on a job's samples (GET /api/jobs/{id}/sandbox)
 export const SANDBOX_PRESET = "dainamo.sandboxPreset";
 type Preset = {
@@ -140,6 +142,14 @@ const INFO = {
   sampler: "How each step moves from noise toward the image. Euler is fast and dependable; Heun is more accurate but runs the model twice a step; DPM++ 2M is often cleaner in fewer steps at Euler's speed.",
   scheduler: "How the noise levels are spaced across the steps. Model default is the model's own schedule; Simple spaces them evenly; Beta puts more steps at the start and the end.",
   shift: "Moves the steps toward the noisy end, where the composition is decided: higher suits bigger images. Blank uses the model's own shift.",
+  prompt: "What to make, or for an edit the change to make. Ctrl+Enter generates.",
+  style: "The song's genre, instruments, mood and voice, as comma-separated tags, such as: indie pop, upbeat, electric guitar, female vocals, English. Ctrl+Enter generates.",
+  lyrics: "Blank makes an instrumental. Section tags like [Intro], [Verse], [Chorus] and [Bridge] lay out the song, each followed by its lines. Score planning is the profile's setting.",
+  compareCheckpoints: "Renders the same prompt and seed with each checkpoint of a job at each strength, as a grid. The LoRAs above apply to every image.",
+  generation: "How big or long to make it, how many steps, how closely to follow the prompt, and the seed.",
+  seconds: "The song's length, up to 6 minutes.",
+  count: "Each makes its own, the seeds counting up from the seed.",
+  advanced: "The sampler and its schedule, the GPU, and how much of the model to keep in system RAM while generating.",
 };
 
 function Num(props: { label: string; v: number; on: (n: number) => void; step?: number; min?: number; max?: number; disabled?: boolean; help?: string; info?: string }) {
@@ -196,8 +206,9 @@ function GridView({ run, onOpen }: { run: SandboxRun; onOpen: Open }) {
   );
 }
 
-/** One run's outputs: LoRA and base side by side per seed. */
-function RunView({ run, onOpen }: { run: SandboxRun; onOpen: Open }) {
+/** One run's outputs, per seed: with the LoRAs and (comparing) the base model side by side, each under its name and
+ * over what made it (``meta``, the run's settings, then its seed and LoRAs). */
+function RunView({ run, meta, onOpen }: { run: SandboxRun; meta: string; onOpen: Open }) {
   if (run.params.grid) return <GridView run={run} onOpen={onOpen} />;
   const bySeed = useMemo(() => {
     const m = new Map<number, Partial<Record<"lora" | "base", SandboxOutput>>>();
@@ -205,24 +216,39 @@ function RunView({ run, onOpen }: { run: SandboxRun; onOpen: Open }) {
     return [...m.entries()];
   }, [run.outputs]);
   const compare = run.params.compare_base;
-  const media = (o: SandboxOutput | undefined, label: string) => o ? (
-    <figure>
-      {o.kind === "audio" ? (
-        <AudioCard src={fileUrl(run, o.file)} {...audioOf(run, o)} />
-      ) : o.kind === "video" ? (
-        <video src={fileUrl(run, o.file)} poster={o.poster ? fileUrl(run, o.poster) : undefined} controls loop preload="metadata" />
-      ) : (
-        <img src={fileUrl(run, o.file)} alt="" onClick={() => onOpen(fileUrl(run, o.file), false)} />
-      )}
-      <figcaption>{label} · seed {o.seed}</figcaption>
-    </figure>
-  ) : <figure className="pending"><div className="sbx-wait">{label}…</div></figure>;
+  const loras = run.params.loras;
+  const song = run.params.seconds != null;
+  const panel = (o: SandboxOutput | undefined, variant: "lora" | "base", seed: number) => {
+    const label = variant === "base" ? "Base model" : loras.length ? (loras.length > 1 ? "With LoRAs" : "With LoRA") : "Result";
+    const withLoras = variant === "lora" && loras.length > 0;
+    return (
+      <div className="sbx-out" key={variant}>
+        <div className="sbx-out-head">
+          <strong>{label}</strong>
+          {withLoras && <span className="faint ellipsis" title={loras.map((l) => `${base(l.path)} @ ${l.strength}`).join("\n")}>{loras.map((l) => base(l.path)).join(", ")}</span>}
+        </div>
+        {!o ? <div className={"sbx-wait" + (song ? " song" : "")}>{label}…</div>
+          : o.kind === "audio" ? <>
+            {o.poster && <img className="sbx-poster" src={fileUrl(run, o.poster)} alt="Spectrogram" onClick={() => onOpen(fileUrl(run, o.file), false, audioOf(run, o))} />}
+            <AudioPlayer src={fileUrl(run, o.file)} download={run.n ? `run${run.n}_${o.file}` : o.file} />
+          </> : o.kind === "video" ? (
+            <video src={fileUrl(run, o.file)} poster={o.poster ? fileUrl(run, o.poster) : undefined} controls loop preload="metadata" />
+          ) : (
+            <img src={fileUrl(run, o.file)} alt="" onClick={() => onOpen(fileUrl(run, o.file), false)} />
+          )}
+        <div className="sbx-out-meta">
+          <div>{meta}</div>
+          <div>Seed {o?.seed ?? seed}{withLoras ? (loras.length === 1 ? ` · LoRA strength ${loras[0].strength}` : ` · ${loras.length} LoRAs`) : variant === "base" ? " · without LoRAs" : ""}</div>
+        </div>
+      </div>
+    );
+  };
   return (
     <div className="stack" style={{ gap: 14 }}>
       {bySeed.map(([seed, o]) => (
         <div key={seed} className={"sbx-pair" + (compare ? " two" : "")}>
-          {media(o.lora, run.params.loras.length ? "With LoRA" : "Result")}
-          {compare && media(o.base, "Base model")}
+          {panel(o.lora, "lora", seed)}
+          {compare && panel(o.base, "base", seed)}
         </div>
       ))}
     </div>
@@ -322,6 +348,13 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
   const progress = session?.progress;
   const offload = form.offload ?? defaults?.offload ?? 0;
   const lowVram = !!form.low_vram && !!family?.streams_text_encoder;
+  const [advanced, setAdvanced] = useState(() => {
+    try { return localStorage.getItem(ADVANCED) === "1"; } catch { return false; }
+  });
+  const openAdvanced = (on: boolean) => {
+    setAdvanced(on);
+    try { localStorage.setItem(ADVANCED, on ? "1" : "0"); } catch { /* not kept: it starts closed next time */ }
+  };
 
   // size: a shape (or the input image's) at some megapixels, or typed in
   const shapes = video ? VIDEO_SHAPES : IMAGE_SHAPES;
@@ -436,6 +469,20 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
     toast("Settings loaded");
   };
 
+  // a run's number: from the server, or (from before runs had one) its place in the list
+  const runNumber = (r: SandboxRun) => r.n ?? runs.length - runs.indexOf(r);
+  const runMeta = (r: SandboxRun) => {
+    const p = r.params;
+    const song = p.seconds != null;
+    return [
+      r.profile_name, p.images.length ? workflows.find((w) => w.id === r.workflow)?.label : "",
+      song ? `${p.seconds} s${p.lyrics ? " with lyrics" : ""}` : `${p.width}×${p.height}`, p.frames > 1 ? `${p.frames} frames` : "",
+      `${p.steps} steps`, song ? "" : status?.samplers[p.sampler] || p.sampler,
+      p.scheduler !== "default" ? status?.schedulers[p.scheduler] : "", p.shift != null ? `shift ${p.shift}` : "",
+      p.cfg !== 1 ? `CFG ${p.cfg}` : "",
+      p.grid ? `${p.grid.job_name || "checkpoints"}: ${p.grid.checkpoints.length} × ${p.grid.strengths.length} strength${p.grid.strengths.length === 1 ? "" : "s"}` : "",
+    ].filter(Boolean).join(" · ");
+  };
   const setLora = (i: number, patch: Partial<LoraRow>) => setForm({ loras: form.loras.map((l, j) => (j === i ? { ...l, ...patch } : l)) });
   const jobs = useMemo(() => {
     const m = new Map<string, LoraOption[]>();
@@ -460,15 +507,16 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
   }, [loraOptions]);
   const setGrid = (patch: Partial<GridForm>) => setForm({ grid: { ...grid, ...patch } });
   const pickGridJob = (id: string) => setGrid({ job_id: id, checkpoints: (gridJobs.get(id)?.opts || []).slice(-12).map((o) => o.path) });
+  const fit = offloadFit(vram, offload, gpuTarget(gpus, gpu));
   const gridOk = !grid.on || (grid.checkpoints.length > 0 && gridStrengths.length > 0 && gridImages <= 64);
   const canGo = !!profile && !!wf && form.prompt.trim() !== "" && !blocked && !busy && gridOk && mpOk;
 
   return (
-    <div className="page">
+    <div className="page wide">
       <div className="page-head">
         <div>
           <h1>Sandbox</h1>
-          <p>Try a profile with your LoRAs: same engine and samplers as training, models kept loaded between generations.</p>
+          <p>Test your LoRAs and compare results.</p>
         </div>
       </div>
 
@@ -502,7 +550,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
           </div>
 
           <label className="field">
-            <span>{music ? "Style" : "Prompt"}</span>
+            <span>{music ? "Style" : "Prompt"}<Info text={music ? INFO.style : INFO.prompt} /></span>
             <textarea rows={music ? 2 : 4} value={form.prompt}
               placeholder={form.workflow === "edit" ? "The edit instruction, e.g. Make it night"
                 : music ? "Genre, instruments, mood and voice: indie pop, upbeat, electric guitar, female vocals, English" : "Describe what to generate"}
@@ -511,11 +559,10 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
           </label>
           {music && (
             <label className="field">
-              <span>Lyrics <span className="faint">· blank for an instrumental</span></span>
-              <textarea rows={7} value={form.lyrics} placeholder={"[Verse]\nWalking down the street tonight\nNeon signs are shining bright\n\n[Chorus]\n…"}
+              <span>Lyrics<Info text={INFO.lyrics} /></span>
+              <textarea rows={2} value={form.lyrics} placeholder="Leave blank for instrumental music"
                 onChange={(e) => setForm({ lyrics: e.target.value })}
                 onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && canGo) generate(); }} />
-              <span className="help">Section tags like [Intro], [Verse], [Chorus] and [Bridge] lay out the song. Score planning is the profile's setting.</span>
             </label>
           )}
           {!music && <div className="field sbx-enhance">
@@ -647,17 +694,16 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
                   title={strength !== 1 ? `${family?.label} LoRAs are used at about strength ${strength}` : undefined}>
                   <IconPlus /> Add LoRA
                 </button>
-                {!grid.on && (
-                  <label className="check">
-                    <input type="checkbox" checked={form.compare_base} disabled={!form.loras.length} onChange={(e) => setForm({ compare_base: e.target.checked })} /> Compare with base<Info text={INFO.compareBase} />
-                  </label>
-                )}
               </div>
             </div>
           </div>
 
-          <div className={"toggle-card" + (grid.on ? " on" : "")}>
-            <label className="check toggle-head">
+          <div className="sbx-checks">
+            <label className="check" title={grid.on ? "Compare checkpoints has its own: Include the base model" : undefined}>
+              <input type="checkbox" checked={form.compare_base && !grid.on} disabled={!form.loras.length || grid.on} onChange={(e) => setForm({ compare_base: e.target.checked })} />
+              Compare with base model<Info text={INFO.compareBase} />
+            </label>
+            <label className="check">
               <input type="checkbox" checked={grid.on} onChange={(e) => {
                 const on = e.target.checked;
                 if (on && !grid.job_id && gridJobs.size) {
@@ -665,13 +711,15 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
                   setGrid({ on, job_id: id, checkpoints: e0.opts.slice(-12).map((o) => o.path) });
                 } else setGrid({ on });
               }} />
-              <span><strong>Compare checkpoints</strong>
-                <span className="help">The same prompt and seed with each checkpoint at each strength, as a grid. The LoRAs above apply to every image.</span></span>
+              Compare checkpoints<Info text={INFO.compareCheckpoints} />
             </label>
-            {grid.on && (gridJobs.size === 0 ? (
-              <div className="help" style={{ marginTop: 10 }}>No {family?.label || ""} job has checkpoints yet.</div>
+          </div>
+          {grid.on && (
+          <div className="sbx-sub">
+            {gridJobs.size === 0 ? (
+              <div className="help">No {family?.label || ""} job has checkpoints yet.</div>
             ) : (
-              <div className="stack" style={{ gap: 10, marginTop: 12 }}>
+              <div className="stack" style={{ gap: 10 }}>
                 <label className="field">
                   <span>Job</span>
                   <select value={grid.job_id} onChange={(e) => pickGridJob(e.target.value)}>
@@ -708,212 +756,227 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
                   {progress?.sec_per_step && gridImages ? ` · about ${fmtDuration(gridImages * form.steps * progress.sec_per_step)} at the current speed` : ""}
                 </span>
               </div>
-            ))}
-          </div>
-
-          {music ? (
-            <div className="grid cols-2">
-              <Num label="Length (seconds)" v={form.seconds} on={(n) => setForm({ seconds: n })} min={5} max={360} help="Up to 6 minutes" />
-            </div>
-          ) : <div className="field">
-            <span>Size</span>
-            <div className="seg sbx-shapes" role="group" aria-label="Shape">
-              {shapes.map((label) => (
-                <button key={label} type="button" className={mode === "shape" && form.shape === label ? "on" : ""}
-                  title={form.mp > 0 ? sizeFor(RATIOS[label], form.mp).join("×") : undefined} onClick={() => setForm({ size_mode: "shape", shape: label })}>{label}</button>
-              ))}
-              {wf?.images && (
-                <button type="button" className={mode === "match" ? "on" : ""} title="The shape of the (first) input image"
-                  onClick={() => setForm({ size_mode: "match" })}>Match input</button>
-              )}
-              <button type="button" className={mode === "custom" ? "on" : ""} title="Type the width and height"
-                onClick={() => setForm({ size_mode: "custom", width, height })}>Custom</button>
-            </div>
-            {mode === "custom" ? (
-              <div className="sbx-size">
-                <input type="number" aria-label="Width" value={Number.isFinite(form.width) ? form.width : ""} step={defaults?.divisibility || 16} min={128}
-                  onChange={(e) => setForm({ width: e.target.value === "" ? NaN : Number(e.target.value) })} />
-                <span className="faint">×</span>
-                <input type="number" aria-label="Height" value={Number.isFinite(form.height) ? form.height : ""} step={defaults?.divisibility || 16} min={128}
-                  onChange={(e) => setForm({ height: e.target.value === "" ? NaN : Number(e.target.value) })} />
-                <button type="button" className="btn icon" title="Swap width and height" aria-label="Swap width and height"
-                  onClick={() => setForm({ width: form.height, height: form.width })}>⇄</button>
-              </div>
-            ) : null}
-            {mode !== "shape" && (
-              <span className="help">
-                {mode === "custom" ? `Sizes are rounded down to multiples of ${defaults?.divisibility || 16}.`
-                  : matched ? `Same shape as ${base(matched.path)} (${matched.width}×${matched.height}).`
-                    : `Choose an input image above to match its shape; until then this is ${form.shape}.`}
-              </span>
             )}
-          </div>}
-          {!music && (mode !== "custom" || video) && (
-            <div className="grid cols-2">
-              {mode !== "custom" && (
-                <Num label="Megapixels" info={INFO.megapixels} v={form.mp} on={(n) => setForm({ mp: n })} step={0.05} min={0.05}
-                  help={!(form.mp > 0) ? "Above 0, such as 1 or 0.75"
-                    : Math.max(width, height) > MAX_SIDE ? `Too big: a side can be at most ${MAX_SIDE} pixels`
-                      : `${width} × ${height} · ${((width * height) / MP).toFixed(2)} MP`} />
-              )}
-              {video && <Num label="Frames" v={form.frames} on={(n) => setForm({ frames: n })} min={1} max={241} help="24 fps" />}
-            </div>
-          )}
-
-          <div className="grid sbx-steps">
-            <Num label="Steps" v={form.steps} on={(n) => setForm({ steps: n })} min={1} max={200} />
-            <Num label={music ? "Token CFG (1 = off)" : "CFG (1 = off)"} info={music ? INFO.tokenCfg : INFO.cfg} v={form.cfg} on={(n) => setForm({ cfg: n })} step={music ? 0.01 : 0.5} min={0}
-              disabled={defaults ? !defaults.supports_samplers && !music : false} />
-            <label className="field">
-              <span>Seed</span>
-              <div className="row" style={{ gap: 6 }}>
-                <input type="number" value={form.seed} disabled={form.random_seed} onChange={(e) => setForm({ seed: Number(e.target.value) })} />
-                <button className={"btn icon" + (form.random_seed ? " primary" : "")} title="Random seed each time" onClick={() => setForm({ random_seed: !form.random_seed })}><IconRefresh /></button>
-              </div>
-            </label>
           </div>
-          {form.cfg > 1 && defaults?.supports_samplers && (
-            <label className="field">
-              <span>Negative prompt<Info text={INFO.negative} /></span>
-              <input value={form.negative} onChange={(e) => setForm({ negative: e.target.value })} />
-            </label>
           )}
 
-          {defaults?.supports_samplers === false ? (
-            <div className="help">{music
-              ? "The composer writes the song token by token (Token CFG guides it; the release uses 1.01 with planning off), then the steps above render it with the release's midpoint sampler; sampler and scheduler don't apply."
-              : "This model uses its released sampler (joint video + audio); sampler and scheduler don't apply."}</div>
-          ) : (
+          <div className="sbx-section">
+            <h3>Generation<Info text={INFO.generation} /></h3>
+            {!music && <div className="field">
+              <span>Size</span>
+              <div className="seg sbx-shapes" role="group" aria-label="Shape">
+                {shapes.map((label) => (
+                  <button key={label} type="button" className={mode === "shape" && form.shape === label ? "on" : ""}
+                    title={form.mp > 0 ? sizeFor(RATIOS[label], form.mp).join("×") : undefined} onClick={() => setForm({ size_mode: "shape", shape: label })}>{label}</button>
+                ))}
+                {wf?.images && (
+                  <button type="button" className={mode === "match" ? "on" : ""} title="The shape of the (first) input image"
+                    onClick={() => setForm({ size_mode: "match" })}>Match input</button>
+                )}
+                <button type="button" className={mode === "custom" ? "on" : ""} title="Type the width and height"
+                  onClick={() => setForm({ size_mode: "custom", width, height })}>Custom</button>
+              </div>
+              {mode === "custom" ? (
+                <div className="sbx-size">
+                  <input type="number" aria-label="Width" value={Number.isFinite(form.width) ? form.width : ""} step={defaults?.divisibility || 16} min={128}
+                    onChange={(e) => setForm({ width: e.target.value === "" ? NaN : Number(e.target.value) })} />
+                  <span className="faint">×</span>
+                  <input type="number" aria-label="Height" value={Number.isFinite(form.height) ? form.height : ""} step={defaults?.divisibility || 16} min={128}
+                    onChange={(e) => setForm({ height: e.target.value === "" ? NaN : Number(e.target.value) })} />
+                  <button type="button" className="btn icon" title="Swap width and height" aria-label="Swap width and height"
+                    onClick={() => setForm({ width: form.height, height: form.width })}>⇄</button>
+                </div>
+              ) : null}
+              {mode !== "shape" && (
+                <span className="help">
+                  {mode === "custom" ? `Sizes are rounded down to multiples of ${defaults?.divisibility || 16}.`
+                    : matched ? `Same shape as ${base(matched.path)} (${matched.width}×${matched.height}).`
+                      : `Choose an input image above to match its shape; until then this is ${form.shape}.`}
+                </span>
+              )}
+            </div>}
+            {!music && (mode !== "custom" || video) && (
+              <div className="grid cols-2">
+                {mode !== "custom" && (
+                  <Num label="Megapixels" info={INFO.megapixels} v={form.mp} on={(n) => setForm({ mp: n })} step={0.05} min={0.05}
+                    help={!(form.mp > 0) ? "Above 0, such as 1 or 0.75"
+                      : Math.max(width, height) > MAX_SIDE ? `Too big: a side can be at most ${MAX_SIDE} pixels`
+                        : `${width} × ${height} · ${((width * height) / MP).toFixed(2)} MP`} />
+                )}
+                {video && <Num label="Frames" v={form.frames} on={(n) => setForm({ frames: n })} min={1} max={241} help="24 fps" />}
+              </div>
+            )}
             <div className="grid cols-2">
+              {music && <Num label="Duration (seconds)" info={INFO.seconds} v={form.seconds} on={(n) => setForm({ seconds: n })} min={5} max={360} />}
+              <Num label="Steps" v={form.steps} on={(n) => setForm({ steps: n })} min={1} max={200} />
+              <Num label={music ? "Token CFG (1 = off)" : "CFG (1 = off)"} info={music ? INFO.tokenCfg : INFO.cfg} v={form.cfg} on={(n) => setForm({ cfg: n })} step={music ? 0.01 : 0.5} min={0}
+                disabled={defaults ? !defaults.supports_samplers && !music : false} />
               <label className="field">
-                <span>Sampler<Info text={INFO.sampler} /></span>
-                <select value={form.sampler} onChange={(e) => setForm({ sampler: e.target.value })}>
-                  {Object.entries(status?.samplers || {}).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-                </select>
+                <span>Seed</span>
+                <div className="sbx-seed">
+                  <input type="number" value={form.seed} disabled={form.random_seed} onChange={(e) => setForm({ seed: Number(e.target.value) })} />
+                  <button className={"btn icon" + (form.random_seed ? " primary" : "")} title={form.random_seed ? "A random seed each time: on" : "A random seed each time: off"}
+                    aria-pressed={form.random_seed} onClick={() => setForm({ random_seed: !form.random_seed })}><IconRefresh /></button>
+                </div>
               </label>
-              <label className="field">
-                <span>Scheduler<Info text={INFO.scheduler} /></span>
-                <select value={form.scheduler} onChange={(e) => setForm({ scheduler: e.target.value })}>
-                  {Object.entries(status?.schedulers || {}).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-                </select>
-              </label>
+              <Num label={music ? "Songs per run" : video ? "Videos per run" : "Images per run"} info={INFO.count} v={form.count} on={(n) => setForm({ count: n })} min={1} max={8} />
             </div>
-          )}
-
-          <div className="grid cols-2">
-            {defaults?.supports_samplers !== false && (
+            {form.cfg > 1 && defaults?.supports_samplers && (
               <label className="field">
-                <span>Shift<Info text={INFO.shift} /></span>
-                <input value={form.shift} placeholder="model's own" onChange={(e) => setForm({ shift: e.target.value })} />
+                <span>Negative prompt<Info text={INFO.negative} /></span>
+                <input value={form.negative} onChange={(e) => setForm({ negative: e.target.value })} />
               </label>
             )}
-            <Num label={music ? "Songs per run" : "Images per run"} v={form.count} on={(n) => setForm({ count: n })} min={1} max={8} help="Seeds count up from the seed" />
           </div>
-          <div className="grid cols-2">
-            {reserve ? (
-              <label className="field">
-                <span>GPU</span>
-                <select value={gpu ?? ""} onChange={(e) => setForm({ gpu: Number(e.target.value) })}>
-                  {gpus.map((g) => <option key={g.index} value={g.index} disabled={training.has(g.index)}>GPU {g.index}{training.has(g.index) ? " — training" : ""}</option>)}
-                </select>
-                <span className="help">The Sandbox holds this GPU; training uses the others until you release it.</span>
-              </label>
-            ) : <div />}
+
+          <div className="sbx-advanced">
+            <div className="sbx-adv-head">
+              <button type="button" className="sbx-adv-toggle" aria-expanded={advanced} onClick={() => openAdvanced(!advanced)}>
+                <IconRight /> Advanced settings
+              </button>
+              <Info text={INFO.advanced} />
+              {!advanced && fit === "over" && <span className="pill failed" title="Open Advanced settings and raise Layer offloading">Won't fit in VRAM</span>}
+              {!advanced && fit === "tight" && <span className="pill warn" title="Close to the GPU's memory: see Layer offloading">Tight on VRAM</span>}
+            </div>
+            {advanced && (
+              <div className="stack sbx-adv-body">
+                {defaults?.supports_samplers === false ? (
+                  <div className="help">{music
+                    ? "The composer writes the song token by token (Token CFG guides it; the release uses 1.01 with planning off), then the steps above render it with the release's midpoint sampler; sampler and scheduler don't apply."
+                    : "This model uses its released sampler (joint video + audio); sampler and scheduler don't apply."}</div>
+                ) : <>
+                  <div className="grid cols-2">
+                    <label className="field">
+                      <span>Sampler<Info text={INFO.sampler} /></span>
+                      <select value={form.sampler} onChange={(e) => setForm({ sampler: e.target.value })}>
+                        {Object.entries(status?.samplers || {}).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+                      </select>
+                    </label>
+                    <label className="field">
+                      <span>Scheduler<Info text={INFO.scheduler} /></span>
+                      <select value={form.scheduler} onChange={(e) => setForm({ scheduler: e.target.value })}>
+                        {Object.entries(status?.schedulers || {}).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+                      </select>
+                    </label>
+                  </div>
+                  <div className="grid cols-2">
+                    <label className="field">
+                      <span>Shift<Info text={INFO.shift} /></span>
+                      <input value={form.shift} placeholder="model's own" onChange={(e) => setForm({ shift: e.target.value })} />
+                    </label>
+                  </div>
+                </>}
+                {reserve && (
+                  <label className="field">
+                    <span>GPU</span>
+                    <select value={gpu ?? ""} onChange={(e) => setForm({ gpu: Number(e.target.value) })}>
+                      {gpus.map((g) => <option key={g.index} value={g.index} disabled={training.has(g.index)}>GPU {g.index}{training.has(g.index) ? " — training" : ""}</option>)}
+                    </select>
+                    <span className="help">The Sandbox holds this GPU; training uses the others until you release it.</span>
+                  </label>
+                )}
+                <OffloadControl proj={vram} value={offload} onChange={(n) => setForm({ offload: n })} gpu={gpuTarget(gpus, gpu)} compact ram={ram}
+                  lowVram={family?.streams_text_encoder ? { on: lowVram, onChange: (on) => setForm({ low_vram: on }) } : null} />
+              </div>
+            )}
           </div>
-          <OffloadControl proj={vram} value={offload} onChange={(n) => setForm({ offload: n })} gpu={gpuTarget(gpus, gpu)} compact ram={ram}
-            lowVram={family?.streams_text_encoder ? { on: lowVram, onChange: (on) => setForm({ low_vram: on }) } : null} />
 
           {blocked && <div className="error-box">{blocked}</div>}
-          <div className="row">
-            <button className="btn primary" disabled={!canGo} onClick={generate}><IconPlay /> {enhancing ? "Enhancing prompt…" : "Generate"}</button>
+          <div className="sbx-go">
+            <button className="btn primary lg" disabled={!canGo} onClick={generate} title="Ctrl+Enter">
+              <IconPlayFill /> {enhancing ? "Enhancing prompt…" : `Generate ${music ? "audio" : video ? (form.count > 1 ? "videos" : "video") : form.count > 1 || grid.on ? "images" : "image"}`}
+            </button>
             {active.length > 0 && (
-              <button className="btn" onClick={() => active.forEach((r) => api.post(`/api/sandbox/runs/${r.id}/cancel`).then(reload))}><IconStop /> Cancel{active.length > 1 ? ` ${active.length}` : ""}</button>
+              <button className="btn lg" onClick={() => active.forEach((r) => api.post(`/api/sandbox/runs/${r.id}/cancel`).then(reload))}><IconStop /> Cancel{active.length > 1 ? ` ${active.length}` : ""}</button>
             )}
-            <div className="spacer" />
-            <span className="faint small">Ctrl+Enter</span>
           </div>
         </div>
 
         <div className="stack sbx-output">
-          <div className="card card-pad sbx-session">
-            <div className="row">
-              <StatusPill status={session?.state === "busy" ? "running" : session?.state === "off" || !session ? "stopped" : session.state === "ready" ? "completed" : "queued"} />
-              <span className="muted small">
-                {!session || session.state === "off" ? "Nothing loaded" :
-                  `GPU ${session.gpu} · ${session.message || session.state}` +
-                  (session.state === "ready" && session.idle_seconds != null && status?.idle_minutes ? ` · releases after ${status.idle_minutes} min idle` : "")}
+          <div className="card sbx-session">
+            <div className="sbx-session-row">
+              <span className={`sbx-dot ${session?.state || "off"}`} aria-hidden="true" />
+              <strong>{SESSION[session?.state || "off"]}</strong>
+              <span className="sbx-session-sep" aria-hidden="true" />
+              <span className="muted ellipsis">
+                {!session || session.state === "off" ? "Loads when generation starts"
+                  : `GPU ${session.gpu}` + (session.state === "ready" ? (status?.idle_minutes ? ` · unloads after ${status.idle_minutes} min idle` : "")
+                    : session.message ? ` · ${session.message}` : "")}
               </span>
-              <div className="spacer" />
+              <span className="spacer" />
               {session && session.state !== "off" && (
                 <button className="btn sm" onClick={() => api.post("/api/sandbox/release").then(reload)} title="Unload the models and free the GPU">Release GPU</button>
               )}
             </div>
             {progress && progress.total > 0 && <>
-              <div className="progress" style={{ marginTop: 10 }}><div style={{ width: `${(100 * progress.done) / progress.total}%` }} /></div>
+              <div className="progress" style={{ marginTop: 12 }}><div style={{ width: `${(100 * progress.done) / progress.total}%` }} /></div>
               <StepCounter p={progress} />
             </>}
           </div>
 
           {current ? (
             <div className="card card-pad">
-              <div className="row" style={{ marginBottom: 12 }}>
+              <div className="card-head">
                 <StatusPill status={current.status === "done" ? "completed" : current.status} />
-                <span className="ellipsis" style={{ fontWeight: 600 }} title={current.params.source_prompt || current.params.prompt}>{current.params.source_prompt || current.params.prompt}</span>
+                <h3>{current === runs[0] ? "Latest result" : `Run ${runNumber(current)}`}</h3>
                 {current.params.source_prompt && <span className="pill">enhanced</span>}
-                <div className="spacer" />
-                <button className="btn sm" onClick={() => reuse(current)}>Reuse settings</button>
+                <span className="spacer" />
+                {current.elapsed ? <span className="faint small" title="How long it took">{fmtDuration(current.elapsed)}</span> : null}
+                <button className="btn" onClick={() => reuse(current)}>Reuse settings</button>
               </div>
-              <div className="muted small" style={{ marginBottom: 12 }}>
-                {current.profile_name} · {workflows.find((w) => w.id === current.workflow)?.label} · {current.params.seconds != null
-                  ? `${current.params.seconds} s${current.params.lyrics ? " · with lyrics" : ""}` : `${current.params.width}×${current.params.height}`}
-                {current.params.frames > 1 ? ` · ${current.params.frames}f` : ""} · {current.params.steps} steps · {status?.samplers[current.params.sampler] || current.params.sampler}
-                {current.params.scheduler !== "default" ? ` · ${status?.schedulers[current.params.scheduler]}` : ""}
-                {current.params.shift != null ? ` · shift ${current.params.shift}` : ""}{current.params.cfg !== 1 ? ` · CFG ${current.params.cfg}` : ""}
-                {current.params.model ? ` · ${base(current.params.model)}` : ""}
-                {current.params.loras.map((l) => ` · ${base(l.path)} @ ${l.strength}`).join("")}
-                {current.params.grid ? ` · ${current.params.grid.job_name || "checkpoints"}: ${current.params.grid.checkpoints.length} × ${current.params.grid.strengths.length} strength${current.params.grid.strengths.length === 1 ? "" : "s"}` : ""}
-                {current.elapsed ? ` · ${fmtDuration(current.elapsed)}` : ""}
-              </div>
+              <p className="sbx-prompt">{current.params.source_prompt || current.params.prompt}</p>
               {current.params.source_prompt && (
                 <details className="sbx-enhanced-run">
                   <summary className="muted small">Enhanced prompt</summary>
                   <div className="small">{current.params.prompt}</div>
                 </details>
               )}
+              {current.params.model && (
+                <div className="muted small sbx-detail">Model: <span className="mono">{base(current.params.model)}</span></div>
+              )}
               {current.params.images.length > 0 && (
-                <div className="muted small" style={{ marginBottom: 12 }}>Images: <span className="mono">{current.params.images.map(base).join(", ")}</span></div>
+                <div className="muted small sbx-detail">Images: <span className="mono">{current.params.images.map(base).join(", ")}</span></div>
               )}
               {(current.params.refmods || []).length > 0 && (
-                <div className="muted small" style={{ marginBottom: 12 }}>RefMods: <span className="mono">{current.params.refmods!.map((r) => `${base(r.path)}${r.strength !== 1 ? ` @ ${r.strength}` : ""}`).join(", ")}</span></div>
+                <div className="muted small sbx-detail">RefMods: <span className="mono">{current.params.refmods!.map((r) => `${base(r.path)}${r.strength !== 1 ? ` @ ${r.strength}` : ""}`).join(", ")}</span></div>
               )}
               {(current.params.audio || []).length > 0 && (
-                <div className="muted small" style={{ marginBottom: 12 }}>Reference audio: <span className="mono">{current.params.audio!.map(base).join(", ")}</span></div>
+                <div className="muted small sbx-detail">Reference audio: <span className="mono">{current.params.audio!.map(base).join(", ")}</span></div>
               )}
-              {current.status === "failed" && <div className="error-box">{current.message}</div>}
+              {current.status === "failed" && <div className="error-box" style={{ marginBottom: 12 }}>{current.message}</div>}
               {current.report?.loras?.some((l) => l.matched < l.total) && (
                 <div className="help" style={{ marginBottom: 10 }}>
                   {current.report.loras.filter((l) => l.matched < l.total).map((l) => `${l.label}: ${l.matched} of ${l.total} layers matched this model`).join(" · ")}
                 </div>
               )}
-              <RunView run={current} onOpen={(src, v, audio) => setLight({ src, video: v, audio })} />
+              <RunView run={current} meta={runMeta(current)} onOpen={(src, v, audio) => setLight({ src, video: v, audio })} />
             </div>
           ) : (
-            <div className="empty"><strong>No generations yet</strong>Pick a profile, write a prompt and press Generate.</div>
+            <Empty icon={<IconSparkle />} title="No generations yet">Pick a profile, write a prompt and press Generate.</Empty>
           )}
 
           {runs.length > 0 && (
             <div className="card card-pad">
-              <div className="row" style={{ marginBottom: 10 }}><strong>History</strong><span className="faint small">{runs.length}</span></div>
+              <div className="card-head"><h3>History</h3><span className="count-pill">{runs.length}</span></div>
               <div className="sbx-history">
                 {runs.map((r) => {
                   const first = r.outputs?.[0];
                   const thumb = first ? fileUrl(r, first.poster || first.file) : null;
+                  const p = r.params;
+                  const note = r.status !== "done" ? r.status.charAt(0).toUpperCase() + r.status.slice(1)
+                    : p.seconds != null ? fmtClock(p.seconds) : p.frames > 1 ? `${p.frames} frames` : `${p.width}×${p.height}`;
                   return (
-                    <div key={r.id} className={"sbx-thumb" + (r.id === current?.id ? " on" : "")} onClick={() => setSelected(r.id)} title={`${r.params.source_prompt || r.params.prompt}\n${fmtTime(r.created)}`}>
-                      {thumb ? <img src={thumb} alt="" loading="lazy" /> : <div className="sbx-wait">{r.status}</div>}
-                      {r.status !== "queued" && r.status !== "running" && (
-                        <button className="btn ghost icon danger" title="Delete" onClick={(e) => { e.stopPropagation(); api.del(`/api/sandbox/runs/${r.id}`).then(reload, (er) => toast(er.message, true)); }}><IconTrash /></button>
-                      )}
+                    <div key={r.id} className={"sbx-thumb" + (r.id === current?.id ? " on" : "")} role="button" tabIndex={0}
+                      aria-pressed={r.id === current?.id} onClick={() => setSelected(r.id)} onKeyDown={(e) => e.key === "Enter" && setSelected(r.id)}
+                      title={`${p.source_prompt || p.prompt}\n${fmtTime(r.created)}`}>
+                      <div className="sbx-thumb-img">
+                        {thumb ? <img src={thumb} alt="" loading="lazy" className={first?.kind === "audio" ? "song" : undefined} /> : <div className="sbx-wait">…</div>}
+                        {r.status !== "queued" && r.status !== "running" && (
+                          <button className="btn ghost icon danger" title="Delete" onClick={(e) => { e.stopPropagation(); api.del(`/api/sandbox/runs/${r.id}`).then(reload, (er) => toast(er.message, true)); }}><IconTrash /></button>
+                        )}
+                      </div>
+                      <div className="sbx-thumb-name">Run {runNumber(r)}</div>
+                      <div className={"sbx-thumb-note" + (r.status === "failed" ? " err" : "")}>{note}</div>
                     </div>
                   );
                 })}

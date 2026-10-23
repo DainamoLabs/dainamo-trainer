@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { api, byFamily, fmtClock, q, type Family, type Profile } from "../api";
-import { IconCheck, IconFile, IconFolder, IconAlert, IconLeft, IconRight, IconUp, IconX } from "./icons";
+import { IconCheck, IconDownload, IconFile, IconFolder, IconAlert, IconLeft, IconMore, IconMute, IconPause, IconPlayFill, IconRight, IconUp, IconVolume, IconX } from "./icons";
 
 /** A profile <select>'s options, under a heading per family. */
 export function ProfileOptions({ profiles, families }: { profiles: Profile[]; families: Family[] }) {
@@ -17,15 +17,37 @@ export function ProfileOptions({ profiles, families }: { profiles: Profile[]; fa
 }
 
 // ---- modal ---------------------------------------------------------------
+const ARROWS: Record<string, number> = { ArrowLeft: -1, ArrowUp: -1, ArrowRight: 1, ArrowDown: 1 };
+
+/** A dialog. It takes the focus when it opens (a field or button in it with autoFocus keeps it) and gives it back
+ * when it closes; the arrow keys move between its footer's buttons and Enter presses the one in focus. Keys pressed
+ * in it stay in it, so the page behind (a lightbox's arrows, the clip editor's keys) doesn't act on them too. */
 export function Modal(props: { title: React.ReactNode; onClose: () => void; children: React.ReactNode; footer?: React.ReactNode; wide?: boolean }) {
+  const box = useRef<HTMLDivElement>(null);
+  const [opener] = useState(() => document.activeElement as HTMLElement | null); // before an autoFocus in it moves it
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && props.onClose();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [props.onClose]);
+  useEffect(() => {
+    if (box.current && !box.current.contains(document.activeElement)) box.current.focus();
+    return () => { if (opener && document.contains(opener)) opener.focus(); };
+  }, []);
+  const onKey = (e: React.KeyboardEvent) => {
+    e.stopPropagation();
+    if (e.key === "Escape") return props.onClose();
+    const by = ARROWS[e.key];
+    const at = document.activeElement;
+    const buttons = [...box.current!.querySelectorAll<HTMLButtonElement>(".modal-foot button:not(:disabled)")];
+    const i = buttons.indexOf(at as HTMLButtonElement);
+    if (!by || !buttons.length || (i < 0 && at !== box.current) || e.altKey || e.ctrlKey || e.metaKey) return;
+    e.preventDefault();
+    buttons[i < 0 ? (by > 0 ? 0 : buttons.length - 1) : (i + by + buttons.length) % buttons.length].focus();
+  };
   return (
     <div className="modal-bg" onMouseDown={(e) => e.target === e.currentTarget && props.onClose()}>
-      <div className={"modal" + (props.wide ? " wide" : "")}>
+      <div className={"modal" + (props.wide ? " wide" : "")} ref={box} tabIndex={-1} role="dialog" aria-modal="true" onKeyDown={onKey}>
         <div className="modal-head">
           <h3>{props.title}</h3>
           <div className="spacer" />
@@ -260,7 +282,7 @@ export function Num(props: { label: string; v: number; on: (n: number) => void; 
 }
 
 export function StatusPill({ status }: { status: string }) {
-  return <span className={"pill " + status}><span className="dot" />{status}</span>;
+  return <span className={"pill " + status}><span className="dot" />{status.charAt(0).toUpperCase() + status.slice(1)}</span>;
 }
 
 /** A song: its spectrogram (``poster``) above a player, and a link to its score (ABC) when it has one. */
@@ -273,6 +295,40 @@ export function AudioCard({ src, poster, score, autoPlay, title }: {
       {poster && <img src={poster} alt="Spectrogram" loading="lazy" />}
       <audio src={src} controls autoPlay={autoPlay} preload={autoPlay ? "auto" : "none"} />
       {score && <a className="small" href={score} target="_blank" rel="noreferrer">Score (ABC notation)</a>}
+    </div>
+  );
+}
+
+/** A song's player: play, where it is of how long, seeking, mute and (with ``download``, the file's name) download.
+ * Starting one pauses any other playing on the page. */
+export function AudioPlayer({ src, download }: { src: string; download?: string }) {
+  const ref = useRef<HTMLAudioElement>(null);
+  const [playing, setPlaying] = useState(false);
+  const [at, setAt] = useState(0);
+  const [length, setLength] = useState(0);
+  const [muted, setMuted] = useState(false);
+  const toggle = () => {
+    const a = ref.current;
+    if (!a) return;
+    if (a.paused) {
+      document.querySelectorAll("audio").forEach((o) => o !== a && o.pause());
+      a.play().catch(() => setPlaying(false));
+    } else a.pause();
+  };
+  const pct = length ? (100 * at) / length : 0;
+  return (
+    <div className="player" onClick={(e) => e.stopPropagation()}>
+      <audio ref={ref} src={src} preload="metadata" muted={muted} onLoadedMetadata={(e) => setLength(e.currentTarget.duration || 0)}
+        onTimeUpdate={(e) => setAt(e.currentTarget.currentTime)} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} />
+      <button type="button" className="player-play" onClick={toggle} aria-label={playing ? "Pause" : "Play"}>{playing ? <IconPause /> : <IconPlayFill />}</button>
+      <span className="player-time">{fmtClock(at)} / {fmtClock(length)}</span>
+      <input type="range" className="player-seek" min={0} max={length || 1} step={0.1} value={at} aria-label="Position"
+        style={{ "--p": `${pct}%` } as React.CSSProperties}
+        onChange={(e) => { const t = Number(e.target.value); if (ref.current) ref.current.currentTime = t; setAt(t); }} />
+      <button type="button" className="player-btn" onClick={() => setMuted(!muted)} aria-label={muted ? "Unmute" : "Mute"} title={muted ? "Unmute" : "Mute"}>
+        {muted ? <IconMute /> : <IconVolume />}
+      </button>
+      {download && <a className="player-btn" href={src} download={download} aria-label="Download" title="Download"><IconDownload /></a>}
     </div>
   );
 }
@@ -392,8 +448,9 @@ export function ConfirmDialog(props: {
   return (
     <Modal title={props.title} onClose={props.onClose} footer={
       <>
-        <button className="btn ghost" onClick={props.onClose}>Cancel</button>
-        <button className={"btn " + (props.danger ? "danger" : "primary")} onClick={() => { props.onConfirm(checked); props.onClose(); }}>{props.confirmLabel}</button>
+        {/* in focus to start with: Cancel where confirming deletes something, so a stray Enter doesn't */}
+        <button className="btn ghost" autoFocus={props.danger} onClick={props.onClose}>Cancel</button>
+        <button className={"btn " + (props.danger ? "danger" : "primary")} autoFocus={!props.danger} onClick={() => { props.onConfirm(checked); props.onClose(); }}>{props.confirmLabel}</button>
       </>
     }>
       <div className="stack">
@@ -402,4 +459,111 @@ export function ConfirmDialog(props: {
       </div>
     </Modal>
   );
+}
+
+/** A list with nothing in it yet: an icon, what's missing, what to do about it, and the button that does it. */
+export function Empty({ icon, title, children, action }: { icon: React.ReactNode; title: string; children?: React.ReactNode; action?: React.ReactNode }) {
+  return (
+    <div className="empty empty-lg">
+      <div className="empty-icon" aria-hidden="true">{icon}</div>
+      <strong>{title}</strong>
+      {children && <p>{children}</p>}
+      {action}
+    </div>
+  );
+}
+
+/** Picking several cards at once: Select starts it; Done (or Esc) ends it and forgets what was picked. */
+export function useSelection() {
+  const [on, setOn] = useState(false);
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const stop = () => { setOn(false); setPicked(new Set()); };
+  const toggle = (id: string) => setPicked((s) => {
+    const next = new Set(s);
+    if (!next.delete(id)) next.add(id);
+    return next;
+  });
+  useEffect(() => {
+    if (!on) return;
+    const key = (e: KeyboardEvent) => { if (e.key === "Escape" && !document.querySelector(".modal-bg")) stop(); };
+    window.addEventListener("keydown", key);
+    return () => window.removeEventListener("keydown", key);
+  }, [on]);
+  return { on, start: () => setOn(true), stop, picked, toggle, set: (ids: string[]) => setPicked(new Set(ids)) };
+}
+export type Selection = ReturnType<typeof useSelection>;
+
+/** The bar while picking: how many are picked (of ``ids``, those that can be), all or none, and what to do. */
+export function SelectBar({ sel, ids, noun, info, children }: { sel: Selection; ids: string[]; noun: [string, string]; info?: React.ReactNode; children: React.ReactNode }) {
+  const n = ids.filter((id) => sel.picked.has(id)).length;
+  const all = ids.length > 0 && n === ids.length;
+  return (
+    <div className="select-bar">
+      <label className="check" title={all ? "Select none" : "Select all"}>
+        <input type="checkbox" checked={all} ref={(el) => { if (el) el.indeterminate = n > 0 && !all; }} onChange={() => sel.set(all ? [] : ids)} disabled={!ids.length} />
+        <span>{n ? `${n} ${n === 1 ? noun[0] : noun[1]} selected` : `Select ${noun[1]}`}</span>
+      </label>
+      {n > 0 && info}
+      <span className="spacer" />
+      {children}
+      <button className="btn ghost" onClick={sel.stop}>Done</button>
+    </div>
+  );
+}
+
+export type MenuItem = { label: string; icon?: React.ReactNode; onClick: () => void; danger?: boolean; disabled?: boolean; title?: string };
+
+/** A "⋯" button and the actions it opens: Up and Down move between them, Escape or a click elsewhere closes it. Clicks
+ * in it don't reach what it's in (a card that opens on a click). */
+export function Menu({ label, items, boxed }: { label: string; items: MenuItem[]; boxed?: boolean }) {
+  const [open, setOpen] = useState(false);
+  const box = useRef<HTMLDivElement>(null);
+  const button = useRef<HTMLButtonElement>(null);
+  const options = () => [...(box.current?.querySelectorAll<HTMLButtonElement>(".menu-list button:not(:disabled)") || [])];
+  useEffect(() => {
+    if (!open) return;
+    options()[0]?.focus();
+    const away = (e: PointerEvent) => { if (!box.current?.contains(e.target as Node)) setOpen(false); };
+    document.addEventListener("pointerdown", away);
+    return () => document.removeEventListener("pointerdown", away);
+  }, [open]);
+  const onKey = (e: React.KeyboardEvent) => {
+    if (!open) return;
+    if (e.key === "Escape" || e.key === "Tab") {
+      if (e.key === "Escape") e.preventDefault();
+      e.stopPropagation();
+      setOpen(false);
+      button.current?.focus();
+    } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const all = options();
+      const i = all.indexOf(document.activeElement as HTMLButtonElement);
+      all[(i + (e.key === "ArrowDown" ? 1 : all.length - 1)) % all.length]?.focus();
+    }
+  };
+  return (
+    <div className="menu" ref={box} onKeyDown={onKey} onClick={(e) => e.stopPropagation()}>
+      <button ref={button} className={(boxed ? "btn icon lg menu-btn boxed" : "btn ghost icon menu-btn") + (open ? " on" : "")} aria-label={label} title={label} aria-haspopup="menu" aria-expanded={open}
+        onClick={() => setOpen(!open)}><IconMore /></button>
+      {open && (
+        <div className="menu-list" role="menu">
+          {items.map((it) => (
+            <button key={it.label} role="menuitem" className={it.danger ? "danger" : ""} disabled={it.disabled} title={it.title}
+              onClick={() => { button.current?.focus(); setOpen(false); it.onClick(); }}>{it.icon}{it.label}</button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** "a, b and 3 more" */
+/** A family's name on a badge: "MiniMax H3 (video + audio)" reads "MiniMax H3 · Video + audio". */
+export function familyBadge(label: string) {
+  return label.replace(/\s*\((.+)\)$/, (_, s: string) => ` · ${s[0].toUpperCase()}${s.slice(1)}`);
+}
+
+export function someNames(names: string[], max = 4): string {
+  if (names.length <= max) return names.length > 1 ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}` : names[0] || "";
+  return `${names.slice(0, max).join(", ")} and ${names.length - max} more`;
 }

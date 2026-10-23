@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
-import { api, byFamily, type Family, type ModelsOverview, type Profile } from "../api";
+import { api, byFamily, type Family, type ModelsOverview, type Profile, type ProfileField } from "../api";
 import { go } from "../App";
-import { IconCopy, IconDownload, IconEdit, IconLayers, IconPlus, IconTrash } from "../components/icons";
+import { IconCopy, IconDownload, IconEdit, IconLayers, IconPlus, IconSearch, IconTrash } from "../components/icons";
 import { DownloadDialog } from "../components/ModelDownload";
-import { Modal, PathInput, usePoll, useToast } from "../components/ui";
+import { ConfirmDialog, Empty, Menu, Modal, PathInput, familyBadge, usePoll, useToast } from "../components/ui";
 import MergeExtract from "./MergeExtract";
 import ModelFiles from "./ModelFiles";
 
@@ -153,27 +153,96 @@ function ProfileEditor(props: { families: Family[]; initial: Partial<Profile> | 
   );
 }
 
+const FAMILY_FILTER = "dainamo.profiles.family";
+
+/** A setting as a card shows it: a file's name, "None" for no file, a plain word capitalized ("off" reads "Off"). */
+function shownValue(f: ProfileField, v: unknown) {
+  const s = String(v ?? "").trim();
+  if (!s) return "None";
+  if (f.kind === "path") return s.split(/[\\/]/).pop() || s;
+  return /^[a-z]+$/.test(s) ? s[0].toUpperCase() + s.slice(1) : s;
+}
+
+function ProfileCard({ p, fam, onEdit, onDuplicate, onDelete }: {
+  p: Profile; fam?: Family; onEdit: () => void; onDuplicate: () => void; onDelete: () => void;
+}) {
+  return (
+    <div className="card pf-card">
+      <div className="pf-head">
+        <div className="pf-icon"><IconLayers /></div>
+        <div className="pf-title">
+          <h3 className="ellipsis" title={p.name}>{p.name}</h3>
+          <span className="pf-family" title={fam?.label || p.family}>{familyBadge(fam?.label || p.family)}</span>
+        </div>
+        <button className="btn pf-edit" onClick={onEdit}><IconEdit /> Edit</button>
+        <Menu boxed label={`More for ${p.name}`} items={[
+          { label: "Duplicate", icon: <IconCopy />, onClick: onDuplicate },
+          { label: "Delete", icon: <IconTrash />, danger: true, onClick: onDelete },
+        ]} />
+      </div>
+      {fam ? fam.profile_fields.filter((f) => f.kind === "path" || f.kind === "select").map((f) => {
+        const v = p.data[f.key] ?? f.default;
+        return (
+          <div className="pf-row" key={f.key}>
+            <span>{f.label.replace(" (CLIP)", "")}</span>
+            <span className="mono ellipsis" title={String(v ?? "")}>{shownValue(f, v)}</span>
+          </div>
+        );
+      }) : <p className="help">This version of Dainamo doesn't train {p.family}.</p>}
+    </div>
+  );
+}
+
 export default function Profiles({ families, view }: { families: Family[]; view: string }) {
   view = ["files", "merge"].includes(view) ? view : "";
   const toast = useToast();
   const [profiles, reload] = usePoll<Profile[]>("/api/profiles", 0);
   const [editing, setEditing] = useState<Partial<Profile> | null | undefined>(undefined);
+  const [deleting, setDeleting] = useState<Profile | null>(null);
+  const [search, setSearch] = useState("");
+  const [family, setFamilyState] = useState(() => {
+    try {
+      return localStorage.getItem(FAMILY_FILTER) || "";
+    } catch {
+      return "";
+    }
+  });
+  const setFamily = (f: string) => {
+    setFamilyState(f);
+    try {
+      localStorage.setItem(FAMILY_FILTER, f);
+    } catch { /* not kept */ }
+  };
 
   const remove = async (p: Profile) => {
-    if (!confirm(`Delete profile "${p.name}"? Model files are not touched.`)) return;
-    await api.del(`/api/profiles/${p.id}`);
-    toast("Profile deleted");
+    setDeleting(null);
+    try {
+      await api.del(`/api/profiles/${p.id}`);
+      toast(`Deleted profile "${p.name}"`);
+    } catch (e: any) {
+      toast(e.message, true);
+    }
     reload();
   };
 
+  // in family order, so a family's profiles sit together
+  const groups = byFamily(profiles || [], families);
+  const fam = groups.some((g) => g.id === family) ? family : ""; // a remembered family with no profiles left shows all
+  const words = search.toLowerCase().split(/\s+/).filter(Boolean);
+  const shown = groups.filter((g) => !fam || g.id === fam).flatMap((g) => g.profiles).filter((p) => {
+    // a profile's name, its family, and its files' names: which profiles use this file?
+    const files = Object.values(p.data).map((v) => String(v ?? "").split(/[\\/]/).pop());
+    return words.every((w) => [p.name, groups.find((g) => g.id === p.family)?.label, ...files].join(" ").toLowerCase().includes(w));
+  });
+
   return (
-    <div className="page">
+    <div className="page profiles">
       <div className="page-head">
         <div>
           <h1>Profiles</h1>
-          <p>A profile is a model setup: which diffusion model, text encoder and VAE files to train with. ComfyUI model files work directly.</p>
+          <p>Manage the model files and components used for training.</p>
         </div>
-        <button className="btn primary" onClick={() => setEditing(null)} disabled={!families.length}><IconPlus /> New profile</button>
+        <button className="btn primary lg" onClick={() => setEditing(null)} disabled={!families.length}><IconPlus /> New profile</button>
       </div>
 
       <div className="view-tabs" role="tablist" aria-label="Profiles">
@@ -189,55 +258,53 @@ export default function Profiles({ families, view }: { families: Family[]; view:
       {view === "merge" && <MergeExtract families={families} />}
 
       {view === "" && profiles && profiles.length === 0 && (
-        <div className="empty">
-          <strong>No profiles yet</strong>
-          Create one to point Dainamo at your model files, e.g. the ones in your ComfyUI models folder. Model files shows which
-          you have, and downloads the rest.
-          <div className="row" style={{ marginTop: 14, justifyContent: "center" }}>
-            <button className="btn primary" onClick={() => setEditing(null)}><IconPlus /> New profile</button>
-            <button className="btn" onClick={() => go("profiles", "files")}>Model files</button>
+        <Empty icon={<IconLayers width={44} height={44} />} title="No profiles yet" action={
+          <div className="row" style={{ justifyContent: "center" }}>
+            <button className="btn primary lg" onClick={() => setEditing(null)} disabled={!families.length}><IconPlus /> New profile</button>
+            <button className="btn lg" onClick={() => go("profiles", "files")}>Model files</button>
           </div>
-        </div>
+        }>
+          A profile is a model setup: the diffusion model, text encoder and VAE files to train with. ComfyUI model files
+          work directly. Model files shows which you have, and downloads the rest.
+        </Empty>
       )}
 
-      {view === "" && byFamily(profiles || [], families).map((g) => (
-        <section className="pf-group" key={g.id}>
-          <div className="pf-group-head">
-            <h2>{g.label}</h2>
-            <span className="count">{g.profiles.length}</span>
+      {view === "" && !!profiles?.length && (
+        <>
+          <div className="ds-toolbar pf-toolbar">
+            <label className="search">
+              <IconSearch />
+              <input type="search" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search profiles…" aria-label="Search profiles"
+                onKeyDown={(e) => e.key === "Escape" && search && (e.stopPropagation(), setSearch(""))} />
+            </label>
+            <select value={fam} onChange={(e) => setFamily(e.target.value)} aria-label="Model family">
+              <option value="">All model families</option>
+              {groups.map((g) => <option key={g.id} value={g.id}>{g.label}</option>)}
+            </select>
           </div>
-          <div className="grid cols-2">
-            {g.profiles.map((p) => {
-              const fam = families.find((f) => f.id === p.family);
-              return (
-                <div className="card card-pad" key={p.id}>
-                  <div className="row" style={{ marginBottom: 12 }}>
-                    <div className="ds-cover" style={{ width: 40, height: 40, color: "var(--accent)" }}><IconLayers width={20} /></div>
-                    <div style={{ minWidth: 0 }}>
-                      <div style={{ fontWeight: 600, fontSize: 15 }} className="ellipsis">{p.name}</div>
-                    </div>
-                    <div className="spacer" />
-                    <button className="btn ghost icon" title="Duplicate" onClick={() => setEditing({ name: p.name + " copy", family: p.family, data: { ...p.data } })}><IconCopy /></button>
-                    <button className="btn ghost icon" title="Edit" onClick={() => setEditing(p)}><IconEdit /></button>
-                    <button className="btn ghost icon danger" title="Delete" onClick={() => remove(p)}><IconTrash /></button>
-                  </div>
-                  {fam?.profile_fields.filter((f) => f.kind === "path" || f.kind === "select").map((f) => (
-                    <div className="kv" key={f.key}>
-                      <span>{f.label}</span>
-                      <span className="mono ellipsis" title={String(p.data[f.key] || "")} style={{ maxWidth: "70%" }}>
-                        {String(p.data[f.key] || "—").split("/").pop()}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              );
-            })}
+          {!shown.length && (
+            <div className="empty">
+              <strong>No profiles match</strong>
+              <button className="btn ghost" onClick={() => { setSearch(""); setFamily(""); }}>Clear the search{fam ? " and filter" : ""}</button>
+            </div>
+          )}
+          <div className="grid cols-2 pf-grid">
+            {shown.map((p) => (
+              <ProfileCard key={p.id} p={p} fam={families.find((f) => f.id === p.family)}
+                onEdit={() => setEditing(p)}
+                onDuplicate={() => setEditing({ name: p.name + " copy", family: p.family, data: { ...p.data } })}
+                onDelete={() => setDeleting(p)} />
+            ))}
           </div>
-        </section>
-      ))}
+        </>
+      )}
 
       {editing !== undefined && (
         <ProfileEditor families={families} initial={editing} onClose={() => setEditing(undefined)} onSaved={() => { setEditing(undefined); reload(); }} />
+      )}
+      {deleting && (
+        <ConfirmDialog title={`Delete ${deleting.name}`} danger confirmLabel="Delete" onClose={() => setDeleting(null)} onConfirm={() => remove(deleting)}
+          message="Delete this profile? Its model files aren't touched, and jobs made with it keep their settings." />
       )}
     </div>
   );

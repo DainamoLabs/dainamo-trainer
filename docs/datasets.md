@@ -6,10 +6,45 @@ A dataset is a folder of images, videos or songs. Link an existing folder or
 upload files. Each file's caption is a `.txt` file next to it with the same
 name. To write captions with a vision LLM, see [Captions](captions.md).
 
+A dataset's page shows its files in one of two views, and remembers the one
+you chose:
+
+- **Grid**: big cards, 24 to a page. A song plays on its card. **Edit
+  caption** edits it in place; Ctrl/Cmd+Enter or clicking away saves, Esc
+  cancels. A card's **⋯** enlarges the file, copies its path or deletes it.
+- **List**: smaller cards, every file on one page. Click a caption to edit it.
+
+**Search** matches file names and captions, and **Missing captions** shows the
+files without one. On an uploaded dataset, **Select files** (or a card's
+checkbox) picks files to delete together. A linked folder's files are only
+deleted in the folder itself. The **⋯** beside Auto-Caption holds Split into
+clips, Export and Remove dataset.
+
 Click a file to enlarge it. The **Left/Right** arrow keys, or the on-screen
 buttons, move between files in the grid's order. You can edit the caption
 there: **Save**, or Ctrl/Cmd+Enter. Unsaved edits are saved when you move to
 another file or close.
+
+## The Datasets page
+
+Each dataset's card shows what it holds (images, videos, audio or a mix),
+whether its files were uploaded or it's a linked folder, how many files have a
+caption, and its trigger word and folder. **Search** matches names, trigger
+words and folders; the media menu shows only datasets with images, videos or
+audio.
+
+## Select, export and delete
+
+The **⋯** on a card exports or deletes that dataset. **Select** on the Datasets
+page puts a checkbox on each dataset (the ones the search shows). Then
+**Export** downloads the selected datasets as one .zip, with a folder for each.
+Each folder holds the dataset's files in their subfolders, each file's caption,
+the reference images, and a split's clip list. Nothing is compressed again, so
+the download starts at once. **Put the trigger word in each caption** writes the
+captions as training reads them: Dainamo adds the trigger word when it trains,
+but other trainers read captions as they are. **Delete** removes the selected
+datasets. Linked folders are left alone; uploaded files are deleted only if you
+tick the box. Esc or **Done** leaves Select.
 
 ## Reference images
 
@@ -20,7 +55,9 @@ is the result and its caption is the instruction.
 
 ## Health check
 
-**Health check** looks for problems for a chosen model and resolution:
+**Dataset health check**, folded under the dataset's counts until you open it
+(**Configure check**), looks for problems for a chosen model and resolution.
+Folded, it still shows how the last check went:
 
 - unreadable files;
 - images and clips smaller than the resolution. Files are never upscaled, so
@@ -49,9 +86,9 @@ last edit can be undone.
 
 A job trains only the start of each clip, up to the clip length (39 frames,
 1.6 s, by default for MiniMax H3; with Auto, up to 10 s), so most of a long
-video is never used. **Split into clips**, on a dataset with videos, makes a new
-dataset with each video cut into clips a job trains on whole. The original is
-left as it is.
+video is never used. **Split into clips**, in the **⋯** menu of a dataset with
+videos, makes a new dataset with each video cut into clips a job trains on
+whole. The original is left as it is.
 
 - **Clip length**: pick a video profile, GPU, resolution, offload and Low VRAM.
   The dialog lists each clip length the model takes (MiniMax H3: 17n + 5

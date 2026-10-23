@@ -5,7 +5,13 @@
 A profile names the files to train with: the diffusion model, text encoder, VAE
 and an optional training adapter. Any precision and file name works. The form
 reads each file's tensors, so a wrong file is caught before training. Profiles
-are grouped by model family, here and in every profile dropdown.
+are grouped by model family in every profile dropdown.
+
+Each profile's card shows its family and files. **Search** matches profile
+names, families and file names, so it finds the profiles that use a file; the
+family menu shows one family's profiles. A card's **⋯** duplicates or deletes
+the profile. Deleting leaves the model files, and jobs made with it keep their
+settings.
 
 Each file field has a **Download** button, and lists matching files on this
 machine when it's empty or the file is wrong. You can save the profile while its
@@ -24,20 +30,26 @@ extracts them from finetuned models.
 ## Model files
 
 **Model files**, the Profiles page's second tab, shows what each family needs
-and which of those files you have. It looks in the ComfyUI models folder set in
-**Settings → Model files** (`diffusion_models` or `unet`, `text_encoders` or
-`clip`, `vae`, `loras`, `checkpoints`) and at the files your profiles use. Files
-are recognised by their contents, whatever they're called. Until the folder is
-set, only your profiles' files are searched; **Use this folder** sets it to the
-one they're in.
+and which of those files you have. It looks in the ComfyUI models folder
+(`diffusion_models` or `unet`, `text_encoders` or `clip`, `vae`, `loras`,
+`checkpoints`) and at the files your profiles use. Files are recognised by their
+contents, whatever they're called.
 
-**Create profile** starts a profile with a family's files filled in.
+**Model folder**, at the top, sets that folder (as does **Settings → Model
+files**). Until it's set, only your profiles' files are searched, and it offers
+the folder they're in: **Use this folder** sets it, or **Choose another**.
+
+Each family's card says whether its required files were found. A field with
+more than one file found lists them under **View files**; hover a file for its
+path and precision. **Search** matches families, fields and file names, and the
+status menu shows only the families that are ready, missing files, or not
+checked. **Create profile** starts a profile with a family's files filled in.
 
 ### Downloads
 
-**Download** gets a file from Hugging Face in a precision Dainamo can read (the
-recommended one is marked), into the models folder's subfolder for its kind, so
-ComfyUI sees it too. You can choose another folder.
+The download button beside a field gets a file from Hugging Face in a precision
+Dainamo can read (the recommended one is marked), into the models folder's
+subfolder for its kind, so ComfyUI sees it too. You can choose another folder.
 
 - Files come from a pinned commit of their repo, so a later change to the repo
   can't swap them.

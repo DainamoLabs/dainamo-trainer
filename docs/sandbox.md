@@ -16,7 +16,7 @@ The Sandbox generates with a profile and LoRAs, to test them.
 - Reference-to-Video with MiniMax H3 also takes [RefMods](refmods.md) and
   reference audio.
 
-**Compare with base** renders each seed again without the LoRAs. **Compare
+**Compare with base model** renders each seed again without the LoRAs. **Compare
 checkpoints** renders one prompt and seed with each of a job's chosen
 checkpoints (up to 12) at each strength (up to 6), optionally with the base
 model.
@@ -25,6 +25,17 @@ model.
 rewrite the prompt in detail before generating, looking at the input images when
 the model can see. The rewrite is reused while the prompt, seed, workflow and
 images stay the same. Its instructions are edited in Settings.
+
+**Generation** holds the size, steps, CFG, seed (the button beside it turns on
+a new random one each run) and how many to make per run. **Advanced settings** holds
+the sampler, scheduler and shift, the GPU and layer offloading; it stays shut
+unless you open it, and when shut it warns **Won't fit in VRAM** or **Tight on
+VRAM** if the offloading setting needs a look. Ctrl+Enter generates.
+
+The latest run shows each seed with the LoRAs beside the base model, if
+compared. **History** keeps every run, newest first, numbered in the order they
+were made: click one to see it again, and **Reuse settings** puts its settings
+back in the form.
 
 ## GPUs
 
@@ -35,4 +46,4 @@ running or queued, and a job ready to start makes it unload after the current
 generation.
 
 It has the same layer offloading slider and Low VRAM switch as Create Job
-([Memory](memory.md)).
+([Memory](memory.md)), under Advanced settings.

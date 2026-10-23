@@ -147,7 +147,6 @@ export function TopBar({ tab, arg, jobs, gpus, waiting }: { tab: Tab; arg: strin
           </a>
         ) : null}
 
-        <span className="tb-sep" aria-hidden="true" />
         <a className={`tb-icon${tab === "settings" ? " active" : ""}`} href="#/settings" aria-label="Settings" title="Settings"
           aria-current={tab === "settings" ? "page" : undefined}><IconSettings /></a>
         <a className="btn primary tb-new" href="#/create" aria-current={tab === "create" ? "page" : undefined}><IconPlus /><span className="tb-new-label">New job</span></a>
