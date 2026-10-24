@@ -1,4 +1,7 @@
-"""``python -m dainamo [--host 127.0.0.1] [--port 7865] [--no-browser] [--password PW | --no-auth] [--new-key]``"""
+"""``python -m dainamo [--host 127.0.0.1] [--port 7865] [--browser] [--password PW | --no-auth] [--new-key]``
+
+Starts the server and prints the link to open. ``--browser`` opens it in the default browser too; ``--no-browser``
+(the old default's switch) is still accepted and does nothing."""
 
 import argparse
 import os
@@ -24,7 +27,8 @@ def main():
     ap.add_argument("--host", default="127.0.0.1",
                     help="use 0.0.0.0 to reach it from other machines (sign-in is then required)")
     ap.add_argument("--port", type=int, default=7865)
-    ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--browser", action="store_true", help="also open the link in your browser")
+    ap.add_argument("--no-browser", action="store_true", help=argparse.SUPPRESS)  # the old default; kept for scripts
     ap.add_argument("--password", default=os.environ.get("DAINAMO_PASSWORD"),
                     help="require this password (default with --host 0.0.0.0: a generated access key)")
     ap.add_argument("--no-auth", action="store_true",
@@ -59,8 +63,8 @@ def main():
     if not loopback:
         print("Warning: Add from URL (experimental) works from other machines too: anyone who can use Dainamo can "
               "make this machine download from any web address, including ones on your local network.", flush=True)
-    print(f"Dainamo Trainer → {local}", flush=True)
-    if not args.no_browser:
+    print(f"Dainamo Trainer is running. Open {open_url} in your browser (Ctrl+C stops it).", flush=True)
+    if args.browser:
         threading.Timer(1.5, lambda: webbrowser.open(open_url)).start()
     uvicorn.run("dainamo.server.app:app", host=args.host, port=args.port, log_level="warning")
 

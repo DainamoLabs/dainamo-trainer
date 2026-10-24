@@ -14,10 +14,11 @@ MOSS-Image, Qwen-Image 2.1, LTX 2.5, MiniMax H3 and YuE2.
 ```bash
 ./launch.sh                 # Linux: first run creates .venv and builds the web UI
 launch.bat                  # Windows: the same (double-click it, or run it in a terminal)
-./launch.sh --port 7865 --host 0.0.0.0 --no-browser
+./launch.sh --port 7865 --host 0.0.0.0
 ```
 
-Then open http://127.0.0.1:7865.
+It prints the link to open, http://127.0.0.1:7865 by default. `--browser`
+opens it in your browser for you.
 
 You need Python 3.12 (or [uv](https://docs.astral.sh/uv/)), Node.js 18+ and
 ffmpeg. The launcher reinstalls packages when `requirements.txt` changes and
