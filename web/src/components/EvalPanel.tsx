@@ -91,9 +91,9 @@ export function EvalPanel({ job, onOpen }: { job: JobDetail; onOpen: (src: strin
             const isRec = rec && e.file === rec.file;
             return (
               <div className={"eval-row" + (isRec ? " rec" : "")} key={e.step}>
-                <span className="mono">{e.step}{isRec && <span className="rec-star"> ★</span>}</span>
+                <span className="mono eval-step" data-label="Step">{e.step}{isRec && <span className="rec-star"> ★</span>}</span>
                 {picker && (
-                  <span className="eval-loss">
+                  <span className="eval-loss" data-label="Validation loss">
                     <span className="mono">{e.val_loss?.toFixed(5) ?? "—"}</span>
                     {e.val_loss != null && (
                       <span className="eval-bar"><span style={{ width: `${hi > lo ? 8 + (92 * (e.val_loss - lo)) / (hi - lo) : 50}%` }}
@@ -102,16 +102,16 @@ export function EvalPanel({ job, onOpen }: { job: JobDetail; onOpen: (src: strin
                   </span>
                 )}
                 {bleed && (
-                  <span>
+                  <span data-label="Concept bleed">
                     {e.bleed != null ? <span className={"pill bleed-" + bleedLevel(e.bleed, limit)}>{e.bleed.toFixed(0)}% · {bleedLevel(e.bleed, limit)}</span> : "—"}
                   </span>
                 )}
                 {bleed && (
-                  <span className={e.drift != null ? "bleed-text bleed-" + driftLevel(e.drift) : ""}>
+                  <span className={e.drift != null ? "bleed-text bleed-" + driftLevel(e.drift) : ""} data-label="Drift">
                     {e.drift != null ? `${e.drift.toFixed(0)}%` : "—"}
                   </span>
                 )}
-                <span className="ellipsis">
+                <span className="ellipsis eval-file" data-label="Checkpoint">
                   {e.file == null ? <span className="faint">base model</span>
                     : available.has(e.file) ? <a href={url("output", e.file)} download className="mono small">{e.file}</a>
                     : <span className="faint small" title="Removed by 'Keep last N saves'">{e.file} (deleted)</span>}

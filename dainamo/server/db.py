@@ -13,8 +13,9 @@ DATA_DIR = os.environ.get("DAINAMO_DATA", os.path.join(os.path.dirname(__file__)
 DATA_DIR = os.path.abspath(DATA_DIR)
 DB_PATH = os.path.join(DATA_DIR, "dainamo.db")
 
-# Auto-Caption styles: the prompt sent with each image. Datasets remember the style they were captioned with
-# (in caption_options, with the other Auto-Caption choices).
+# Auto-Caption styles: the prompt sent with each image, and optionally a system prompt and the style's own
+# temperature and max_tokens (left out: the caption provider's). Datasets remember the style they were captioned
+# with (in caption_options, with the other Auto-Caption choices).
 DEFAULT_CAPTION_PROMPT = ("Describe this image in one detailed paragraph for training an image generation model. "
                           "Describe the subject, setting, lighting, composition and style. Do not start with 'This image'.")
 # the "long" caption of MOSS-Image's own recaptioning prompt (its USERGUIDE.md), as plain text instead of JSON
@@ -26,6 +27,48 @@ MOSS_CAPTION_STYLE = {
               "describe its layout: line breaks, order, relative position, alignment, size, font, color and spacing. "
               "Don't mention watermarks. Reply with the paragraph only, without Markdown, and don't start with "
               "'This image'.",
+}
+# FLUX 3 Image Klein was trained on captions its prompt upsampler wrote. This is the upsampler's text-to-image
+# system prompt (dainamo/assets/flux3_pup_prompts.json, "t2i") turned to describing an image: the framing (expand a
+# short request) and the request-only rules (a target canvas, planning what's left open, inventing text) are
+# replaced, its other rules kept word for word (tests/test_db.py checks which). Its sampling too: temperature 0, with
+# max_tokens 1024 rather than its 3584, which leaves room for layout tables; a caption is 100 to 350 words.
+FLUX3_CAPTION_STYLE = {
+    "id": "flux3", "name": "FLUX 3 (prompt upsampler style)",
+    "prompt": "Write the caption for this image.",
+    "system": "You caption the training images of a text-to-image model. Describe the attached image as ONE "
+              "detailed, self-contained caption: the exact text the image model receives to generate it. Output "
+              "only the caption, with no greetings, explanations, refusals, questions, Markdown, headings, JSON, "
+              "coordinates, ids or angle-bracket tokens, and no quotes around it.\n\n"
+              "Fidelity: describe what the image shows. Keep every visible subject, attribute, count, spatial "
+              "relation, style cue and piece of wording; never guess, substitute or offer alternatives, and never "
+              "hedge. Add camera optics (depth of field, bokeh, blur) only when the image shows them. For a "
+              "photograph, open with the medium convention (\"Full-color outdoor photograph, ...\", \"Full-color "
+              "indoor photograph, ...\", \"Studio photograph, ...\", \"Close-up photograph, ...\"); keep "
+              "\"Photorealistic\" for renders. Give a photograph a few ordinary, non-ideal specifics drawn from the "
+              "scene's own objects instead of the stock-photo ideal. Do not invent names, brands, logos or "
+              "celebrities, or name people you recognize; keep the names written in the image. Drop appraisal and "
+              "sales vocabulary, and turn moods into observable physical facts. Time of day is lighting, not "
+              "rendered text.\n\n"
+              "Caption format: one continuous prose block in the generative voice, never \"this image shows\", \"we "
+              "can see\" or \"is visible\". Lead with medium and style, then scene, lighting and camera, then the "
+              "subjects with concrete colors, materials and state. Every person in focus gets an observable "
+              "profile: ethnicity, gender, age range, skin tone (\"fair skin\", \"brown skin\"), hair and clothing. "
+              "Make the layout reconstructable from words: frame-relative positions (frame-left, frame-right, "
+              "upper, lower, foreground, midground, background), sentence-initial anchors (\"On the left, ...\", "
+              "\"In the background, ...\"), relations (holds, faces, behind) and a consistent order; describe up to "
+              "about ten instances one by one, beyond that give the exact count and arrangement. Out-of-focus or "
+              "distant planes are shapes, colors and silhouettes, never identities or readable text, and the "
+              "background takes about a sixth of the caption. Be definite: no hedging adverbs, no quality or "
+              "emotion judgments, no closing sentence about mood; state negations as what is present. Rendered "
+              "text: transcribe every wording verbatim inside double quotes in its original language and script, "
+              "keep the line breaks of multi-line text, and give its typography, color and placement; name "
+              "canonical structures (calendar, keyboard, periodic table) exactly with their full layout. All prose "
+              "is English; only quoted text keeps its language. Typical length is 100 to 350 words, more for "
+              "complex scenes.\n\n"
+              "Output only the caption.",
+    "temperature": 0,
+    "max_tokens": 1024,
 }
 
 CAPTION_STYLES = [
@@ -42,6 +85,7 @@ CAPTION_STYLES = [
                "what happens over the clip in order, the camera movement, and the lighting and style. You only see "
                "frames, so don't describe sounds. Do not start with 'This video'."},
     MOSS_CAPTION_STYLE,
+    FLUX3_CAPTION_STYLE,
 ]
 
 DEFAULT_SETTINGS = {
@@ -124,6 +168,8 @@ MIGRATIONS: list = [
     lambda c: _add_caption_style(c, MOSS_CAPTION_STYLE),
     # 4: each job's folder in data/jobs, named after the job (older jobs have none: their folder is their id)
     "ALTER TABLE jobs ADD COLUMN folder TEXT;",
+    # 5: the FLUX 3 caption style, for caption styles saved before it was a default
+    lambda c: _add_caption_style(c, FLUX3_CAPTION_STYLE),
 ]
 
 

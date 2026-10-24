@@ -123,11 +123,16 @@ Upstream: https://github.com/black-forest-labs/flux-3-image-klein (the reference
   alpha-16 schedule follow `text_encoder.py`, `pipeline.py`, `sampling.py` and `autoencoder.py`.
 - `tests/test_flux3_klein.py` checks the port against small copies of the reference's DiT, packing and schedule,
   as its docstring says.
+- `dainamo/assets/flux3_pup_prompts.json`: the prompt upsampler's system prompts (`src/flux3/pup_prompts.json`),
+  copied unchanged. The "FLUX 3 (prompt upsampler style)" caption style in `dainamo/server/db.py` adapts its `t2i`
+  prompt to describing an image (see `dainamo/assets/README.md`).
 
 The FLUX 3 Image Klein **weights** are under the FLUX Kommunity License v1.0 (copy in
 `dainamo/engine/families/flux3_klein/FLUX_KOMMUNITY_LICENSE.txt`): non-commercial use, and commercial use of the
 images for Qualifying Users (under US$5M in yearly revenue) with content filtering or review. A LoRA is a
 derivative: it travels with the license and its attribution notice, marked as modified. Dainamo ships no weights.
+The prompt upsampler (`black-forest-labs/flux-3-image-klein-pup`, a fine-tune of Qwen3.5-9B) is Apache License
+2.0; Model files can download its ComfyUI copy for captions.
 
 ## MiniMax H3 (MiniMax) — MiniMax H3 Community License Agreement
 

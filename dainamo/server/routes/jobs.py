@@ -106,6 +106,8 @@ def _job_summary(j: dict) -> dict:
     j["merge"] = bool(cfg.get("settings", {}).get("merge_enabled"))  # LoRAs merged into one
     j["network"] = "full" if cfg.get("settings", {}).get("finetune_enabled") else \
         cfg.get("settings", {}).get("network_type") or "lora"
+    # its training state is kept: Resume trains on from it (a job that saved none can only restart)
+    j["resumable"] = os.path.exists(os.path.join(job_dir(j["id"]), "state", "last.pt"))
     made = st.get("refmod") or {}
     if made.get("preview") and not j["last_sample"]:  # a RefMod's thumbnail: its first frame, decoded
         j["last_sample"] = {"file": made["preview"][0]["file"], "kind": "image"}
@@ -765,7 +767,7 @@ def evaluate_job(jid: str, body: EvaluateIn):
     if cfg["settings"].get("slider_enabled") and s["picker_enabled"]:
         raise HTTPException(400, "The checkpoint picker doesn't apply to sliders; concept bleed does")
     if not (s["picker_enabled"] or s["bleed_enabled"]):
-        raise HTTPException(400, "Turn on the checkpoint picker, the concept bleed detector, or both")
+        raise HTTPException(400, "Turn on the checkpoint picker, concept bleed, or both")
     val_dsets = []
     if s["picker_enabled"]:
         trained = cfg["settings"]

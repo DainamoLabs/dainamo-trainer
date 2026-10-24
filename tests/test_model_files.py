@@ -22,13 +22,64 @@ def client():
         yield c
 
 
+@pytest.fixture(autouse=True)
+def hf_cache(monkeypatch, tmp_path_factory):
+    """An empty Hugging Face cache instead of this machine's, for tests to fill (``hf_repo``)."""
+    from dainamo.server import model_files
+
+    cache = tmp_path_factory.mktemp("hub")
+    monkeypatch.setattr(model_files, "hf_cache_folder", lambda: str(cache))
+    return cache
+
+
+def hf_repo(cache, repo: str, files: dict, indexed=(), sha="5" * 40):
+    """A ``models--owner--repo`` folder as huggingface_hub leaves it: ``files`` ({path in the repo: tensors}) as
+    blobs, linked from the snapshot ``refs/main`` names; each folder in ``indexed`` ("" for the top) gets a
+    model.safetensors.index.json of its .safetensors files' tensors. -> the repo folder."""
+    import json
+
+    root = cache / ("models--" + repo.replace("/", "--"))
+    snap = root / "snapshots" / sha
+    (root / "refs").mkdir(parents=True)
+    (root / "refs" / "main").write_text(sha)
+    (root / "blobs").mkdir()
+    for i, (rel, tensors) in enumerate(files.items()):
+        link = snap / rel
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if tensors is None:  # a small file that isn't a model
+            (root / "blobs" / f"b{i}").write_text("{}")
+        else:
+            header_only_safetensors(root / "blobs" / f"b{i}", tensors)
+        link.symlink_to(os.path.relpath(root / "blobs" / f"b{i}", link.parent))
+    for folder in indexed:
+        weight_map = {k: os.path.basename(rel) for rel, t in files.items()
+                      if t and os.path.dirname(rel) == folder and rel.endswith(".safetensors") for k in t}
+        (snap / folder / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+    return root
+
+
+def qwen3_4b(prefix="model."):
+    """Qwen3-4B's tensors that tell it apart (FLUX.2 Klein 4B's text encoder), in two shards."""
+    return ({f"{prefix}embed_tokens.weight": ("BF16", (151936, 2560)),
+             f"{prefix}layers.0.self_attn.q_norm.weight": ("BF16", (128,))},
+            {f"{prefix}layers.35.mlp.down_proj.weight": ("BF16", (2560, 9728))})
+
+
+FLUX2_VAE = {"bn.running_mean": ("F32", (128,)), "encoder.conv_in.weight": ("F32", (128, 3, 3, 3))}
+
+
+def _fields(ov: dict, family: str) -> dict:
+    return {f["key"]: f for f in next(x for x in ov["families"] if x["id"] == family)["fields"]}
+
+
 def test_every_catalog_file_fits_its_family():
     from dainamo.engine.families import FAMILIES
     from dainamo.server.model_files import KIND_FOLDERS
 
     ids = set()
     for F in FAMILIES.values():
-        paths = {f.key for f in F.info.profile_fields if f.kind == "path"}
+        paths = {f.key for f in F.info.profile_fields if f.kind == "path"} | set(F.extra_fields)
+        assert not set(F.extra_fields) & {f.key for f in F.info.profile_fields}, F.info.id
         variants = ["", *(next((f.options for f in F.info.profile_fields if f.key == "variant"), None) or [])]
         for d in F.downloads:
             assert d.field in paths, (F.info.id, d.field)
@@ -84,6 +135,162 @@ def test_files_are_found_by_what_is_in_them(client, tmp_path):
         assert isinstance(suggest, list)
     finally:
         client.put("/api/settings", json={"models": {"folder": ""}})
+
+
+def test_the_flux3_prompt_upsampler_is_an_optional_row_for_captions(client, tmp_path, monkeypatch):
+    """No profile takes it: a row of its own in Model files, never a MOSS Image text encoder though it has the
+    tensors of one, and a file the caption provider's text encoder can use."""
+    import dataclasses
+
+    from conftest import FAKE_ENCODERS
+    from dainamo.engine.families import FAMILIES
+
+    models = tmp_path / "models"
+    (models / "text_encoders").mkdir(parents=True)
+    moss = {**FAKE_ENCODERS["moss"][0], "model.language_model.layers.0.linear_attn.in_proj_qkv.weight": ("BF16", (1,))}
+    name = "qwen3.5_9b_flux3_prompt_upsampler_int8_convrot.safetensors"
+    pup = header_only_safetensors(models / "text_encoders" / name, moss)
+    own = header_only_safetensors(models / "text_encoders" / "qwen3.5_9b_int8_convrot.safetensors", moss)
+    F = FAMILIES["flux3_klein"]  # the catalog's file is this one: the same name and size
+    monkeypatch.setattr(F, "downloads", [dataclasses.replace(d, size=os.path.getsize(pup)) if d.name == name else d
+                                         for d in F.downloads])
+    client.put("/api/settings", json={"models": {"folder": str(models)}})
+    try:
+        ov = client.get("/api/models").json()
+        row = _fields(ov, "flux3_klein")["prompt_upsampler"]
+        assert (row["label"], row["hint"], row["required"], row["profile"]) == ("Prompt upsampler", "for captions",
+                                                                               False, False)
+        assert [x["path"] for x in row["found"]] == [pup] and len(row["downloads"]) == 2
+        assert all(o["folder"] == "text_encoders" for o in row["downloads"])
+        assert "profile" not in _fields(ov, "flux3_klein")["text_encoder"]
+        assert [x["path"] for x in _fields(ov, "moss_image")["text_encoder"]["found"]] == [own]
+        listed = {e["path"]: e for e in client.get("/api/llm/encoders").json()}
+        assert listed[pup]["name"] == "FLUX 3 prompt upsampler" and listed[pup]["profiles"] == []
+        assert own not in listed  # no profile uses it, and it isn't an upsampler
+    finally:
+        client.put("/api/settings", json={"models": {"folder": ""}})
+
+
+def test_the_hugging_face_cache_is_searched_too(client, hf_cache):
+    """A sharded repo is one model, by its repo folder; a diffusers pipeline's text_encoder/ (shards) and vae/ (one
+    file) are models of their own; the pipeline's diffusers-layout transformer matches no diffusion model."""
+    shard1, shard2 = qwen3_4b()
+    qwen = hf_repo(hf_cache, "Qwen/Qwen3-4B", {"model-00001-of-00002.safetensors": shard1,
+                                                "model-00002-of-00002.safetensors": shard2,
+                                                "config.json": None}, indexed=[""])
+    te1, te2 = qwen3_4b()
+    pipe = hf_repo(hf_cache, "acme/klein-pipeline", {
+        "model_index.json": None,
+        "text_encoder/model-00001-of-00002.safetensors": te1, "text_encoder/model-00002-of-00002.safetensors": te2,
+        "vae/diffusion_pytorch_model.safetensors": FLUX2_VAE,
+        "transformer/diffusion_pytorch_model.safetensors": {"x_embedder.weight": ("BF16", (3072, 128)),
+                                                            "context_embedder.weight": ("BF16", (3072, 7680))},
+    }, indexed=["text_encoder"])
+    snap = pipe / "snapshots" / ("5" * 40)
+    (hf_cache / "models--half--done" / "refs").mkdir(parents=True)  # refs/main, but nothing downloaded
+    (hf_cache / "models--half--done" / "refs" / "main").write_text("6" * 40)
+
+    ov = client.get("/api/models").json()
+    assert ov["hf_cache"] == str(hf_cache) and ov["hf_cache_ok"]
+    klein = _fields(ov, "flux2_klein")
+    te = {x["name"]: x for x in klein["text_encoder"]["found"]}
+    assert set(te) == {"Qwen/Qwen3-4B", "acme/klein-pipeline/text_encoder"}
+    assert te["Qwen/Qwen3-4B"]["path"] == str(qwen)  # read at refs/main (comfy_io.shard_files)
+    assert te["Qwen/Qwen3-4B"]["size"] == sum(os.path.getsize(qwen / "snapshots" / ("5" * 40) / n)
+                                              for n in ("model-00001-of-00002.safetensors",
+                                                        "model-00002-of-00002.safetensors"))
+    assert te["acme/klein-pipeline/text_encoder"]["path"] == str(snap / "text_encoder")
+    assert all(x["source"] == "hf_cache" for x in te.values())
+    assert {x["repo"] for x in te.values()} == {"Qwen/Qwen3-4B", "acme/klein-pipeline"}
+    [vae] = klein["vae"]["found"]
+    assert (vae["name"], vae["path"], vae["repo"]) == ("acme/klein-pipeline/vae/diffusion_pytorch_model.safetensors",
+                                                       str(snap / "vae" / "diffusion_pytorch_model.safetensors"),
+                                                       "acme/klein-pipeline")
+    assert klein["diffusion_model"]["found"] == []  # diffusers' key names aren't Klein's
+    assert _fields(ov, "krea2")["text_encoder"]["found"] == []  # Qwen3, not Qwen3-VL
+
+    # what a profile editor's pick puts in the field checks out
+    v = client.post("/api/profiles/validate", json={"name": "k", "family": "flux2_klein",
+                                                    "data": {"text_encoder": str(qwen), "vae": vae["path"]}}).json()
+    assert {c["field"]: c["level"] for c in v if c["field"] in ("text_encoder", "vae")} == {"text_encoder": "ok",
+                                                                                           "vae": "ok"}
+
+
+def test_the_models_folder_copy_comes_first(client, hf_cache, tmp_path):
+    """Both places have a Qwen3-4B: the overview says where each is from, and lists the ComfyUI one first (what
+    Create profile picks). A file linked into the models folder from the cache is listed once."""
+    shard1, shard2 = qwen3_4b()
+    hf_repo(hf_cache, "Qwen/Qwen3-4B", {"model-00001-of-00002.safetensors": shard1,
+                                        "model-00002-of-00002.safetensors": shard2}, indexed=[""])
+    vae_repo = hf_repo(hf_cache, "acme/flux2-vae", {"ae.safetensors": FLUX2_VAE})
+    models = tmp_path / "models"
+    (models / "text_encoders").mkdir(parents=True)
+    (models / "vae").mkdir()
+    header_only_safetensors(models / "text_encoders" / "zz_qwen_3_4b.safetensors", {**shard1, **shard2})
+    (models / "vae" / "flux2-vae.safetensors").symlink_to(vae_repo / "snapshots" / ("5" * 40) / "ae.safetensors")
+    client.put("/api/settings", json={"models": {"folder": str(models)}})
+    try:
+        ov = client.get("/api/models").json()
+        klein = _fields(ov, "flux2_klein")
+        assert [(x["name"], x["source"]) for x in klein["text_encoder"]["found"]] == [
+            ("zz_qwen_3_4b.safetensors", "models"), ("Qwen/Qwen3-4B", "hf_cache")]
+        assert klein["text_encoder"]["found"][0]["repo"] == ""
+        assert [(x["path"], x["source"]) for x in klein["vae"]["found"]] == [
+            (str(models / "vae" / "flux2-vae.safetensors"), "models")]
+    finally:
+        client.put("/api/settings", json={"models": {"folder": ""}})
+
+
+def test_a_cache_without_models_adds_nothing(client, hf_cache):
+    """Whisper, a repo whose shards aren't all downloaded, one with refs/main but no snapshot: nothing a family
+    takes. The overview is the same as with no cache at all."""
+    from dainamo.server import model_files
+
+    def found(ov):
+        return {(fam["id"], f["key"]): f["found"] for fam in ov["families"] for f in fam["fields"]}
+
+    before = found(client.get("/api/models").json())
+    hf_repo(hf_cache, "openai/whisper-tiny", {"model.safetensors": {"model.encoder.conv1.weight": ("F32", (384, 80, 3))}})
+    shard1, shard2 = qwen3_4b()
+    partly = hf_repo(hf_cache, "Qwen/Qwen3-4B", {"model-00001-of-00002.safetensors": shard1,
+                                                 "model-00002-of-00002.safetensors": shard2}, indexed=[""])
+    (partly / "snapshots" / ("5" * 40) / "model-00002-of-00002.safetensors").unlink()  # still downloading
+    (hf_cache / "models--gone--away" / "refs").mkdir(parents=True)
+    (hf_cache / "models--gone--away" / "refs" / "main").write_text("7" * 40)
+    (hf_cache / "datasets--some--data").mkdir()
+    ov = client.get("/api/models").json()
+    assert found(ov) == before
+    assert not any(x["source"] == "hf_cache" for fs in found(ov).values() for x in fs)
+    assert [f["name"] for f in model_files.scan() if f["source"] == "hf_cache"] == [
+        "openai/whisper-tiny/model.safetensors"]  # looked at, and taken for nothing
+
+
+def test_a_cache_of_many_repos_lists_quickly_once_scanned(client, hf_cache, monkeypatch):
+    """Headers are read once; after that a scan reads only folders, until a download changes one."""
+    from dainamo.server import model_files
+
+    for i in range(20):
+        a, b = qwen3_4b()
+        hf_repo(hf_cache, f"owner/repo-{i}", {"model-00001-of-00002.safetensors": a,
+                                              "model-00002-of-00002.safetensors": b,
+                                              "vae/ae.safetensors": FLUX2_VAE}, indexed=[""])
+    first = model_files.scan()
+    assert len([f for f in first if f["source"] == "hf_cache"]) == 40
+    read = []
+    real = model_files._identify
+    monkeypatch.setattr(model_files, "_identify", lambda path: read.append(path) or real(path))
+    t = time.monotonic()
+    again = model_files.scan()
+    assert time.monotonic() - t < 0.5 and not read
+    assert [f["path"] for f in again] == [f["path"] for f in first]
+    # a new file in one: that folder changed, so it's looked at again
+    folder = hf_cache / "models--owner--repo-3" / "snapshots" / ("5" * 40) / "vae"
+    header_only_safetensors(hf_cache / "models--owner--repo-3" / "blobs" / "new", FLUX2_VAE)
+    (folder / "ae2.safetensors").symlink_to(os.path.relpath(hf_cache / "models--owner--repo-3" / "blobs" / "new", folder))
+    st = os.stat(folder)
+    os.utime(folder, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))  # a second later, as a real download would be
+    names = [f["name"] for f in model_files.scan()]
+    assert "owner/repo-3/vae/ae2.safetensors" in names and read == [str(folder / "ae2.safetensors")]
 
 
 def test_a_turbo_model_without_its_adapter_is_flagged(client):

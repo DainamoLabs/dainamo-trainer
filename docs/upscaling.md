@@ -21,7 +21,9 @@ There are two kinds:
 - **SeedVR2** (ByteDance's one-step diffusion restorer, the 3B model): it makes
   any size directly and restores detail as it goes. It upscales a clip's frames
   together, in passes of as many as fit (41 at 1080p), so they stay consistent
-  with each other. It needs its VAE, `seedvr2_ema_vae_fp16.safetensors`, in
+  with each other. Each pass shares its last 8 frames with the next, and over
+  those frames the result fades from one pass to the other, so there's no jump
+  where a pass ends. It needs its VAE, `seedvr2_ema_vae_fp16.safetensors`, in
   the same folder (or ComfyUI's `vae` folder; a SeedVR2 file in
   `diffusion_models` is found too). It's much slower than a pixel upscaler and
   needs more VRAM: about 12 GB for a 1080p image and 15 to 18 GB for a 1080p
@@ -55,18 +57,43 @@ and it's listed. A file Dainamo can't read is listed with the reason.
 An upscale is a run of its own. It waits for the generations queued before it,
 runs in the Sandbox's worker beside the model loaded there, and shows in
 History as "2× upscale", with the file it came from beside the result. You can
-upscale a result again. A video keeps its frame rate and sound. The upscaler
-stays loaded for the next upscale until another one is picked or the GPU is
-released. A result's longest side can be at most 8192 pixels (4096 for a
-video).
+upscale a result again. The upscaler stays loaded for the next upscale until
+another one is picked or the GPU is released. A result's longest side can be
+at most 8192 pixels (4096 for a video).
+
+A video keeps its frame rate and sound. It's written as it's upscaled, so a
+long clip is never held in memory whole. A pixel upscaler takes it a frame at
+a time. SeedVR2 takes the whole clip when its frames fit in 8 GB of system RAM
+(or a quarter of what's free, if that's less), about 250 frames at 1080p. A
+longer clip goes in pieces that share 8 frames and fade into each other the
+same way its passes do. If an upscale fails or is cancelled part way, the
+unfinished video is removed.
+
+With SeedVR2, the dialog also has **SeedVR2 settings**, folded away:
+
+- **Frames per pass**, for a video: the most frames a pass takes, rounded down
+  to 4n + 1 (1 to 1001). Blank takes as many as fit at the size: 41 at 1080p.
+  Fewer frames need less VRAM, and a clip has more joins between passes.
+- **VAE tile**: **Auto**, or 512, 768 or 1024 px, the size of the tiles
+  SeedVR2's VAE works in. Auto tiles only when a frame wouldn't fit in the VRAM
+  that's free. A smaller tile needs less VRAM and is slower.
+- **Seed** (666 by default): the noise SeedVR2 starts from. The same seed gives
+  the same result.
+
+A value out of range is brought into it, and the Sandbox's status line says
+what was used.
+
+The Sandbox's [Hi-res fix](sandbox.md) uses the same upscalers inside a
+generation: the render is upscaled, then rendered again at the bigger size, so
+the model redraws the detail the upscaler made.
 
 ## Upscale small images
 
 Training never makes an image bigger, so an image with fewer pixels than the
 resolution trains at a smaller size, and the
 [health check](datasets.md#health-check)
-warns about it. **Upscale small images**, in a dataset's **⋯** menu, upscales
-those images:
+warns about it. **Upscale small images**, in a dataset's **Tools** menu,
+upscales those images:
 
 - It takes the images with fewer pixels than the resolution squared (1024 by
   default, or what you used last) and upscales each to about that many pixels,
@@ -100,8 +127,9 @@ queued.
 The upscaler loads beside the model the Sandbox holds. If they don't both fit,
 the Sandbox moves its diffusion model to system RAM while the upscaler runs.
 SeedVR2's weights alone are 6.8 GB, and its working memory grows with the size
-and the frames. If it runs out of memory, try a smaller factor, or press
-**Release GPU** in the Sandbox first so nothing else is loaded beside it.
+and the frames. If it runs out of memory, try a smaller factor, a smaller
+SeedVR2 **VAE tile** or fewer **Frames per pass**, or press **Release GPU** in
+the Sandbox first so nothing else is loaded beside it.
 
 ## Licenses
 

@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { api, byFamily, fmtClock, q, type Family, type Profile } from "../api";
-import { IconCheck, IconDownload, IconFile, IconFolder, IconAlert, IconLeft, IconMore, IconMute, IconPause, IconPlayFill, IconRight, IconUp, IconVolume, IconX } from "./icons";
+import { IconCheck, IconDown, IconDownload, IconFile, IconFolder, IconAlert, IconLeft, IconMore, IconMute, IconPause, IconPlayFill, IconRight, IconUp, IconVolume, IconX } from "./icons";
 
 /** A profile <select>'s options, under a heading per family. */
 export function ProfileOptions({ profiles, families }: { profiles: Profile[]; families: Family[] }) {
@@ -77,6 +77,68 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
       {children}
       {toast && <div className={"toast" + (toast.err ? " err" : "")}>{toast.msg}</div>}
     </ToastCtx.Provider>
+  );
+}
+
+/** A call whose failure would otherwise go unseen (a Cancel, a reload): ``attempt(api.post(...), "Couldn't cancel")``
+ * toasts its error, after ``what`` when given, and resolves to its result (undefined when it failed). */
+export function useToastErrors() {
+  const toast = useToast();
+  return useCallback(<T,>(work: Promise<T>, what?: string): Promise<T | undefined> =>
+    work.catch((e: any) => {
+      toast(what ? `${what}: ${e?.message || e}` : String(e?.message || e), true);
+      return undefined;
+    }), [toast]);
+}
+
+/** A list that couldn't be loaded: what went wrong, and Try again, in place of an empty list. */
+export function LoadError({ what, error, onRetry }: { what: string; error: string; onRetry?: () => void }) {
+  return (
+    <div className="error-box load-error" role="alert">
+      <span>Couldn't load {what}: {error}</span>
+      {onRetry && <button className="btn sm" onClick={onRetry}>Try again</button>}
+    </div>
+  );
+}
+
+/** A background task's strip (captioning, a split, a download, an upscale): an icon, what it's doing, how far it
+ * is and its current file or message, with Cancel while it runs (``cancelLabel`` when Cancel isn't what it does);
+ * when it's over, what it did, any errors and (with ``onDismiss``) a way to put it away. ``done``/``total`` show as
+ * "3 / 10" after the label and fill the bar, ``pct`` fills it when there's no count, and neither shows it busy.
+ * A failed Cancel is toasted. ``actions``: more buttons, beside Cancel. ``bar``: the progress bar shows (by default
+ * while it runs; a paused download's shows where it stopped). */
+export function TaskProgress({ icon, label, done, total, pct, detail, running, bar = running, onCancel, cancelLabel = "Cancel", onDismiss, errors, actions, className }: {
+  icon?: React.ReactNode; label: React.ReactNode; done?: number; total?: number; pct?: number | null; detail?: React.ReactNode;
+  running: boolean; bar?: boolean; onCancel?: () => Promise<unknown> | void; cancelLabel?: string; onDismiss?: () => void; errors?: string[];
+  actions?: React.ReactNode; className?: string;
+}) {
+  const attempt = useToastErrors();
+  const [busy, setBusy] = useState(false);
+  const counted = total != null && total > 0 && done != null;
+  const fill = counted ? (100 * done!) / Math.max(1, total!) : pct;
+  const cancel = async () => {
+    if (!onCancel) return;
+    setBusy(true);
+    await attempt(Promise.resolve(onCancel()), `Couldn't ${cancelLabel.toLowerCase()}`);
+    setBusy(false);
+  };
+  return (
+    <div className={"task-progress" + (className ? " " + className : "")}>
+      <div className="task-head">
+        {icon && <span className="task-icon" aria-hidden="true">{icon}</span>}
+        <span className="task-text">
+          {label}{counted && running ? ` ${done!.toLocaleString()} / ${total!.toLocaleString()}` : ""}
+          {detail && <span className="faint"> {detail}</span>}
+        </span>
+        <span className="spacer" />
+        {actions}
+        {running && onCancel && <button className="btn sm" disabled={busy} onClick={cancel}><IconX /> {cancelLabel}</button>}
+        {!running && onDismiss && <button className="btn ghost icon sm" aria-label="Dismiss" title="Dismiss" onClick={onDismiss}><IconX /></button>}
+      </div>
+      {bar && (fill != null ? <div className="progress"><div style={{ width: `${Math.min(100, Math.max(0, fill))}%` }} /></div>
+        : <div className="progress busy"><div /></div>)}
+      {!!errors?.length && <div className="error-box task-errors">{errors.slice(-5).map((e, i) => <div key={i}>{e}</div>)}</div>}
+    </div>
   );
 }
 
@@ -275,11 +337,24 @@ export function Info({ text }: { text: string }) {
   );
 }
 
-export function Num(props: { label: string; v: number; on: (n: number) => void; step?: number; min?: number; max?: number; help?: string; info?: string }) {
+/** A number field. Cleared to type a new number, it stays blank (rather than jumping to 0) and the value stays as it
+ * was until a number is typed; left blank, it shows the value again. A value that isn't a number (NaN) shows blank. */
+export function Num(props: {
+  label: React.ReactNode; v: number; on: (n: number) => void; step?: number; min?: number; max?: number; help?: string; info?: string;
+  disabled?: boolean; placeholder?: string;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
   return (
     <label className="field">
       <span>{props.label}{props.info && <Info text={props.info} />}</span>
-      <input type="number" value={props.v} step={props.step ?? 1} min={props.min} max={props.max} onChange={(e) => props.on(e.target.value === "" ? 0 : Number(e.target.value))} />
+      <input type="number" value={draft ?? (Number.isFinite(props.v) ? props.v : "")} step={props.step ?? 1} min={props.min} max={props.max}
+        disabled={props.disabled} placeholder={props.placeholder} onBlur={() => setDraft(null)}
+        onChange={(e) => {
+          const t = e.target.value; // "" while what's typed isn't a number yet ("-", "1e")
+          if (t === "" || !Number.isFinite(Number(t))) return setDraft(t);
+          setDraft(null);
+          props.on(Number(t));
+        }} />
       {props.help && <span className="help">{props.help}</span>}
     </label>
   );
@@ -297,15 +372,16 @@ export function AudioCard({ src, poster, score, autoPlay, title }: {
     <div className="audio-card" onClick={(e) => e.stopPropagation()}>
       {title && <div className="audio-title">{title}</div>}
       {poster && <img src={poster} alt="Spectrogram" loading="lazy" />}
-      <audio src={src} controls autoPlay={autoPlay} preload={autoPlay ? "auto" : "none"} />
+      <AudioPlayer src={src} autoPlay={autoPlay} />
       {score && <a className="small" href={score} target="_blank" rel="noreferrer">Score (ABC notation)</a>}
     </div>
   );
 }
 
 /** A song's player: play, where it is of how long, seeking, mute and (with ``download``, the file's name) download.
- * Starting one pauses any other playing on the page. */
-export function AudioPlayer({ src, download }: { src: string; download?: string }) {
+ * Starting one pauses any other playing on the page. The one audio player: the Sandbox's results, the lightbox and
+ * sample cards all use it. */
+export function AudioPlayer({ src, download, autoPlay }: { src: string; download?: string; autoPlay?: boolean }) {
   const ref = useRef<HTMLAudioElement>(null);
   const [playing, setPlaying] = useState(false);
   const [at, setAt] = useState(0);
@@ -322,7 +398,7 @@ export function AudioPlayer({ src, download }: { src: string; download?: string 
   const pct = length ? (100 * at) / length : 0;
   return (
     <div className="player" onClick={(e) => e.stopPropagation()}>
-      <audio ref={ref} src={src} preload="metadata" muted={muted} onLoadedMetadata={(e) => setLength(e.currentTarget.duration || 0)}
+      <audio ref={ref} src={src} preload={autoPlay ? "auto" : "metadata"} autoPlay={autoPlay} muted={muted} onLoadedMetadata={(e) => setLength(e.currentTarget.duration || 0)}
         onTimeUpdate={(e) => setAt(e.currentTarget.currentTime)} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} />
       <button type="button" className="player-play" onClick={toggle} aria-label={playing ? "Pause" : "Play"}>{playing ? <IconPause /> : <IconPlayFill />}</button>
       <span className="player-time">{fmtClock(at)} / {fmtClock(length)}</span>
@@ -350,13 +426,15 @@ function aspect(w: number, h: number): string | null {
 
 /** Full-screen view of an image, a video (``video``) or a song (``audio``: its poster and score). With ``info`` (a
  * dataset file's), a panel at the bottom shows its name, its size in pixels and its length (as the browser reads
- * them), ``details`` and its caption, which ``info.onCaption`` makes editable. ``nav`` adds previous and next (the
- * arrow keys too) through a list of files, ``at`` of ``count``. An edited caption is saved before moving on or
- * closing; if that fails, the view stays. */
-export function Lightbox({ src, video, audio, info, nav, onClose }: {
+ * them), ``details`` and its caption, which ``info.onCaption`` makes editable, and ``info.actions`` (buttons) under
+ * it. ``nav`` adds previous and next (the arrow keys too) through a list of files, ``at`` of ``count``; ``navY``
+ * adds up and down (a job's samples: left and right through steps, up and down through prompts). An edited caption
+ * is saved before moving on or closing; if that fails, the view stays. */
+export function Lightbox({ src, video, audio, info, nav, navY, onClose }: {
   src: string; video?: boolean; audio?: { poster?: string; score?: string; title?: React.ReactNode };
-  info?: { name: string; caption: string; details?: React.ReactNode[]; onCaption?: (caption: string) => Promise<void> };
-  nav?: { at: number; count: number; go: (step: -1 | 1) => void };
+  info?: { name: string; caption: string; details?: React.ReactNode[]; onCaption?: (caption: string) => Promise<void>; actions?: React.ReactNode };
+  nav?: { at: number; count: number; go: (step: -1 | 1) => void; noun?: string };
+  navY?: { at: number; count: number; go: (step: -1 | 1) => void; noun: string };
   onClose: () => void;
 }) {
   const toast = useToast();
@@ -378,8 +456,8 @@ export function Lightbox({ src, video, audio, info, nav, onClose }: {
       busy.current = false;
     }
   };
-  const step = (s: -1 | 1) => {
-    if (nav && nav.at + s >= 0 && nav.at + s < nav.count) leave(() => nav.go(s));
+  const step = (s: -1 | 1, n = nav) => {
+    if (n && n.at + s >= 0 && n.at + s < n.count) leave(() => n.go(s));
   };
   const keys = useRef<(e: KeyboardEvent) => void>(() => {});
   keys.current = (e) => {
@@ -388,6 +466,9 @@ export function Lightbox({ src, video, audio, info, nav, onClose }: {
     else if (nav && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
       e.preventDefault(); // not a seek in a focused video
       step(e.key === "ArrowLeft" ? -1 : 1);
+    } else if (navY && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+      e.preventDefault();
+      step(e.key === "ArrowUp" ? -1 : 1, navY);
     }
   };
   useEffect(() => {
@@ -438,6 +519,17 @@ export function Lightbox({ src, video, audio, info, nav, onClose }: {
           </div>
         ) : (
           <div className="lightbox-caption">{info.caption || <span className="faint">No caption</span>}</div>
+        )}
+        {(info.actions || navY) && (
+          <div className="row small lightbox-actions">
+            {navY && navY.count > 1 && <>
+              <button className="btn sm" disabled={navY.at <= 0} onClick={() => step(-1, navY)} aria-label={`Previous ${navY.noun}`} title={`Previous ${navY.noun} (↑)`}>↑</button>
+              <button className="btn sm" disabled={navY.at >= navY.count - 1} onClick={() => step(1, navY)} aria-label={`Next ${navY.noun}`} title={`Next ${navY.noun} (↓)`}>↓</button>
+            </>}
+            <span className="faint key-hint">{[nav && `← → ${nav.noun || "file"}s`, navY && navY.count > 1 && `↑ ↓ ${navY.noun}s`, "Esc"].filter(Boolean).join(" · ")}</span>
+            <span className="spacer" />
+            {info.actions}
+          </div>
         )}
       </div>
     </div>
@@ -516,11 +608,12 @@ export function SelectBar({ sel, ids, noun, info, children }: { sel: Selection; 
   );
 }
 
-export type MenuItem = { label: string; icon?: React.ReactNode; onClick: () => void; danger?: boolean; disabled?: boolean; title?: string };
+// ``sep``: a line above it, setting it apart from the items before (a delete after the tools)
+export type MenuItem = { label: string; icon?: React.ReactNode; onClick: () => void; danger?: boolean; disabled?: boolean; title?: string; sep?: boolean };
 
 /** A "⋯" button and the actions it opens: Up and Down move between them, Escape or a click elsewhere closes it. Clicks
  * in it don't reach what it's in (a card that opens on a click). */
-export function Menu({ label, items, boxed }: { label: string; items: MenuItem[]; boxed?: boolean }) {
+export function Menu({ label, items, boxed, text, icon }: { label: string; items: MenuItem[]; boxed?: boolean; text?: string; icon?: React.ReactNode }) {
   const [open, setOpen] = useState(false);
   const box = useRef<HTMLDivElement>(null);
   const button = useRef<HTMLButtonElement>(null);
@@ -548,12 +641,18 @@ export function Menu({ label, items, boxed }: { label: string; items: MenuItem[]
   };
   return (
     <div className="menu" ref={box} onKeyDown={onKey} onClick={(e) => e.stopPropagation()}>
-      <button ref={button} className={(boxed ? "btn icon lg menu-btn boxed" : "btn ghost icon menu-btn") + (open ? " on" : "")} aria-label={label} title={label} aria-haspopup="menu" aria-expanded={open}
-        onClick={() => setOpen(!open)}><IconMore /></button>
+      {text ? (
+        // a named menu ("Tools"): its icon, its name and a caret, as a button of its row
+        <button ref={button} className={"btn lg menu-text" + (open ? " on" : "")} aria-label={label} aria-haspopup="menu" aria-expanded={open}
+          onClick={() => setOpen(!open)}>{icon}{text}<IconDown className="menu-caret" /></button>
+      ) : (
+        <button ref={button} className={(boxed ? "btn icon lg menu-btn boxed" : "btn ghost icon menu-btn") + (open ? " on" : "")} aria-label={label} title={label} aria-haspopup="menu" aria-expanded={open}
+          onClick={() => setOpen(!open)}><IconMore /></button>
+      )}
       {open && (
         <div className="menu-list" role="menu">
           {items.map((it) => (
-            <button key={it.label} role="menuitem" className={it.danger ? "danger" : ""} disabled={it.disabled} title={it.title}
+            <button key={it.label} role="menuitem" className={(it.danger ? "danger" : "") + (it.sep ? " sep" : "")} disabled={it.disabled} title={it.title}
               onClick={() => { button.current?.focus(); setOpen(false); it.onClick(); }}>{it.icon}{it.label}</button>
           ))}
         </div>

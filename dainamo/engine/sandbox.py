@@ -36,6 +36,7 @@ from __future__ import annotations
 import contextlib
 import gc
 import json
+import math
 import os
 import queue
 import subprocess
@@ -156,11 +157,15 @@ class Session:
             self.vae_loaded = True
 
     def decode(self, lat, low_vram: bool, w: int, h: int, frames: int = 1, keep_vae: bool = False):
-        """The render's media. In low VRAM mode the VAE comes to the GPU just for this (the diffusion model
-        moving to system RAM meanwhile, if there isn't room for both), then goes back to system RAM unless
-        ``keep_vae`` (the next render's input images need it)."""
+        """The render's media (``with_vae``)."""
+        return self.with_vae(lambda: self.driver.to_media(lat)[0], low_vram, w, h, frames, keep_vae)
+
+    def with_vae(self, fn, low_vram: bool, w: int, h: int, frames: int = 1, keep_vae: bool = False):
+        """``fn()`` (decoding or encoding a w x h render) with the VAE on the GPU. In low VRAM mode the VAE comes to
+        the GPU just for this (the diffusion model moving to system RAM meanwhile, if there isn't room for both),
+        then goes back to system RAM unless ``keep_vae`` (the next render's input images need it)."""
         if not low_vram:
-            return self.driver.to_media(lat)[0]
+            return fn()
         from .memory import decode_bytes
         from .offload import make_room, park, unpark
 
@@ -168,7 +173,7 @@ class Session:
         moved = make_room(decode_bytes(self.driver, w, h, frames, loaded=on_gpu), [self.model], self.driver.swapper)
         try:
             self.vae_to_gpu()
-            return self.driver.to_media(lat)[0]
+            return fn()
         finally:
             if not keep_vae:
                 self.vae_parked = park(self._vae_modules())
@@ -302,8 +307,13 @@ class Session:
 
     # --- generation ------------------------------------------------------------
     def generate(self, msg: dict, is_cancelled):
+        """Renders a request's images (or videos, or songs): each seed with the LoRAs, and without them to compare,
+        or a checkpoint grid's cells. Image-to-Image starts each from its input image (``params.strength``). The
+        hi-res fix (``params.hires``) makes each render bigger after it's decoded (``_hires_upscale``) and renders it
+        again from there at the bigger size; each first pass is an output too (variant "pass1", ``of`` the variant
+        it's the first pass of), and the second pass is the render's own output."""
         from .media import save_media
-        from .sampling import Cancelled, model_calls
+        from .sampling import Cancelled, img2img_sigmas, model_calls
         from .trainer import cond_key
 
         rid, p, out_dir = msg["id"], msg["params"], msg["out_dir"]
@@ -319,6 +329,9 @@ class Session:
         if frames > 1 and d.snap_frames:
             frames = d.snap_frames(frames)
         images = list(p.get("images") or [])
+        # Image-to-Image's image is where sampling starts, not a condition or a reference
+        init_path = images.pop(0) if p.get("workflow") == "i2i" and images else None
+        hires = p.get("hires") or None
         audio = list(p.get("audio") or []) if frames > 1 else []
         refs = {**({"refmods": p["refmods"]} if p.get("refmods") else {}), **({"audio": audio} if audio else {}),
                 # Reference-to-Video's images are references whatever the model was trained for (MiniMax H3's fl2va
@@ -350,7 +363,17 @@ class Session:
             self.drop_model()
         d.offload = offload
         self.encode(conds)
-        self.ensure_models(vae=not low_vram or bool(images or audio))
+        keep_vae = bool(images or audio)  # the family's sampling encodes its input images with the VAE
+        self.ensure_models(vae=not low_vram or keep_vae)
+        sampler, scheduler, shift = p.get("sampler") or "euler", p.get("scheduler") or "default", p.get("shift")
+        steps = int(p["steps"])
+        init, strength = None, float(p.get("strength") or 1.0)
+        if init_path:
+            from .dataset import load_and_crop
+
+            emit("status", message="Encoding the input image")
+            px = load_and_crop(init_path, (w, h))  # cover-cropped to the size, as training crops
+            init = self.with_vae(lambda: d.encode_image(px), low_vram, w, h, keep_vae=keep_vae)
         fixed = p.get("loras") or []
         grid = p.get("grid")
         # a checkpoint grid: the base model (if asked), then each strength with each checkpoint, per seed;
@@ -364,70 +387,177 @@ class Session:
             report = self.apply_loras(fixed)
         seeds = [int(p["seed"]) + i for i in range(int(p.get("count") or 1))]
         renders = [(i, seed, *cell) for i, seed in enumerate(seeds) for cell in cells]
-        steps = int(p["steps"])
-        per = model_calls(p.get("sampler") or "euler", steps) if d.supports_samplers else steps
-        total = per * len(renders)
-        # sampling and decoding times so far, for seconds per step and the time left
-        clock = {"started": time.time(), "last": 0.0, "sampling": 0.0, "calls": 0, "decodes": []}
-        n = 0  # the render in progress
+
+        def calls(n: int) -> int:
+            return model_calls(sampler, n) if d.supports_samplers else n
+
+        # each pass's size, steps and model calls per render: the render, then the hi-res fix's second pass
+        passes = [{"size": (w, h), "steps": steps, "calls": calls(steps), "area": 1.0}]
+        if init is not None:  # the steps from the strength down (``img2img_sigmas``: as asked, or the nearest)
+            passes[0]["steps"] = len(img2img_sigmas(d, scheduler, steps, w, h, shift, strength)) - 1
+            passes[0]["calls"] = calls(passes[0]["steps"])
+        if hires:
+            size2 = (int(hires["width"]), int(hires["height"]))
+            asked2 = int(hires.get("steps") or steps)
+            steps2 = len(img2img_sigmas(d, scheduler, asked2, *size2, shift, float(hires["strength"]))) - 1
+            passes.append({"size": size2, "steps": steps2, "calls": calls(steps2), "asked": asked2,
+                           "area": size2[0] * size2[1] / (w * h)})
+        total = sum(ps["calls"] for ps in passes) * len(renders)
+        images_made = len(renders) * len(passes)
+        # sampling and decoding times so far per pass, for seconds per step and the time left
+        clock = {"started": time.time(), "last": 0.0, "sampling": [0.0] * len(passes), "calls": [0] * len(passes),
+                 "decodes": [[] for _ in passes]}
+        at = {"pass": 0, "base": 0, "image": 0}  # the render in progress: its pass, the calls before it, its number
+
+        def per_call(k: int) -> float | None:
+            """Seconds a model call of pass ``k`` takes: as timed, else the first pass's scaled by the area."""
+            if clock["calls"][k]:
+                return clock["sampling"][k] / clock["calls"][k]
+            if k and clock["calls"][0]:
+                return clock["sampling"][0] / clock["calls"][0] * passes[k]["area"] ** 1.25
+            return None
+
+        def per_decode(k: int) -> float:
+            done = clock["decodes"][k] or [x * passes[k]["area"] for x in clock["decodes"][0]]
+            return sum(done) / len(done) if done else 0.0
 
         def progress(done: int, message: str | None = None):
-            """``done`` model calls of ``total`` (all renders) -> a progress event with the step counter."""
-            per_call = clock["sampling"] / clock["calls"] if clock["calls"] else None
+            """``done`` model calls of ``total`` (all renders and passes) -> a progress event with the step counter."""
+            k, ps = at["pass"], passes[at["pass"]]
             eta = None
-            if per_call is not None:
-                decode = sum(clock["decodes"]) / len(clock["decodes"]) if clock["decodes"] else 0.0
-                eta = (total - done) * per_call + (len(renders) - len(clock["decodes"])) * decode
-            emit("progress", id=rid, done=done, total=total, message=message, image=n + 1, images=len(renders),
-                 step=min(steps, round((done - n * per) * steps / per)), steps=steps,
-                 sec_per_step=per_call * per / steps if per_call else None, eta=eta, started=clock["started"])
+            if per_call(0) is not None:
+                left = [len(renders) * q["calls"] for q in passes]  # calls still to make, per pass
+                for j in range(len(passes)):
+                    made = min(left[j], max(0, done - sum(len(renders) * q["calls"] for q in passes[:j])))
+                    left[j] -= made
+                decodes = [len(renders) - len(clock["decodes"][j]) for j in range(len(passes))]
+                eta = sum(left[j] * (per_call(j) or 0) + decodes[j] * per_decode(j) for j in range(len(passes)))
+            pc = per_call(k)
+            emit("progress", id=rid, done=done, total=total, message=message, image=at["image"] + 1,
+                 images=images_made, step=min(ps["steps"], round((done - at["base"]) * ps["steps"] / ps["calls"])),
+                 steps=ps["steps"], sec_per_step=pc * ps["calls"] / ps["steps"] if pc else None, eta=eta,
+                 started=clock["started"])
 
         def note(text):
             if is_cancelled():
                 raise Cancelled()
-            progress(n * per, text)
+            progress(at["base"], text)
 
         def callback(done, _total):
             if is_cancelled():
                 raise Cancelled()
             now = time.time()
-            clock["sampling"] += now - clock["last"]
-            clock["calls"] += 1
+            clock["sampling"][at["pass"]] += now - clock["last"]
+            clock["calls"][at["pass"]] += 1
             clock["last"] = now
-            progress(n * per + done)
+            progress(at["base"] + done)
 
+        def use_cell(variant, c, s) -> str:
+            """Apply a render's LoRAs (a grid cell's checkpoint at its strength), or turn them off for the base
+            model -> its label."""
+            nonlocal report
+            if variant == "grid":
+                ckpt, strength_ = grid["checkpoints"][c], grid["strengths"][s]
+                report = self.apply_loras(fixed + [{"path": ckpt["path"], "strength": strength_}])
+                label = f"{ckpt['label']} at {strength_:g}"
+            else:
+                label = "Base model" if variant == "base" else "Sampling"
+            self.adapters.set_enabled(variant != "base")
+            return label
+
+        def render(k: int, n: int, seed: int, label: str, init_, strength_, steps_):
+            """One pass of one render, sampled and decoded -> its media."""
+            ps = passes[k]
+            rw, rh = ps["size"]
+            at.update({"pass": k, "base": sum(len(renders) * q["calls"] for q in passes[:k]) + n * ps["calls"],
+                       "image": k * len(renders) + n})
+            progress(at["base"], f"{label} · seed {seed}")
+            clock["last"] = time.time()
+            extra = {"init": init_, "strength": strength_} if init_ is not None else {}
+            lat = d.sample(self.model, self.texts[key], self.texts.get(negative) if use_cfg else None,
+                           rw, rh, steps_, cfg, seed, frames=frames, images=images or None, sampler=sampler,
+                           scheduler=scheduler, shift=shift, callback=callback, **refs, **extra)
+            progress(at["base"] + ps["calls"], "Decoding")
+            if is_cancelled():
+                raise Cancelled()
+            t = time.time()
+            media = self.decode(lat, low_vram, rw, rh, frames, keep_vae=keep_vae)
+            clock["decodes"][k].append(time.time() - t)
+            return media
+
+        def item(seed, variant, c, s, size) -> dict:
+            """An output's details: its seed and variant (a grid cell's checkpoint and strength), and its size
+            (none for a song)."""
+            out = {"seed": seed, "variant": variant, **({"checkpoint": c, "strength": s} if variant == "grid" else {})}
+            return {**out, "width": size[0], "height": size[1]} if size[0] else out
+
+        firsts = []  # the hi-res fix's first passes: (render, its media)
         d.progress_note = note
         try:
             for n, (i, seed, variant, c, s) in enumerate(renders):
-                if variant == "grid":
-                    ckpt, strength = grid["checkpoints"][c], grid["strengths"][s]
-                    report = self.apply_loras(fixed + [{"path": ckpt["path"], "strength": strength}])
-                    label = f"{ckpt['label']} at {strength:g}"
+                label = use_cell(variant, c, s)
+                media = render(0, n, seed, label, init, strength, steps)
+                stem = f"{i}_c{c}_s{s}" if variant == "grid" else f"{i}_{variant}"
+                if hires:
+                    saved = save_media(media, out_dir, f"{stem}_pass1")
+                    emit("output", id=rid, item={**saved, **item(seed, variant, c, s, (w, h)), "variant": "pass1",
+                                                  "of": variant})
+                    firsts.append(((n, i, seed, variant, c, s, stem), media))
                 else:
-                    label = "Base model" if variant == "base" else "Sampling"
-                self.adapters.set_enabled(variant != "base")
-                progress(n * per, f"{label} · seed {seed}")
-                clock["last"] = time.time()
-                lat = d.sample(self.model, self.texts[key], self.texts.get(negative) if use_cfg else None,
-                               w, h, steps, cfg, seed, frames=frames, images=images or None,
-                               sampler=p.get("sampler") or "euler", scheduler=p.get("scheduler") or "default",
-                               shift=p.get("shift"), callback=callback, **refs)
-                progress((n + 1) * per, "Decoding")
-                if is_cancelled():
-                    raise Cancelled()
-                t = time.time()
-                media = self.decode(lat, low_vram, w, h, frames, keep_vae=bool(images or audio))
-                clock["decodes"].append(time.time() - t)
-                if variant == "grid":
-                    saved = save_media(media, out_dir, f"{i}_c{c}_s{s}")
-                    emit("output", id=rid, item={**saved, "seed": seed, "variant": variant, "checkpoint": c, "strength": s})
-                else:
-                    saved = save_media(media, out_dir, f"{i}_{variant}")
-                    emit("output", id=rid, item={**saved, "seed": seed, "variant": variant})
+                    saved = save_media(media, out_dir, stem)
+                    emit("output", id=rid, item={**saved, **item(seed, variant, c, s, (w, h))})
+            if hires:
+                at.update({"pass": 1, "base": len(renders) * passes[0]["calls"], "image": len(renders)})
+                bigger = self._hires_upscale([m for _, m in firsts], hires, passes[1]["size"], note,
+                                             _checker(is_cancelled))
+                for ((n, i, seed, variant, c, s, stem), _), big in zip(firsts, bigger):
+                    label = use_cell(variant, c, s)
+                    at.update({"pass": 1, "base": len(renders) * passes[0]["calls"] + n * passes[1]["calls"],
+                               "image": len(renders) + n})
+                    note(f"Hi-res fix · encoding seed {seed}")
+                    px = _pixels(big)
+                    init2 = self.with_vae(lambda: d.encode_image(px), low_vram, *passes[1]["size"], keep_vae=keep_vae)
+                    media = render(1, n, seed, f"Hi-res fix · {label}", init2, float(hires["strength"]),
+                                   passes[1]["asked"])
+                    saved = save_media(media, out_dir, stem)
+                    emit("output", id=rid, item={**saved, **item(seed, variant, c, s, passes[1]["size"])})
         finally:
             self.adapters.set_enabled(True)
             d.progress_note = None
         emit("done", id=rid, elapsed=round(time.time() - t0, 1), loras=report)
+
+    def _hires_upscale(self, images: list, hires: dict, size: tuple[int, int], note, check) -> list:
+        """The hi-res fix's first passes (PIL images) made ``size`` (width, height): resized (``hires["model"]``
+        "resize": Lanczos), or upscaled with the upscaler file in it, the Session's cached one as an upscale run
+        uses (``ensure_upscaler``), with the profile's models parked in system RAM meanwhile when it hasn't room
+        beside them (``_upscaler_room``). A big upscaler (SeedVR2) is unloaded after, before the second pass.
+        ``note(text)`` shows what it's doing; ``check()`` raises to cancel."""
+        from PIL import Image
+
+        if hires["model"] == "resize":
+            note(f"Hi-res fix · resizing to {size[0]}×{size[1]}")
+            return [im.convert("RGB").resize(size, Image.Resampling.LANCZOS) for im in images]
+        import numpy as np
+
+        from .offload import unpark
+
+        torch = self.torch
+        parked = self._upscaler_room(hires["model"])
+        try:
+            up = self.ensure_upscaler(hires["model"])
+            out = []
+            for k, im in enumerate(images):
+                what = f"Hi-res fix · upscaling{f' {k + 1} of {len(images)}' if len(images) > 1 else ''}" \
+                    f" to {size[0]}×{size[1]} with {up.info.name}"
+                note(what)
+                x = torch.from_numpy(np.asarray(im.convert("RGB"), dtype=np.float32) / 255).permute(2, 0, 1)[None]
+                y = up.upscale(x.contiguous(), size, lambda text: note(f"{what}: {text}"), check)
+                out.append(_to_image(y, "RGB"))
+            return out
+        finally:
+            self.drop_upscaler(big_only=True)  # the second pass needs the room
+            if parked:
+                unpark(parked)
 
 
     # --- RefMods -------------------------------------------------------------
@@ -553,7 +683,7 @@ class Session:
     def upscale(self, msg: dict, is_cancelled):
         """Each of ``inputs`` (images and clips) upscaled by ``factor`` with the upscaler in ``model``, one output
         each: a fixed-scale model runs at its scale and is fitted to the size asked; clips keep their frame rate and
-        sound. Progress counts frames, an image as one."""
+        sound, and are written as they're upscaled (``_upscale_clip``). Progress counts frames, an image as one."""
         from . import upscale
         from .dataset import image_size, media_kind
         from .media import save_media
@@ -597,6 +727,8 @@ class Session:
         parked = self._upscaler_room(msg["model"])
         try:
             up = self.ensure_upscaler(msg["model"])
+            if kw and hasattr(up, "check_options"):  # once: a long clip's pieces would each log the same changes
+                kw = {"options": up.check_options(kw["options"])}
             state["since"] = time.time()
             for n, (path, kind, (iw, ih), (w, h), frames, clip) in enumerate(jobs):
                 state["input"] = n
@@ -610,60 +742,75 @@ class Session:
                     state["done"] += 1
                     state["px"] += w * h
                 else:
-                    media = self._upscale_clip(up, path, clip, (w, h), state, report, check, kw)
-                    report(f"{name}: writing the video")
-                    saved = save_media(media, out_dir, stem)
-                    del media
+                    saved = self._upscale_clip(up, path, clip, (w, h), out_dir, stem, state, report, check, kw)
                 emit("output", id=rid, item={**saved, "source": path, "width": w, "height": h})
         finally:
             if parked:
                 unpark(parked)
         emit("done", id=rid, elapsed=round(time.time() - t0, 1))
 
-    def _upscale_clip(self, up, path: str, clip: dict, size: tuple[int, int], state: dict, report, check,
-                      kw: dict) -> dict:
-        """A clip upscaled to ``size`` -> ``save_media``'s video dict, with its frame rate and sound. Frames are
-        read and upscaled a chunk at a time (one at a time for a pixel upscaler, as much of the clip as fits for one
-        that takes clips as clips), so only the result is held whole, as 8-bit frames."""
+    def _upscale_clip(self, up, path: str, clip: dict, size: tuple[int, int], out_dir: str, stem: str, state: dict,
+                      report, check, kw: dict) -> dict:
+        """A clip upscaled to ``size`` and written to ``out_dir`` as <stem>.mp4 with its frame rate and its sound
+        (``media.VideoWriter``, which muxes the sound from the clip) -> {file, kind, poster}. It's read, upscaled
+        and written a piece at a time, so no length is too long: a frame at a time for a pixel upscaler; for one
+        that takes clips as clips, the whole clip when its frames fit in ``CLIP_RAM`` (the upscaler makes its own
+        overlapping passes), else pieces of whole passes, each sharing the upscaler's ``overlap_frames`` with the
+        piece before, crossfaded as its passes are (``upscale.crossfade``)."""
         import numpy as np
         import psutil
 
-        from .dataset import read_audio
+        from .media import VideoWriter
+        from .upscale import crossfade
 
         torch = self.torch
-        name, (w, h), count = os.path.basename(path), size, clip["frames"]
-        free = psutil.virtual_memory().available
-        need = 2 * count * w * h * 3  # the frames, and save_media's copy of them for ffmpeg
-        if need + 2e9 > free:
-            raise ValueError(f"{name}: {count} frames at {w}×{h} take {need / 1e9:.0f} GB of system RAM to write, and "
-                             f"{free / 1e9:.0f} GB is free. Try a smaller factor or a shorter clip.")
+        name, (w, h), count = os.path.basename(path), size, max(1, clip["frames"])
         per = 4 * 3 * (clip["width"] * clip["height"] + w * h)  # a frame in and out, as floats
-        chunk = max(1, min(count, int(min(8e9, free / 4) // per))) if up.info.video else 1
-        per_pass = getattr(up, "frames_per_pass", None)
-        if per_pass is not None and chunk < count:  # pieces end where the upscaler's own passes end
-            n = max(1, int(per_pass(size)))
-            chunk = max(n, chunk - chunk % n) if chunk >= n else chunk
-        out, made = [], 0
-        with contextlib.closing(_clip_frames(path, clip["width"], clip["height"], chunk)) as chunks:
-            for frames in chunks:
+        free = psutil.virtual_memory().available
+        fits = int(min(CLIP_RAM, free / 4) // per)  # frames a piece can be
+        chunk, overlap = 1, 0
+        if up.info.video:
+            per_pass, shared = getattr(up, "frames_per_pass", None), getattr(up, "overlap_frames", None)
+            n = max(1, int(per_pass(size, kw.get("options")))) if per_pass else count
+            overlap = max(0, min(int(shared(size, kw.get("options"))) if shared else 0, (n - 1) // 2))
+            chunk = min(count, fits)
+            if count > chunk >= n:  # pieces of whole passes: m * (n - overlap) + overlap frames
+                chunk = overlap + (chunk - overlap) // (n - overlap) * (n - overlap)
+        if fits < chunk or chunk <= overlap:
+            least = overlap + 1
+            raise ValueError(f"{name}: {least} frame{'s' * (least > 1)} at {w}×{h} take {least * per / 1e9:.1f} GB "
+                             f"of system RAM to upscale together, more than a quarter of the {free / 1e9:.1f} GB "
+                             "free. Try a smaller factor, or close what else is using RAM.")
+        # a clip's pieces, as the header counts its frames (a pixel upscaler's frames aren't pieces)
+        pieces = 1 if chunk >= count or not up.info.video else math.ceil((count - overlap) / (chunk - overlap))
+        made, held = 0, None  # held: a piece's last frames, kept back to crossfade with the start of the next
+        # the rate as ffprobe gave it (30000/1001, not 29.97002997...), passed to ffmpeg as it is
+        with VideoWriter(out_dir, stem, clip["fps"], audio=path if clip["audio"] else None) as video, \
+                contextlib.closing(_clip_frames(path, clip["width"], clip["height"], chunk, overlap)) as frames_in:
+            for k, frames in enumerate(frames_in):
                 check()
+                repeated = overlap if k else 0  # the frames this piece shares with the one before
+                part = f"part {k + 1} of {max(pieces, k + 1)}: " if pieces > 1 else ""
                 x = torch.from_numpy(frames.astype(np.float32)).div_(255).permute(0, 3, 1, 2).contiguous()
-                y = up.upscale(x, size, lambda text: report(f"{name}: {text}"), check, **kw)
-                out.append((y.permute(0, 2, 3, 1) * 255).round_().clamp_(0, 255).to(torch.uint8).numpy())
-                del x, y
-                made += len(frames)
-                state["done"] += len(frames)
-                state["px"] += len(frames) * w * h
+                y = up.upscale(x, size, lambda text: report(f"{name}: {part}{text}"), check, **kw)
+                del x
+                if repeated:
+                    with torch.inference_mode():  # SeedVR2's frames are inference tensors: changed only in it
+                        y[:repeated] = crossfade(held, y[:repeated])
+                keep = overlap if len(frames) == chunk else 0  # only a whole piece can have another after it
+                _write_frames(video, y[:len(y) - keep])
+                held = y[len(y) - keep:].clone() if keep else None
+                del y
+                made += len(frames) - repeated
+                state["done"] += len(frames) - repeated
+                state["px"] += (len(frames) - repeated) * w * h
                 report(f"{name}: frame {made} of {max(count, made)}")
-        if not out:
-            raise ValueError(f"{name}: no frames could be read")
-        audio = None
-        if clip["audio"]:
-            audio = read_audio(path, made / clip["rate"], clip["sample_rate"], clip["channels"]).numpy()
-        frames = out[0] if len(out) == 1 else np.concatenate(out)
-        del out
-        # the rate as ffprobe gave it (30000/1001, not 29.97002997...): save_media passes it to ffmpeg as it is
-        return {"frames": frames, "fps": clip["fps"], "audio": audio, "sample_rate": clip["sample_rate"]}
+            if held is not None:
+                _write_frames(video, held)
+            if not made:
+                raise ValueError(f"{name}: no frames could be read")
+            report(f"{name}: writing the video")
+            return video.close()
 
     def upscale_dataset(self, msg: dict, is_cancelled):
         """A dataset's small images upscaled in place: each of ``paths`` whose area is under ``resolution`` squared
@@ -726,6 +873,9 @@ class Session:
 
 # VRAM an upscaler works in beyond its weights, by kind, to judge whether the profile's models must make room
 UPSCALE_WORK = {"pixel": 3e9, "seedvr2": 9.7e9}
+# system RAM a clip's piece may take while it's upscaled (its frames in and out, as floats), and at most a quarter
+# of what's free: a longer clip goes in pieces (8 GB is 300 frames from 480p to 1080p)
+CLIP_RAM = 8e9
 
 
 def _upscaler_work(info) -> float:
@@ -782,6 +932,15 @@ def _to_image(frames, mode: str):
 
     arr = (frames[0].permute(1, 2, 0) * 255).round_().clamp_(0, 255).byte().numpy()
     return Image.fromarray(arr[..., 0] if mode == "L" else arr)
+
+
+def _pixels(image):
+    """A PIL image -> (1, 3, H, W) float in [-1, 1], as ``encode_image`` takes it (``dataset.load_and_crop``'s)."""
+    import numpy as np
+    import torch
+
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32) / 127.5 - 1.0
+    return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
 
 
 def _replace_image(path: str, image, icc) -> str:
@@ -850,22 +1009,37 @@ def _rate(text: str) -> float:
         return 0.0
 
 
-def _clip_frames(path: str, width: int, height: int, chunk: int):
-    """A clip's frames as (n, height, width, 3) uint8 arrays, ``chunk`` at a time, decoded by ffmpeg as they're
-    asked for: every frame as it is, none added or dropped to even out the frame rate."""
+def _write_frames(video, frames, batch: int = 8):
+    """Upscaled frames (n, 3, h, w) float in [0, 1] into a ``media.VideoWriter`` as 8-bit, a few at a time, so
+    there's never a second copy of them all."""
+    import torch
+
+    for a in range(0, frames.shape[0], batch):
+        video.write((frames[a:a + batch].permute(0, 2, 3, 1) * 255).round_().clamp_(0, 255).to(torch.uint8).numpy())
+
+
+def _clip_frames(path: str, width: int, height: int, chunk: int, overlap: int = 0):
+    """A clip's frames as (n, height, width, 3) uint8 arrays of up to ``chunk``, decoded by ffmpeg as they're
+    asked for: every frame as it is, none added or dropped to even out the frame rate. Each array after the first
+    starts with the last ``overlap`` frames of the one before, then up to ``chunk - overlap`` new ones."""
     import numpy as np
 
     size = width * height * 3
+    overlap = max(0, min(overlap, chunk - 1))
     with tempfile.TemporaryFile() as err:
         proc = subprocess.Popen(["ffmpeg", "-v", "error", "-i", path, "-map", "0:v:0", "-fps_mode", "passthrough",
                                  "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE, stderr=err)
         try:
+            last = None
             while True:
-                data = proc.stdout.read(size * chunk)
+                want = chunk if last is None else chunk - overlap
+                data = proc.stdout.read(size * want)
                 n = len(data) // size
                 if n:
-                    yield np.frombuffer(data, np.uint8, n * size).reshape(n, height, width, 3)
-                if len(data) < size * chunk:
+                    new = np.frombuffer(data, np.uint8, n * size).reshape(n, height, width, 3)
+                    last = new if last is None or not overlap else np.concatenate([last[-overlap:], new])
+                    yield last
+                if len(data) < size * want:
                     break
             if proc.wait() != 0:
                 err.seek(0)
@@ -893,7 +1067,9 @@ def _out_of_memory(cmd: str, msg: dict, session: Session) -> str:
         except Exception:
             pass
     what = "a smaller factor" if cmd == "upscale" else "a lower resolution or max factor"
-    return f"Out of GPU memory: try {what}" + (", or a smaller SeedVR2 tile (its tile option)" if seedvr2 else "") + ". "
+    if seedvr2:
+        what += ", or a smaller SeedVR2 tile (its tile option) or fewer frames a pass (max frames)"
+    return f"Out of GPU memory: try {what}. "
 
 
 def main():

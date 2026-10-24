@@ -151,3 +151,88 @@ def test_saved_clips_keep_every_frame(tmp_path):
                               "stream=nb_read_frames", "-of", "csv=p=0", str(tmp_path / saved["file"])],
                              capture_output=True, text=True, check=True).stdout.strip()
         assert int(out) == 49, (seconds, out)
+
+
+# --- image-to-image ----------------------------------------------------------------------------------------------
+class Shifted:
+    """A model whose own schedule is evenly spaced through a shift of 3 (most of its steps at high noise)."""
+
+    def default_sigmas(self, steps, w, h):
+        return [sampling.shift_sigma(u, 3.0) for u in sampling.spacing("simple", steps)]
+
+    def default_shift(self, w, h):
+        return 3.0
+
+
+@pytest.mark.parametrize("scheduler", list(sampling.SCHEDULERS))
+def test_an_img2img_schedule_starts_at_the_strength_and_runs_the_steps_asked(scheduler):
+    for steps in (1, 2, 8, 20):
+        for strength in (0.05, 0.35, 0.6, 0.9, 1.0):
+            sig = sampling.img2img_sigmas(Shifted(), scheduler, steps, 64, 64, None, strength)
+            assert sig[0] == strength and sig[-1] == 0.0 and len(sig) - 1 == steps, (steps, strength, sig)
+            assert all(a > b for a, b in zip(sig, sig[1:])), sig
+            if strength == 1.0:  # the whole schedule: as text-to-image samples
+                assert sig == sampling.make_sigmas(Shifted(), scheduler, steps, 64, 64)
+    # the run's own schedule, cut, would leave 1 of 8 steps below 0.35; these are spaced as its schedule spaces them
+    assert len(sampling.cut_sigmas(sampling.make_sigmas(Shifted(), "default", 8, 64, 64), 0.35)) - 1 == 1
+    sig = sampling.img2img_sigmas(Shifted(), "default", 8, 64, 64, None, 0.35)
+    gaps = [a - b for a, b in zip(sig, sig[1:])]
+    assert max(gaps) / min(gaps) < 3
+
+
+def test_cutting_a_schedule():
+    sig = sampling.make_sigmas(None, "simple", 10, 64, 64, shift=1.0)  # 1.0, 0.9, ..., 0.1, 0
+    assert sampling.cut_sigmas(sig, 1.0) == sig
+    cut = sampling.cut_sigmas(sig, 0.62)  # 0.6 is nearer than 0.7: the strength takes its place
+    assert cut[0] == 0.62 and cut[1:] == pytest.approx([0.5, 0.4, 0.3, 0.2, 0.1, 0.0])
+    cut = sampling.cut_sigmas(sig, 0.68)  # 0.7 is nearer: it takes 0.7's place, before 0.6
+    assert cut[0] == 0.68 and cut[1:] == pytest.approx([0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0])
+    assert sampling.cut_sigmas(sig, 0.05) == [0.05, 0.0]  # at least one step, to 0
+    for bad in (0.0, -0.1, 1.5):
+        with pytest.raises(ValueError):
+            sampling.cut_sigmas(sig, bad)
+
+
+def test_an_image_is_noised_to_the_strength():
+    init, noise = torch.randn(4, 8, 6), torch.randn(1, 4, 8, 6)  # latents as encode_image gives them
+    x = sampling.noised(init.to(torch.bfloat16), noise, 0.3)
+    assert x.shape == noise.shape and x.dtype == noise.dtype
+    assert torch.allclose(x, 0.7 * init.to(torch.bfloat16).float()[None] + 0.3 * noise)
+    with pytest.raises(ValueError, match="don't match"):
+        sampling.noised(torch.randn(4, 6, 8), noise, 0.3)  # another size
+
+
+class TinyImageFamily:
+    """A family whose model knows only the data is N(MU, C^2) per element: its velocity is the exact one for that
+    (``gaussian_velocity``), so a sample from noise is a draw from the data, and from an image it's that image with
+    only as much changed as the strength lets."""
+
+    @staticmethod
+    def make():
+        from dainamo.engine.families.base import FamilyDriver, FamilyInfo
+
+        class Tiny(FamilyDriver):
+            info = FamilyInfo(id="tiny", label="Tiny", media=["image"], profile_fields=[])
+
+            def prepare_sampling(self, model, cond, uncond, width, height, cfg, seed, images=None):
+                g = torch.Generator().manual_seed(int(seed))
+                return torch.randn(1, 4, height // 8, width // 8, generator=g), gaussian_velocity
+
+        return Tiny({}, torch.device("cpu"))
+
+
+def test_sampling_from_an_image_keeps_it_at_a_low_strength_and_ignores_it_at_one():
+    d = TinyImageFamily.make()
+    init = MU + 2.0 + 0.5 * torch.randn(4, 8, 8)  # well away from what the model would make from noise
+    kw = dict(model=None, cond=None, uncond=None, width=64, height=64, steps=20, cfg=1.0, seed=3)
+    t2i = d.sample(**kw)
+    low = d.sample(**kw, init=init, strength=0.05)
+    assert (low[0] - init).abs().mean() < 0.06
+    full = d.sample(**kw, init=init, strength=1.0)
+    assert torch.equal(full, t2i)  # noise alone: as from text
+    assert (full[0] - init).abs().mean() > 1.5
+    mid = d.sample(**kw, init=init, strength=0.6)
+    assert (low[0] - init).abs().mean() < (mid[0] - init).abs().mean() < (full[0] - init).abs().mean()
+    calls = []
+    d.sample(**kw, init=init, strength=0.35, callback=lambda done, total: calls.append(total))
+    assert calls == [20] * 20  # the steps asked, from the strength down

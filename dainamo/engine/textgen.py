@@ -7,6 +7,9 @@ caption a dataset or rewrite a prompt with nothing else to download. Two can't: 
 LTX 2.5's is Lightricks' custom Gemma 4, changed for LTX so that it no longer predicts text (no layer of it does).
 A Gemma 4 file that still does (Gemma4UnifiedForConditionalGeneration) loads too. Every encoder is checked once
 it's loaded: one that can't continue a plain English sentence is refused rather than left to write gibberish.
+FLUX 3 Image Klein's prompt upsampler is a Qwen3.5-9B too (the same layout, tokenizer and chat template as MOSS
+Image's): it isn't a text encoder, but it wrote the captions FLUX 3 was trained on, and loads the same way. Its
+header doesn't say which it is, so it's told by its file name.
 
     python -m dainamo.engine.textgen --model FILE --port 8090
 
@@ -25,6 +28,7 @@ import binascii
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -43,6 +47,9 @@ QWEN = {
     (248320, 4096, 32): ("qwen3_5", "Qwen3.5-9B", "MOSS Image", False),
 }
 GEMMA_SIZES = {3840: "12B"}  # hidden size → name
+# a Qwen3.5-9B named like FLUX 3 Image Klein's prompt upsampler (qwen3.5_9b_flux3_prompt_upsampler_*.safetensors,
+# or "pup" as a word): BFL's files carry no metadata that tells it from MOSS Image's encoder
+UPSAMPLER_NAME = re.compile(r"upsampler|(?<![a-z0-9])pup(?![a-z0-9])", re.I)
 # ComfyUI's names → Gemma4UnifiedForConditionalGeneration's (the first matching prefix)
 GEMMA_NAMES = (("model.", "model.language_model."), ("vision_model.", "model.embed_vision."),
                ("multi_modal_projector.", "model.embed_vision.multimodal_embedder."),
@@ -71,9 +78,16 @@ class Encoder:
     whose: str  # the model it's the text encoder of
     vision: bool  # the file has the vision part, so it can see images
     tied: bool  # no lm_head in the file: the output layer is the input embeddings
+    tuned_from: str = ""  # a model that isn't a text encoder (FLUX 3's prompt upsampler): the model it was tuned from
+
+    @property
+    def label(self) -> str:
+        """What it is, e.g. "Qwen3-VL-4B (Krea 2's text encoder)", "FLUX 3 prompt upsampler (Qwen3.5-9B)"."""
+        return f"{self.name} ({self.tuned_from})" if self.tuned_from else f"{self.name} ({self.whose}'s text encoder)"
 
     def to_json(self) -> dict:
-        return {"kind": self.kind, "name": self.name, "whose": self.whose, "vision": self.vision}
+        return {"kind": self.kind, "name": self.name, "whose": self.whose, "vision": self.vision,
+                **({"tuned_from": self.tuned_from} if self.tuned_from else {})}
 
 
 def detect(path: str) -> Encoder:
@@ -135,7 +149,11 @@ def detect(path: str) -> Encoder:
     if not tied and not head:
         raise EncoderError(f"{base} has no output layer (lm_head), so it can't write text. ComfyUI's {name} "
                            "files keep it.")
-    return Encoder(kind, name, whose, any(k.startswith(("model.visual.", "visual.")) for k in keys), tied)
+    vision = any(k.startswith(("model.visual.", "visual.")) for k in keys)
+    hinted = any("upsampler" in str(v).lower() for v in meta.values())  # a header that says so (BFL's don't)
+    if kind == "qwen3_5" and (UPSAMPLER_NAME.search(base) or hinted):
+        return Encoder(kind, "FLUX 3 prompt upsampler", "FLUX 3 Image Klein", vision, tied, tuned_from=name)
+    return Encoder(kind, name, whose, vision, tied)
 
 
 # --- loading ---------------------------------------------------------------------------------------
@@ -280,7 +298,7 @@ class Engine:
         if not torch.cuda.is_available():
             raise RuntimeError("No GPU is visible: the text encoder runs on a GPU")
         start = time.time()
-        self.log(f"Loading {self.enc.name} ({self.enc.whose}'s text encoder) from {self.path}")
+        self.log(f"Loading {self.enc.label} from {self.path}")
         self.model, self.processor = self._gemma() if self.enc.kind == "gemma4" else self._qwen()
         self.model.eval()
         assert_materialized(self.model)

@@ -49,16 +49,17 @@ download from any address, including ones on your local network.
 
 ## First job
 
-1. **Settings → Model files**: set your ComfyUI models folder.
-2. **Profiles → Model files**: download what's missing, then **Create profile**.
-3. **Datasets**: link a folder or upload files. Captions are `.txt` files next
+1. **Models → Model files**: set your ComfyUI models folder, download what's
+   missing, then **Create profile**.
+2. **Datasets**: link a folder or upload files. Captions are `.txt` files next
    to each file; **Auto-Caption** writes them once a caption provider is set
    up in Settings.
-4. **New job**: pick the profile and datasets, set the steps and sample prompts,
+3. **New job**: pick the profile and datasets, set the steps and sample prompts,
    and press **Fit to GPU** if the projection says it won't fit.
-5. **Queue**: open the job for its samples, loss and log. The LoRA is saved in
+4. **Queue**: open the job for its samples, loss and log. The LoRA is saved in
    `data/jobs/<job name>_<id>/` and downloadable from the Checkpoints tab.
-6. **Sandbox**: generate with the LoRA and compare it with the base model.
+5. **Sandbox**: generate with the LoRA and compare it with the render without
+   it.
 
 ## Documentation
 
@@ -66,7 +67,7 @@ download from any address, including ones on your local network.
 - [Merge & extract](docs/merge-and-extract.md): LoRAs merged into one, LoRAs extracted from any finetuned model
 - [Datasets](docs/datasets.md): edit datasets (sources and results), health check, caption edits, Split into clips and the clip editor, Add from URL
 - [Captions](docs/captions.md): Auto-Caption and the caption provider
-- [Jobs](docs/jobs.md): Create Job, the queue, editing and continuing jobs, the checkpoint picker, notifications
+- [Jobs](docs/jobs.md): New job, the queue, editing and continuing jobs, the checkpoint picker, notifications
 - [Sandbox](docs/sandbox.md)
 - [Upscaling](docs/upscaling.md): Real-ESRGAN and SeedVR2 in the Sandbox, and a dataset's small images
 - [LoKr](docs/lokr.md), [Sliders](docs/sliders.md), [Full finetuning](docs/finetuning.md), [RefMods](docs/refmods.md), [Music](docs/music.md)

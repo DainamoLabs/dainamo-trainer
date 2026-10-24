@@ -3,8 +3,8 @@ import {
   api, q, type Dataset, type DatasetUpscale, type SandboxOutput, type SandboxRun, type UpscaleParams, type UpscalePlan, type Upscaler,
   type Upscalers,
 } from "../api";
-import { IconFilm, IconImages, IconUpload, IconUpscale, IconX } from "./icons";
-import { Info, Modal, PathInput, usePoll, useToast } from "./ui";
+import { IconFilm, IconImages, IconRight, IconUpload, IconUpscale } from "./icons";
+import { Info, Modal, PathInput, TaskProgress, usePoll, useToast } from "./ui";
 
 /** What to upscale: a Sandbox run's output, or a file on this machine (``upload``), with its size when known. */
 export type UpscaleTarget = {
@@ -19,6 +19,8 @@ const FACTORS = [2, 3, 4];
 const MAX_FACTORS = [2, 3, 4, 6, 8];
 const MAX_SIDE = { image: 8192, video: 4096 }; // the server's limits on an upscaled file's longest side
 const MODEL_KEY = "dainamo.upscale.model"; // the upscaler picked last
+const TILES = [512, 768, 1024]; // SeedVR2's VAE tile sizes offered; blank: Auto, tiled only when a frame won't fit
+const SEED = 666; // SeedVR2's default seed, as the reference's
 const FACTOR_KEY = "dainamo.upscale.factor";
 
 export const UPSCALE_INFO = {
@@ -43,21 +45,25 @@ export function upscalerLabel(m: Upscaler) {
   if (m.kind === "pixel") return `${m.name} · ${m.scale}×`;
   return m.name;
 }
-const usable = (m: Upscaler) => m.kind !== "unknown" && !m.error;
+export const usableUpscaler = (m: Upscaler) => m.kind !== "unknown" && !m.error;
 
 /** The upscaler to start on: the one picked last, else SeedVR2 for a clip and a pixel upscaler for an image. */
-function pickModel(models: Upscaler[], kind: "image" | "video", wanted?: string) {
-  const ok = models.filter(usable);
+export function pickUpscaler(models: Upscaler[], kind: "image" | "video", wanted?: string) {
+  const ok = models.filter(usableUpscaler);
   return ok.find((m) => m.path === wanted) || ok.find((m) => m.path === remembered(MODEL_KEY))
     || ok.find((m) => m.kind === (kind === "video" ? "seedvr2" : "pixel")) || ok[0];
 }
 
-/** The upscalers menu: the usable ones, then the others, greyed with the reason. */
-function UpscalerSelect({ models, value, onChange }: { models: Upscaler[]; value: string; onChange: (path: string) => void }) {
+/** The upscalers menu: ``extra`` options first (the hi-res fix's "Resize only"), the usable upscalers, then the
+ * others, greyed with the reason. */
+export function UpscalerSelect({ models, value, onChange, extra }: {
+  models: Upscaler[]; value: string; onChange: (path: string) => void; extra?: React.ReactNode;
+}) {
   return (
     <select value={value} onChange={(e) => onChange(e.target.value)}>
-      {models.filter(usable).map((m) => <option key={m.path} value={m.path}>{upscalerLabel(m)}</option>)}
-      {models.filter((m) => !usable(m)).map((m) => (
+      {extra}
+      {models.filter(usableUpscaler).map((m) => <option key={m.path} value={m.path}>{upscalerLabel(m)}</option>)}
+      {models.filter((m) => !usableUpscaler(m)).map((m) => (
         <option key={m.path} value={m.path} disabled>{m.name} · {m.error || "not an upscaler Dainamo reads"}</option>
       ))}
     </select>
@@ -83,10 +89,21 @@ export function UpscaleDialog({ target, gpu, onClose, onQueued }: {
   const [list] = usePoll<Upscalers>("/api/upscalers", 0);
   const models = list?.models || [];
   const [picked, setPicked] = useState("");
-  const cur = pickModel(models, target.kind, picked);
+  const cur = pickUpscaler(models, target.kind, picked);
   const [factor, setFactor] = useState(() => FACTORS.includes(Number(remembered(FACTOR_KEY))) ? Number(remembered(FACTOR_KEY)) : 2);
   const [size, setSize] = useState(target.width && target.height ? { width: target.width, height: target.height } : null);
   const [busy, setBusy] = useState(false);
+  // SeedVR2's settings, as typed: blank leaves one to its default
+  const [maxFrames, setMaxFrames] = useState("");
+  const [tile, setTile] = useState("");
+  const [seed, setSeed] = useState(String(SEED));
+  const seedvr2 = cur?.kind === "seedvr2";
+  const options = seedvr2 ? {
+    ...(target.kind === "video" && maxFrames.trim() ? { max_frames: Number(maxFrames) } : {}),
+    ...(tile ? { tile: Number(tile) } : {}),
+    ...(seed.trim() ? { seed: Number(seed) } : {}),
+  } : {};
+  const optionsOk = Object.values(options).every((v) => Number.isInteger(v) && v >= 0);
   useEffect(() => {
     if (size || target.kind !== "image" || !target.upload) return;
     api.get<{ width: number; height: number }>(`/api/sandbox/image-size?path=${q(target.upload)}`).then(setSize, () => {});
@@ -100,6 +117,7 @@ export function UpscaleDialog({ target, gpu, onClose, onQueued }: {
     try {
       const run = await api.post<SandboxRun>("/api/sandbox/upscale", {
         model: cur.path, factor, gpu, ...(target.source ? { source: target.source } : { upload: target.upload }),
+        ...(Object.keys(options).length ? { options } : {}),
       });
       remember(MODEL_KEY, cur.path);
       remember(FACTOR_KEY, String(factor));
@@ -115,7 +133,7 @@ export function UpscaleDialog({ target, gpu, onClose, onQueued }: {
   return (
     <Modal title={`Upscale ${target.kind === "video" ? "a video" : "an image"}`} onClose={onClose} footer={<>
       <button className="btn ghost" onClick={onClose}>Cancel</button>
-      <button className="btn primary" disabled={!cur || busy || tooBig} onClick={go}><IconUpscale /> {busy ? "Starting…" : "Upscale"}</button>
+      <button className="btn primary" disabled={!cur || busy || tooBig || !optionsOk} onClick={go}><IconUpscale /> {busy ? "Starting…" : "Upscale"}</button>
     </>}>
       {!list ? <div className="muted">Looking for upscalers…</div> : (
         <div className="stack">
@@ -126,7 +144,7 @@ export function UpscaleDialog({ target, gpu, onClose, onQueued }: {
               <div className="muted small">{size ? `${size.width}×${size.height}` : target.kind === "video" ? "Video" : "Image"}</div>
             </div>
           </div>
-          {!models.some(usable) ? <NoUpscaler list={list} /> : <>
+          {!models.some(usableUpscaler) ? <NoUpscaler list={list} /> : <>
             <label className="field">
               <span>Upscaler<Info text={UPSCALE_INFO.model} /></span>
               <UpscalerSelect models={models} value={cur?.path || ""} onChange={setPicked} />
@@ -140,6 +158,38 @@ export function UpscaleDialog({ target, gpu, onClose, onQueued }: {
                 {size!.width}×{size!.height} → {out[0]}×{out[1]}{tooBig ? `: a side can be at most ${MAX_SIDE[target.kind]} pixels` : ""}
               </span>}
             </div>
+            {seedvr2 && (
+              <details className="me-how up-opts">
+                <summary><IconRight />SeedVR2 settings</summary>
+                <div className="up-opts-body">
+                  <div className={"grid " + (target.kind === "video" ? "cols-3" : "cols-2")}>
+                    {target.kind === "video" && (
+                      <label className="field">
+                        <span>Frames per pass <span className="faint">· optional</span></span>
+                        <input type="number" min={1} max={1001} step={4} value={maxFrames} placeholder="As many as fit" onChange={(e) => setMaxFrames(e.target.value)} />
+                      </label>
+                    )}
+                    <label className="field">
+                      <span>VAE tile</span>
+                      <select value={tile} onChange={(e) => setTile(e.target.value)}>
+                        <option value="">Auto</option>
+                        {TILES.map((t) => <option key={t} value={t}>{t} px</option>)}
+                      </select>
+                    </label>
+                    <label className="field">
+                      <span>Seed</span>
+                      <input type="number" min={0} value={seed} placeholder={String(SEED)} onChange={(e) => setSeed(e.target.value)} />
+                    </label>
+                  </div>
+                  <p className="help" style={{ margin: 0 }}>
+                    {target.kind === "video" ? "Frames per pass: blank takes as many as fit at the size (rounded down to 4n + 1); fewer need less VRAM, with more joins between passes. " : ""}
+                    VAE tile: Auto tiles a frame only when it wouldn't fit in the free VRAM; a smaller tile needs less VRAM and is slower.
+                    The same seed gives the same result.
+                  </p>
+                  {!optionsOk && <span className="validation error">Whole numbers of 0 or more</span>}
+                </div>
+              </details>
+            )}
             <p className="help" style={{ margin: 0 }}>
               {cur?.kind === "seedvr2"
                 ? `SeedVR2 makes the size asked for directly${target.kind === "video" ? ", and upscales the clip whole, so its frames stay consistent" : ""}. It's slower than a pixel upscaler and needs more VRAM.`
@@ -254,7 +304,7 @@ export function DatasetUpscaleModal({ dataset, last, onClose, onStarted }: {
   const [list] = usePoll<Upscalers>("/api/upscalers", 0);
   const models = list?.models || [];
   const [picked, setPicked] = useState("");
-  const cur = pickModel(models, "image", picked || last?.model);
+  const cur = pickUpscaler(models, "image", picked || last?.model);
   const [resolution, setResolution] = useState(last?.resolution ?? 1024);
   const [maxFactor, setMaxFactor] = useState(last?.max_factor ?? 4);
   const resOk = Number.isInteger(resolution) && resolution >= 128 && resolution <= 4096;
@@ -287,7 +337,7 @@ export function DatasetUpscaleModal({ dataset, last, onClose, onStarted }: {
           <p className="help" style={{ margin: 0 }}>Training never makes an image bigger, so one smaller than the resolution trains smaller.
             This upscales the images under the resolution to about its size (each side by at most the largest factor), saves each as a PNG
             of the same name, and leaves the captions as they are. Clips aren't upscaled here: use Upscale a file in the Sandbox.</p>
-          {!models.some(usable) ? <NoUpscaler list={list} /> : (
+          {!models.some(usableUpscaler) ? <NoUpscaler list={list} /> : (
             <label className="field">
               <span>Upscaler<Info text={UPSCALE_INFO.model} /></span>
               <UpscalerSelect models={models} value={cur?.path || ""} onChange={setPicked} />
@@ -329,27 +379,19 @@ export function DatasetUpscaleModal({ dataset, last, onClose, onStarted }: {
 }
 
 /** A dataset's upscale on its page: progress with Cancel, then what was done. */
-export function DatasetUpscaleTask({ up, onCancel, onDismiss }: { up: DatasetUpscale; onCancel: () => void; onDismiss: () => void }) {
+export function DatasetUpscaleTask({ up, onCancel, onDismiss }: { up: DatasetUpscale; onCancel: () => Promise<unknown>; onDismiss: () => void }) {
   const active = up.state === "queued" || up.state === "running";
   const made = up.made;
+  const n = made?.upscaled ?? up.done;
   return (
-    <div className="dd-task">
-      <div className="row small" style={{ marginBottom: 6 }}>
-        <IconUpscale width={14} style={{ color: "var(--accent)" }} />
-        {up.state === "queued" ? <span>Upscaling waits for the Sandbox's generations before it</span>
-          : up.state === "running" ? <span>Upscaling {up.done} / {up.total} images <span className="faint">{up.message}</span></span>
-          : up.state === "done" ? <span>Upscaled {made?.upscaled ?? up.done} image{(made?.upscaled ?? up.done) === 1 ? "" : "s"}{made?.skipped ? `, ${made.skipped} skipped` : ""}
-            <span className="faint"> · the originals are in _originals</span></span>
-          : up.state === "cancelled" ? <span>Upscaling cancelled{up.done ? `; the ${up.done} image${up.done === 1 ? "" : "s"} already upscaled stay so` : ""}</span>
-          : <span className="validation error">Upscaling failed: {up.message}</span>}
-        <span className="spacer" />
-        {active ? <button className="btn sm" onClick={onCancel}><IconX /> Cancel</button>
-          : <button className="btn ghost icon sm" aria-label="Dismiss" title="Dismiss" onClick={onDismiss}><IconX /></button>}
-      </div>
-      {active && (up.state === "running" && up.total
-        ? <div className="progress"><div style={{ width: `${(100 * up.done) / Math.max(1, up.total)}%` }} /></div>
-        : <div className="progress busy"><div /></div>)}
-      {!!made?.errors.length && <div className="error-box" style={{ marginTop: 8 }}>{made.errors.slice(-5).map((e) => <div key={e}>{e}</div>)}</div>}
-    </div>
+    <TaskProgress className="dd-task" icon={<IconUpscale />} running={active} onCancel={onCancel} onDismiss={onDismiss}
+      errors={made?.errors}
+      label={up.state === "queued" ? "Upscaling waits for the Sandbox's generations before it"
+        : up.state === "running" ? "Upscaling"
+        : up.state === "done" ? <>Upscaled {n} image{n === 1 ? "" : "s"}{made?.skipped ? `, ${made.skipped} skipped` : ""}<span className="faint"> · the originals are in _originals</span></>
+        : up.state === "cancelled" ? `Upscaling cancelled${up.done ? `; the ${up.done} image${up.done === 1 ? "" : "s"} already upscaled stay so` : ""}`
+        : <span className="validation error">Upscaling failed: {up.message}</span>}
+      done={up.state === "running" ? up.done : undefined} total={up.state === "running" ? up.total : undefined}
+      detail={up.state === "running" && up.total ? `images ${up.message || ""}` : undefined} />
   );
 }

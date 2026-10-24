@@ -27,8 +27,6 @@ router = APIRouter(prefix="/api")
 MAX_FACTOR = 8
 MAX_IMAGE_SIDE = 8192  # an upscaled image's longest side
 MAX_VIDEO_SIDE = 4096
-# an upscaled clip's pixels times its frames, all held at once: 2048 × 2048 × 241 frames
-MAX_VIDEO_PIXELS = 2048 * 2048 * 241
 MIN_RESOLUTION, MAX_RESOLUTION = 128, 4096
 
 
@@ -154,9 +152,6 @@ def check_upscale(body: UpscaleIn) -> dict:
     if max(w, h) > side:
         raise HTTPException(400, f"{body.factor:g}× makes {w}×{h}; a{' video' if video else 'n image'}'s side can be at "
                                  f"most {side} pixels. Choose a smaller factor.")
-    if video and w * h * inp["frames"] > MAX_VIDEO_PIXELS:
-        raise HTTPException(400, f"{inp['frames']} frames at {w}×{h} is more than the Sandbox holds at once. Choose a "
-                                 "smaller factor, or a shorter clip.")
     return {"model": info["path"], "model_name": info["name"], "kind": info["kind"], "scale": info["scale"],
             "factor": float(body.factor), "source": source, "upload": inp["path"] if not source else None,
             "options": dict(body.options), "input": inp, "width": w, "height": h}

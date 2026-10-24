@@ -1,16 +1,16 @@
 import { useEffect, useState } from "react";
 import type { Tab } from "../App";
-import { fmtDuration, type Gpu, type Job } from "../api";
+import { fmtLeft, type BackgroundTask, type Gpu, type Job, type SystemRam } from "../api";
 import { FINISHED, PHASES } from "../pages/Queue";
 import { Temp } from "./Hardware";
-import { IconAlert, IconImages, IconLayers, IconPlus, IconQueue, IconSettings, IconSparkle } from "./icons";
+import { IconAlert, IconDownload, IconImages, IconLayers, IconPlus, IconQueue, IconScissors, IconSettings, IconSparkle, IconUpscale } from "./icons";
 import { Spark } from "./LossChart";
 
 const PAGES: { id: Tab; label: string; icon: React.FC<React.SVGProps<SVGSVGElement>> }[] = [
   { id: "queue", label: "Queue", icon: IconQueue },
   { id: "sandbox", label: "Sandbox", icon: IconSparkle },
   { id: "datasets", label: "Datasets", icon: IconImages },
-  { id: "profiles", label: "Profiles", icon: IconLayers },
+  { id: "profiles", label: "Models", icon: IconLayers },
 ];
 
 // the failed job whose warning was put away by opening its page
@@ -35,11 +35,16 @@ function progressOf(j: Job) {
   const phase = stopping ? "Stopping" : j.evaluating ? "Evaluating checkpoints" : PHASES[p.phase || ""] || p.phase || "Starting";
   const counted = !j.evaluating && ["training", "extracting", "merging"].includes(p.phase || "") && !!p.total_steps;
   const pct = counted ? Math.min(100, (100 * (p.step || 0)) / p.total_steps!) : null;
-  const left = !stopping && p.phase === "training" && p.eta_seconds != null ? fmtDuration(p.eta_seconds) : null;
+  const left = !stopping && p.phase === "training" ? fmtLeft(p.eta_seconds) : "";
   const steps = counted ? `${(p.step || 0).toLocaleString()} / ${p.total_steps!.toLocaleString()}` : null;
   const training = !stopping && !j.evaluating && p.phase === "training";
-  return { pct, left, meta: [!training && phase, steps, left && `${left} left`].filter(Boolean).join(" · ") };
+  return { pct, left, meta: [!training && phase, steps, left].filter(Boolean).join(" · ") };
 }
+
+const TASK_ICON: Record<BackgroundTask["kind"], React.ReactNode> = {
+  caption: <IconSparkle />, split: <IconScissors />, download: <IconDownload />, upscale: <IconUpscale />,
+};
+const taskPct = (t: BackgroundTask) => (t.total ? Math.min(100, (100 * t.done) / t.total) : null);
 
 function Ring({ pct }: { pct: number }) {
   const c = 2 * Math.PI * 10;
@@ -52,8 +57,11 @@ function Ring({ pct }: { pct: number }) {
 }
 
 /** The pages on the left; on the right, what the trainer is doing (the running job, or the last one if it failed, or
- * idle), each GPU's memory and temperature, Settings and New job. On a phone the pages move to ``TabBar``. */
-export function TopBar({ tab, arg, jobs, gpus, waiting }: { tab: Tab; arg: string; jobs: Job[] | null; gpus: Gpu[]; waiting: number }) {
+ * idle), a dataset task going (captioning, a split, a download, an upscale: its page isn't the only place it shows),
+ * each GPU's memory and temperature, Settings and New job. On a phone the pages move to ``TabBar``. */
+export function TopBar({ tab, arg, jobs, gpus, ram, waiting, tasks }: {
+  tab: Tab; arg: string; jobs: Job[] | null; gpus: Gpu[]; ram?: SystemRam; waiting: number; tasks: BackgroundTask[];
+}) {
   const page = pageOf(tab);
   const running = (jobs || []).filter((j) => j.status === "running" || j.status === "stopping").sort((a, b) => (a.started || 0) - (b.started || 0));
   const last = (jobs || []).filter((j) => FINISHED.includes(j.status) && j.finished).sort((a, b) => b.finished! - a.finished!)[0];
@@ -70,6 +78,8 @@ export function TopBar({ tab, arg, jobs, gpus, waiting }: { tab: Tab; arg: strin
   const prog = job && progressOf(job);
   const failed = !job && broke && seen !== broke.id ? broke : null;
   const failedAt = failed && `${failed.status === "failed" ? "Failed" : "Interrupted"}${failed.progress.step ? ` at step ${failed.progress.step.toLocaleString()}` : ""}`;
+  const task = tasks[0];
+  const taskMeta = task && [task.dataset, task.total ? `${task.done.toLocaleString()} / ${task.total.toLocaleString()}` : ""].filter(Boolean).join(" · ");
 
   return (
     <header className="topbar">
@@ -106,7 +116,15 @@ export function TopBar({ tab, arg, jobs, gpus, waiting }: { tab: Tab; arg: strin
               <span className="tb-err-link">View log</span>
             </a>
           )}
-          {!job && !failed && (
+          {task && (
+            <a className="tb-chip tb-task" href={`#/datasets/${encodeURIComponent(task.dataset_id)}`} title={`${task.label} · ${taskMeta}`}>
+              <span className="tb-task-icon" aria-hidden="true">{TASK_ICON[task.kind]}</span>
+              <span className="tb-text"><span className="tb-name">{task.label}</span><span className="tb-meta">{taskMeta}</span></span>
+              {tasks.length > 1 && <span className="tb-meta">+{tasks.length - 1}</span>}
+              {taskPct(task) != null && <span className="tb-line" aria-hidden="true"><span style={{ width: `${taskPct(task)}%` }} /></span>}
+            </a>
+          )}
+          {!job && !failed && !task && (
             <div className="tb-chip">
               <span className="tb-idle" aria-hidden="true" />
               <span className="tb-text">
@@ -130,6 +148,16 @@ export function TopBar({ tab, arg, jobs, gpus, waiting }: { tab: Tab; arg: strin
                   </div>
                 );
               })}
+              {ram && ram.total_gb > 0 && (  // system RAM: what offloading, Low VRAM and the Sandbox's parked models live in
+                <div className="tb-gpu tb-ram"
+                  title={`System RAM · ${ram.used_gb.toFixed(1)} of ${ram.total_gb.toFixed(0)} GB in use · ${ram.available_gb.toFixed(1)} GB available`}>
+                  <span className="tb-gpu-top"><span>RAM</span><span className="tb-temp faint">{ram.total_gb.toFixed(0)} GB</span></span>
+                  <span className="tb-gpu-mem">
+                    <span className={`tb-meter${ram.used_gb / ram.total_gb > 0.1 ? " on" : ""}`}><span style={{ width: `${(100 * ram.used_gb) / ram.total_gb}%` }} /></span>
+                    {ram.used_gb.toFixed(1)} GB
+                  </span>
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -144,6 +172,11 @@ export function TopBar({ tab, arg, jobs, gpus, waiting }: { tab: Tab; arg: strin
         ) : failed ? (
           <a className="tb-mini err" href={`#/queue/${encodeURIComponent(failed.id)}/log`} aria-label={`${failed.name}: ${failedAt}`}>
             <IconAlert /> {failed.status === "failed" ? "Failed" : "Interrupted"}
+          </a>
+        ) : task ? (
+          <a className="tb-mini tb-mini-task" href={`#/datasets/${encodeURIComponent(task.dataset_id)}`} aria-label={`${task.label}: ${taskMeta}`}>
+            {taskPct(task) != null ? <Ring pct={taskPct(task)!} /> : <span className="tb-task-icon">{TASK_ICON[task.kind]}</span>}
+            <span className="tb-meta">{task.label}</span>
           </a>
         ) : null}
 

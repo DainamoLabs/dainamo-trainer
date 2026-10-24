@@ -1,10 +1,10 @@
 # Jobs
 
-| Create Job | Queue |
+| New job | Queue |
 | --- | --- |
-| ![Create Job with a dataset card, its health check and the summary](screenshots/create-job.png) | ![The queue with four finished jobs](screenshots/queue.png) |
+| ![New job with a dataset card, its health check and the summary](screenshots/create-job.png) | ![The queue with four finished jobs](screenshots/queue.png) |
 
-## Create Job
+## New job
 
 Pick a profile, the datasets and the training settings, then add the job to the
 queue. The sidebar sums up the run (its datasets, epochs, saves and file size)
@@ -43,7 +43,8 @@ Besides a LoRA, a job can make:
   ([Sliders](sliders.md));
 - a finetune, for MOSS-Image and Krea 2: **Finetune** under Training method
   ([Full finetuning](finetuning.md));
-- a RefMod, for MiniMax H3: **RefMod** under Make ([RefMods](refmods.md)).
+- a RefMod, for MiniMax H3: **RefMod** under Training method
+  ([RefMods](refmods.md)).
 
 **Sample prompts** are cards. Width, height, seed and LoRA strength left blank
 use the Sampling defaults.
@@ -93,10 +94,14 @@ A job's files are in `data/jobs/<name>_<id>/`, named when the job is added;
 renaming the job later doesn't move them. Jobs added before folders had names
 keep `data/jobs/<id>/`.
 
-You can stop a job (it saves its state), resume or restart it, take samples or a
-checkpoint now, or duplicate its settings into a new job.
+On its page you can stop a job (it saves its state), cancel it while it waits,
+force a stopping one to stop now, resume it from its last save or restart it
+from step 0 (after asking), take samples or a checkpoint now, duplicate its
+settings into a new job, or delete it. A job with no save to resume from offers
+only Restart. A finetune's page also extracts a LoRA from one of its
+checkpoints ([Merge and extract](merge-and-extract.md)).
 
-**Edit** opens a job that isn't running in the Create Job form. Before it has
+**Edit** opens a job that isn't running in the New job form. Before it has
 trained, anything can change. After that, it carries on from its last save with
 the changes: datasets, clip length, resolution, batch size, learning rate and
 schedule, steps, samples, memory settings, masked loss, EMA weights, the noise
@@ -110,8 +115,8 @@ from step 0, after asking.
 
 **Continue training** gives a finished job more steps, picking up with the same
 optimizer state. Its final LoRA so far is kept as `name_002000.safetensors`,
-which "keep last N" never deletes. A cosine or linear schedule stretches to the
-new length.
+which **Keep last N saves** never deletes. A cosine or linear schedule
+stretches to the new length.
 
 **Open in Sandbox**, on an enlarged sample, loads its prompt, seed, size,
 sampler and checkpoint into the Sandbox, so Generate re-creates it.
@@ -125,24 +130,25 @@ model file elsewhere counts as the same file; another precision or a fine-tune
 doesn't.
 
 Each job's card on the Queue page shows its disk use. Below the jobs, the
-Queue shows the total: everything the jobs keep, the cache, and the LoRAs.
+Queue shows the total: everything the jobs keep, the cache, and the outputs
+(LoRAs, finetuned models and RefMods).
 **Manage cache** shows how much of the cache queued or running jobs use, and
 clears the rest. A completed job's training state can be deleted on its page,
 after which the job can't continue.
 
 ## Checkpoint picker and concept bleed
 
-Both are off by default; turn them on in section 06 of Create Job. They run at
-each save, and at step 0 as a baseline.
+Both are off by default; turn them on in New job's **Checkpoint picker &
+concept bleed** section. They run at each save, and at step 0 as a baseline.
 
-**Best checkpoint picker.** Every checkpoint is scored on validation images,
+**Checkpoint picker.** Every checkpoint is scored on validation images,
 held out of training or taken from a separate dataset, with the same noise and
 timesteps each time. The curve turns upward when the LoRA starts to overfit. The
-checkpoint with the lowest validation loss is recommended, and "keep last N"
-never deletes it. Optionally, it's rendered at several LoRA strengths at the
-end.
+checkpoint with the lowest validation loss is recommended, and **Keep last N
+saves** never deletes it. Optionally, it's rendered at several LoRA strengths at
+the end.
 
-**Concept bleed detector.** Prompts without the trigger word are rendered by the
+**Concept bleed.** Prompts without the trigger word are rendered by the
 base model and each checkpoint with a fixed seed, and compared with DINOv2 image
 features (`facebook/dinov2-small`, downloaded once):
 

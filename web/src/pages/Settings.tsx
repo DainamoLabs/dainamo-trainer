@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
+import { useUnsaved } from "../App";
 import { api, fmtTime, type AuthStatus, type CaptionProvider, type CaptionStyle, type EncoderInfo, type Gpu, type LlmStatus, type NotifyKind, type Settings, type WhisperModel } from "../api";
 import { browserAlertsBlocked, browserAlertsOn, setBrowserAlerts } from "../components/alerts";
-import { Info, PathInput, usePoll, useToast } from "../components/ui";
+import { Info, LoadError, PathInput, usePoll, useToast } from "../components/ui";
 
 const MODES: { id: Settings["queue"]["mode"]; label: string; desc: string }[] = [
   { id: "sequential", label: "Sequential", desc: "One job at a time, in queue order, on the first selected GPU." },
@@ -43,7 +44,8 @@ const SERVER_STATE: Record<LlmStatus["state"], [string, string]> = {
   off: ["", "Off"], starting: ["running", "Loading"], ready: ["completed", "Ready"], stopping: ["stopping", "Stopping"], failed: ["failed", "Failed"],
 };
 
-/** The server Dainamo runs (llama-server or a text encoder): how it is, Start (with the settings on the page, saved first) and Stop, and its log. */
+/** The server Dainamo runs (llama-server or a text encoder): how it is, Start (with the caption provider's settings on
+ * the page, saved first: only those, so other edits stay unsaved) and Stop, and its log. */
 function ServerPanel({ st, reload, save }: { st: LlmStatus; reload: () => void; save: () => Promise<boolean> }) {
   const toast = useToast();
   const [showLog, setShowLog] = useState(false);
@@ -89,18 +91,25 @@ function ServerPanel({ st, reload, save }: { st: LlmStatus; reload: () => void; 
   );
 }
 
-/** Pick a caption style to edit; add, duplicate or delete styles, and choose the default for new datasets. */
-function CaptionStyles({ value, onChange }: { value: Settings["caption_styles"]; onChange: (v: Settings["caption_styles"]) => void }) {
+/** Pick a caption style to edit; add, duplicate or delete styles, and choose the default for new datasets. A style's
+ * system prompt, temperature and max tokens are under Advanced; blank ones are the caption provider's (``provider``). */
+function CaptionStyles({ value, onChange, provider }: {
+  value: Settings["caption_styles"]; onChange: (v: Settings["caption_styles"]) => void; provider: Settings["captioner"];
+}) {
   const [sel, setSel] = useState(value.default);
   const styles = value.styles;
   const cur = styles.find((x) => x.id === sel) || styles[0];
   const put = (list: CaptionStyle[], def = value.default) => onChange({ default: def, styles: list });
   const edit = (patch: Partial<CaptionStyle>) => put(styles.map((x) => (x.id === cur.id ? { ...x, ...patch } : x)));
   const add = (from?: CaptionStyle) => {
-    const st = { id: `style-${Date.now().toString(36)}`, name: from ? `${from.name} (copy)` : "New style", prompt: from?.prompt || "" };
+    const id = `style-${Date.now().toString(36)}`;
+    const st: CaptionStyle = from ? { ...from, id, name: `${from.name} (copy)` } : { id, name: "New style", prompt: "" };
     put([...styles, st]);
     setSel(st.id);
   };
+  // what Advanced holds for this style, shown beside it while it's closed
+  const own = [cur.system && "system prompt", cur.temperature != null && `temperature ${cur.temperature}`,
+    cur.max_tokens != null && `${cur.max_tokens} tokens at most`].filter(Boolean) as string[];
   const remove = () => {
     const rest = styles.filter((x) => x.id !== cur.id);
     put(rest, value.default === cur.id ? rest[0].id : value.default);
@@ -125,21 +134,48 @@ function CaptionStyles({ value, onChange }: { value: Settings["caption_styles"];
           </label>
         </div>
         <label className="field"><span>Prompt</span><textarea rows={4} value={cur.prompt} onChange={(e) => edit({ prompt: e.target.value })} /></label>
+        <details>
+          <summary className="muted small" style={{ cursor: "pointer" }}>Advanced{own.length > 0 && <span className="faint"> · {own.join(", ")}</span>}</summary>
+          <div className="stack" style={{ marginTop: 10 }}>
+            <label className="field"><span>System prompt <span className="faint">· optional</span></span>
+              <textarea rows={8} value={cur.system || ""} onChange={(e) => edit({ system: e.target.value || undefined })} />
+              <span className="help">The model's instructions, sent before the image; the prompt above then goes with the image.</span>
+            </label>
+            <div className="grid cols-2">
+              <label className="field"><span>Temperature<Info text={INFO.temperature} /></span>
+                <input type="number" step={0.1} min={0} max={2} value={cur.temperature ?? ""} placeholder={String(provider.temperature)}
+                  onChange={(e) => edit({ temperature: e.target.value === "" ? undefined : Number(e.target.value) })} />
+              </label>
+              <label className="field"><span>Max tokens<Info text={INFO.maxTokens} /></span>
+                <input type="number" step={64} min={16} value={cur.max_tokens ?? ""} placeholder={String(provider.max_tokens)}
+                  onChange={(e) => edit({ max_tokens: e.target.value === "" ? undefined : Number(e.target.value) })} />
+              </label>
+            </div>
+            <span className="help">Blank uses the caption provider's. About 1024 tokens is plenty for a caption: FLUX 3's prompt upsampler allows 3584, room for layout tables, but its captions run 100 to 350 words, so the FLUX 3 style stops at 1024.</span>
+          </div>
+        </details>
       </div>
       <span className="help">You pick a style when you start Auto-Caption, and each dataset remembers the one it used, so datasets for different models can each keep their own. The captioner sees images, or a few frames of a clip; it can't hear sound.</span>
     </div>
   );
 }
 
+// the sections the caption provider's server starts with: Start saves these, and only these
+const PROVIDER_SECTIONS: (keyof Settings)[] = ["captioner", "llama", "text_encoder"];
+const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+
 export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; auth: AuthStatus; onSignOut: () => void }) {
   const toast = useToast();
+  // ``s``: the settings as edited on the page; ``saved``: as the server has them
   const [s, setS] = useState<Settings | null>(null);
+  const [saved, setSaved] = useState<Settings | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
   const [test, setTest] = useState<string | null>(null);
   const [notifyTest, setNotifyTest] = useState<string | null>(null);
   const [delivery, setDelivery] = useState<Delivery>({});
   const [browser, setBrowser] = useState(browserAlertsOn());
   const [whisper, setWhisper] = useState<WhisperModel[]>([]);
-  const [suggested, setSuggested] = useState<string[]>([]); // models folders the profiles' files are in
   // a Dainamo server started before this page was built has no caption provider settings: it needs a restart
   const stale = !!s && (!s.llama || !s.text_encoder);
   const provider = (!stale && s?.captioner.provider) || "server";
@@ -147,22 +183,35 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
   const encPath = provider === "encoder" ? s?.text_encoder.path.trim() : "";
   const [encoder] = usePoll<EncoderInfo>(encPath ? `/api/llm/encoder?path=${encodeURIComponent(encPath)}` : null, 0);
   const [encoders] = usePoll<EncoderInfo[]>(provider === "encoder" ? "/api/llm/encoders" : null, 0);
+  const load = () => api.get<Settings>("/api/settings").then((r) => { setS(r); setSaved(r); setLoadError(null); }, (e) => setLoadError(e.message));
   useEffect(() => {
-    api.get<Settings>("/api/settings").then(setS);
+    load();
     api.get<Delivery>("/api/notifications").then(setDelivery, () => {});
     api.get<{ whisper_models: WhisperModel[] }>("/api/system").then((sys) => setWhisper(sys.whisper_models), () => {});
-    api.get<{ folders: string[] }>("/api/models/suggest").then((r) => setSuggested(r.folders), () => {});
   }, []);
-  if (!s) return <div className="page muted">Loading…</div>;
+  // the sections edited and not saved yet
+  const changed = s && saved ? (Object.keys(s) as (keyof Settings)[]).filter((k) => !same(s[k], saved[k])) : [];
+  useUnsaved(changed.length > 0, "Settings");
+  if (!s || !saved) {
+    return <div className="page">{loadError ? <LoadError what="the settings" error={loadError} onRetry={load} /> : <p className="muted">Loading…</p>}</div>;
+  }
 
-  const save = async (quiet = false) => {
+  /** Save the edited sections (``only``: just those of them), keeping other edits on the page as they are. */
+  const save = async (quiet = false, only?: (keyof Settings)[]) => {
+    const keys = changed.filter((k) => !only || only.includes(k));
+    if (!keys.length) return true;
+    setSaving(true);
     try {
-      setS(await api.put<Settings>("/api/settings", s));
+      const r = await api.put<Settings>("/api/settings", Object.fromEntries(keys.map((k) => [k, s[k]])));
+      setSaved(r);
+      setS((cur) => cur && { ...cur, ...Object.fromEntries(keys.map((k) => [k, r[k]])) });
       if (!quiet) toast("Settings saved");
       return true;
     } catch (e: any) {
       toast(e.message, true);
       return false;
+    } finally {
+      setSaving(false);
     }
   };
   const setQ = (patch: Partial<Settings["queue"]>) => setS({ ...s, queue: { ...s.queue, ...patch } });
@@ -214,10 +263,9 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
   };
 
   return (
-    <div className="page" style={{ maxWidth: 900 }}>
+    <div className="page settings-page">
       <div className="page-head">
-        <div><h1>Settings</h1><p>Queue behaviour, the Sandbox, model files, notifications, remote access and the caption provider.</p></div>
-        <button className="btn primary" onClick={() => save()}>Save settings</button>
+        <div><h1>Settings</h1><p>How the queue runs, the Sandbox, notifications, remote access and the caption provider.</p></div>
       </div>
 
       <div className="card card-pad" style={{ marginBottom: 16 }}>
@@ -266,21 +314,8 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
 
       <div className="card card-pad" style={{ marginBottom: 16 }}>
         <h2>Model files</h2>
-        <div className="field">
-          <span>ComfyUI models folder</span>
-          <PathInput mode="dir" value={s.models?.folder ?? ""} placeholder="…/ComfyUI/models" onChange={(v) => setS({ ...s, models: { folder: v } })} />
-          {!s.models?.folder && suggested.length > 0 && (
-            <div className="row wrap" style={{ gap: 8 }}>
-              <span className="help">Your profiles use files in <span className="mono">{suggested[0]}</span></span>
-              <button className="btn sm" type="button" onClick={() => setS({ ...s, models: { folder: suggested[0] } })}>Use it</button>
-            </div>
-          )}
-          <span className="help">
-            Model files (on the Profiles page) looks for model files here, and downloads each into the subfolder ComfyUI reads its
-            kind from: diffusion_models, text_encoders, vae, loras or checkpoints. Choose ComfyUI's models folder, or the
-            folder its extra_model_paths.yaml points to if your models live elsewhere.
-          </span>
-        </div>
+        <p className="help" style={{ margin: 0 }}>The ComfyUI models folder, where Dainamo finds model files and downloads them to, is set in{" "}
+          <a href="#/profiles/files">Models › Model files</a>.</p>
       </div>
 
       <div className="card card-pad" style={{ marginBottom: 16 }}>
@@ -422,12 +457,13 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
               <div className="field"><span>Text encoder (.safetensors)</span>
                 <PathInput value={s.text_encoder.path} exts=".safetensors" placeholder="text_encoder.safetensors" onChange={(v) => setT({ path: v })}
                   validation={s.text_encoder.path && encoder ? (encoder.ok
-                    ? { level: "ok", message: `${encoder.name}, ${encoder.whose}'s text encoder${encoder.vision ? "" : ". This file has no vision part, so it can't see images"}` }
+                    ? { level: "ok", message: `${encoder.tuned_from ? `${encoder.name} (${encoder.tuned_from}), which wrote ${encoder.whose}'s training captions` : `${encoder.name}, ${encoder.whose}'s text encoder`}${encoder.vision ? "" : ". This file has no vision part, so it can't see images"}` }
                     : { level: "error", message: encoder.error || "" }) : undefined} />
-                <span className="help">The text encoder file one of your profiles uses. Choosing one shows which model it is, or why it can't write text.</span>
+                <span className="help">The text encoder file one of your profiles uses. Choosing one shows which model it is, or why it can't write text.
+                  {!encoders?.some((e) => e.tuned_from) && <> Download the FLUX 3 prompt upsampler in <a href="#/profiles/files">Model files</a> to caption the way FLUX 3 was trained.</>}</span>
               </div>
               {encoders && encoders.length > 0 && (
-                <div className="field"><span>In your profiles</span>
+                <div className="field"><span>{encoders.some((e) => !e.profiles?.length) ? "In your profiles and models folder" : "In your profiles"}</span>
                   <div className="stack" style={{ gap: 6 }}>
                     {encoders.map((e) => (
                       <div key={e.path} className="row" style={{ gap: 8 }}>
@@ -435,8 +471,8 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
                           {e.path === s.text_encoder.path ? "Chosen" : "Use"}
                         </button>
                         <span className="small" style={{ minWidth: 0 }} title={e.ok ? e.path : e.error}>
-                          {e.ok ? `${e.name} · ${e.whose}'s` : <span className="muted">{e.path.split(/[\\/]/).pop()}: can't write text</span>}
-                          <span className="faint"> · {e.profiles?.join(", ")}</span>
+                          {e.ok ? `${e.name} · ${e.tuned_from || `${e.whose}'s`}` : <span className="muted">{e.path.split(/[\\/]/).pop()}: can't write text</span>}
+                          <span className="faint"> · {e.profiles?.length ? e.profiles.join(", ") : "models folder"}</span>
                         </span>
                       </div>
                     ))}
@@ -464,7 +500,7 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
               </div>
             </>
           )}
-          {provider !== "server" && llm && <ServerPanel st={llm} reload={reloadLlm} save={() => save(true)} />}
+          {provider !== "server" && llm && <ServerPanel st={llm} reload={reloadLlm} save={() => save(true, PROVIDER_SECTIONS)} />}
           {provider === "server" && (
             <>
               <div className="grid cols-2">
@@ -479,7 +515,7 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
               <div className="row"><button className="btn" onClick={runTest}>Test connection</button>{test && <span className="small muted">{test}</span>}</div>
             </>
           )}
-          <CaptionStyles value={s.caption_styles} onChange={(v) => setS({ ...s, caption_styles: v })} />
+          <CaptionStyles value={s.caption_styles} onChange={(v) => setS({ ...s, caption_styles: v })} provider={s.captioner} />
           <div className="field">
             <span>Video clips</span>
             <div className="grid cols-2">
@@ -534,6 +570,15 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
           </div>
         </div>
       </div>
+
+      {changed.length > 0 && (
+        <div className="save-bar" role="region" aria-label="Unsaved changes">
+          <span>Your changes aren't saved yet</span>
+          <span className="spacer" />
+          <button className="btn ghost" disabled={saving} onClick={() => setS(saved)}>Discard</button>
+          <button className="btn primary" disabled={saving} onClick={() => save()}>{saving ? "Saving…" : "Save settings"}</button>
+        </div>
+      )}
     </div>
   );
 }

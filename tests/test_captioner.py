@@ -1,5 +1,6 @@
 """How Auto-Caption and Enhance prompt read an LLM server's replies: thinking left out, a reply cut off at
-max_tokens asked for again with more room, and empty or still-cut-off replies reported, never saved.
+max_tokens asked for again with more room, and empty or still-cut-off replies reported, never saved. And what a
+caption style sends: its system prompt before the image, and its own temperature and max tokens.
 
     .venv/bin/python -m pytest tests/test_captioner.py -v
 """
@@ -101,3 +102,34 @@ def test_frames_fall_back_to_a_contact_sheet_when_refused(tmp_path):
     assert captioner.caption_file(str(clip), {**LLM, "video_frames": 3}, client) == "A test pattern."
     images = [sum(c.get("type") == "image_url" for c in g["messages"][0]["content"]) for g in got]
     assert images == [3, 1]
+
+
+def test_a_style_with_a_system_prompt_sends_it_first_with_its_own_sampling(tmp_path):
+    from dainamo.server import db
+
+    style = db.FLUX3_CAPTION_STYLE
+    cfg = captioner.style_config(LLM, style)
+    assert cfg["prompt"] == style["prompt"] and cfg["system"] == style["system"]
+    assert (cfg["temperature"], cfg["max_tokens"], cfg["endpoint"]) == (0, 1024, LLM["endpoint"])
+    photo = tmp_path / "photo.png"
+    Image.new("RGB", (64, 48), "green").save(photo)
+    client, got = server("Full-color outdoor photograph,\n a green field.")
+    assert captioner.caption_file(str(photo), cfg, client) == "Full-color outdoor photograph, a green field."
+    (body,) = got
+    system, user = body["messages"]
+    assert system == {"role": "system", "content": style["system"]}
+    # the image, then the text: how FLUX 3's upsampler gets its references
+    assert user["role"] == "user" and [c["type"] for c in user["content"]] == ["image_url", "text"]
+    assert user["content"][1]["text"] == style["prompt"]
+    assert (body["temperature"], body["max_tokens"]) == (0, 1024)
+
+
+def test_a_style_without_its_own_settings_keeps_the_providers():
+    plain = {"id": "tags", "name": "Tags", "prompt": "Tags."}
+    cfg = captioner.style_config(LLM, plain)
+    assert (cfg["prompt"], cfg["system"], cfg["temperature"], cfg["max_tokens"]) == ("Tags.", "", 0.2, 300)
+    client, got = server("cat, mat")
+    assert captioner._ask(cfg, client, cfg["prompt"], [Image.new("RGB", (32, 32))]) == "cat, mat"
+    (message,) = got[0]["messages"]  # one user message, its text first
+    assert message["role"] == "user" and [c["type"] for c in message["content"]] == ["text", "image_url"]
+    assert (got[0]["temperature"], got[0]["max_tokens"]) == (0.2, 300)

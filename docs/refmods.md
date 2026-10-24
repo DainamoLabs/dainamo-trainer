@@ -38,10 +38,11 @@ jobs' in the RefMods menu.
 
 ## Making one with a job
 
-For a dataset's images and clips, or for sound, choose **RefMod** under Make in
-Create Job (MiniMax H3 profiles, fl2va or ref2va), then what it's **Of**:
-*Pictures* or *Sound*. Nothing is trained; the job loads only a VAE and takes a
-few minutes or less. With one GPU, a queued job unloads the Sandbox first.
+For a dataset's images and clips, or for sound, choose **RefMod** under
+Training method in New job (MiniMax H3 profiles, fl2va or ref2va), then what
+it's **Of**: *Pictures* or *Sound*. Nothing is trained; the job loads only a VAE
+and takes a few minutes or less. With one GPU, a queued job unloads the Sandbox
+first.
 
 **Pictures.** Every image and clip in the chosen datasets is a reference, in
 order. Captions, repeats and `_refs` aren't used.

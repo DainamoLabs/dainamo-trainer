@@ -1,18 +1,24 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  api, byFamily, fmtClock, fmtDuration, fmtTime, type Family, type Gpu, type LoraOption, type ModelOption, type Profile, type RefModOption, type SandboxDefaults,
+  api, byFamily, fmtClock, fmtDuration, fmtSpeed, fmtTime, type Family, type Gpu, type LoraOption, type ModelOption, type Profile, type RefModOption, type SandboxDefaults,
   type SandboxOutput, type SandboxParams, type SandboxProgress, type SandboxRun, type SandboxStatus, type SystemRam,
-  type MediaKind, type Workflow,
+  type MediaKind, type Upscalers, type Workflow,
 } from "../api";
 import { IconPlayFill, IconPlus, IconRefresh, IconRight, IconSparkle, IconStop, IconTrash, IconUpscale, IconX } from "../components/icons";
 import { MakeRefModDialog, NEW_REFMOD, type RefModDraft } from "../components/MakeRefMod";
-import { UpscaleDialog, UpscaleFileCard, UpscaleRunView, upscaleMeta, upscaleParams, type UpscaleTarget } from "../components/Upscale";
-import { AudioPlayer, Empty, ImagesInput, Info, Lightbox, PathInput, ProfileOptions, StatusPill, usePoll, useToast } from "../components/ui";
+import {
+  UpscaleDialog, UpscaleFileCard, UpscaleRunView, UpscalerSelect, pickUpscaler, upscaleMeta, upscaleParams, usableUpscaler,
+  type UpscaleTarget,
+} from "../components/Upscale";
+import { AudioPlayer, ConfirmDialog, Empty, ImagesInput, Info, Lightbox, Num, PathInput, ProfileOptions, StatusPill, usePoll, useToast, useToastErrors } from "../components/ui";
 import { OffloadControl, gpuTarget, offloadFit, useVramProjection } from "../components/Vram";
 
 type LoraRow = { path: string; strength: number; custom: boolean };
 // compare checkpoints: a job's checkpoints (paths) at some strengths
 type GridForm = { on: boolean; job_id: string; checkpoints: string[]; strengths: string; base: boolean };
+// the hi-res fix: how many times bigger, made so by an upscaler (its path; "resize": Lanczos; "": the one picked last
+// in Upscale), then rendered again at a strength, in some steps ("": the run's)
+type HiresForm = { on: boolean; factor: number; model: string; strength: number; steps: string };
 type SizeMode = "shape" | "custom" | "match";
 // the latest enhanced prompt, and what it was made from: reused until one of those changes
 type Enhanced = { prompt: string; seed: number; workflow: string; images: string; text: string };
@@ -29,6 +35,8 @@ type Form = {
   size_mode: SizeMode; shape: string; mp: number; // width/height are used as typed only in "custom"
   enhance: boolean; enhanced: Enhanced | null;
   grid: GridForm;
+  strength: number; // Image-to-Image: how much of the input image is redone (1: all of it)
+  hires: HiresForm;
 };
 
 const STORE = "dainamo.sandbox.form";
@@ -61,6 +69,7 @@ function presetForm(base: Form, p: Preset, video: boolean): Form {
     sampler: "euler", scheduler: "default", shift: "", seed: p.seed, random_seed: false, count: 1, compare_base: false,
     loras: p.loras.map((l) => ({ ...l, custom: false })), images: p.images.join(", "), offload: p.offload ?? null,
     low_vram: !!p.low_vram, enhance: false, enhanced: null, refmods: [], audio: [], model: p.model || "", model_custom: false,
+    hires: { ...BLANK.hires, ...base.hires, on: false },
   };
 }
 const BLANK: Form = {
@@ -70,7 +79,9 @@ const BLANK: Form = {
   refmods: [], audio: [], compare_base: false, gpu: null, offload: null, low_vram: false, size_mode: "shape", shape: "1:1", mp: 1, enhance: false, enhanced: null,
   model: "", model_custom: false,
   grid: { on: false, job_id: "", checkpoints: [], strengths: "1.0", base: false },
+  strength: 0.6, hires: { on: false, factor: 2, model: "", strength: 0.35, steps: "" },
 };
+const HIRES_FACTORS = [1.5, 2];
 
 const parseStrengths = (s: string) => s.replace(/,/g, " ").split(/\s+/).filter(Boolean).map(Number).filter((n) => Number.isFinite(n));
 
@@ -82,6 +93,13 @@ const IMAGE_SHAPES = ["1:1", "4:3", "3:4", "16:9", "9:16"];
 const VIDEO_SHAPES = ["1:1", "5:3", "3:5", "16:9", "9:16"];
 const ROUND_MP = [0.25, 0.35, 0.5, 1, 1.5, 2]; // what a size is described as, when one of these gives it exactly
 const MAX_SIDE = 4096; // the server's limit
+
+// a side made ``factor`` times bigger, on the ``div`` grid, as the server rounds it (half to even)
+function scaled(side: number, factor: number, div: number) {
+  const x = (side * factor) / div;
+  const r = Math.round(x);
+  return Math.max(div, (x % 1 === 0.5 && r % 2 ? r - 1 : r) * div);
+}
 
 export function sizeFor(ratio: number, mp: number): [number, number] {
   const snap = (v: number) => Math.max(128, Math.round(v / 64) * 64);
@@ -131,9 +149,14 @@ const AUDIO_EXTS = ".mp3,.wav,.flac,.ogg,.m4a,.opus,.aac,.mp4,.mov,.mkv,.webm";
 
 // what the "i" beside a setting says, for the ones whose name doesn't
 const INFO = {
-  profile: "The model files to generate with (the model, its text encoder and VAE), set up on the Profiles page.",
-  workflow: "What to make: from a prompt alone, an edit of an input image, a video from a first frame, and so on. Only the ones this profile's model supports can be chosen.",
-  enhance: "Before generating, the caption provider set in Settings rewrites your prompt into a more detailed one, with an instruction for this workflow. The rewrite is kept and used again while the prompt, seed and inputs stay the same.",
+  profile: "The model files to generate with (the model, its text encoder and VAE), set up in Models.",
+  workflow: "What to make: from a prompt alone, from an input image, an edit of one, a video from a first frame, and so on. Only the ones this profile's model supports can be chosen.",
+  strength: "Sampling starts from the input image with this much noise added, then runs the steps from there, so the prompt and the LoRAs redo that much of it. Around 0.3 keeps the picture and changes its look; 0.6 keeps the layout; 1 starts from noise alone. The input is cropped to the output's shape: Match input keeps all of it.",
+  hires: "Renders at the size above, makes the result bigger, then renders it again at that size from the bigger image, so the detail is drawn at full size rather than stretched. Both are kept: the first pass shows beside the result.",
+  hiresModel: "What makes the first pass bigger before the second pass. Resize only is a plain Lanczos resize. An upscaler from Model files (Real-ESRGAN, SeedVR2) adds detail of its own first, which the second pass then refines. SeedVR2 takes much more VRAM and time: the diffusion model waits in system RAM while it runs.",
+  hiresStrength: "How much of the bigger image the second pass redoes: low keeps the first pass as it is with sharper detail, higher redraws more, and at a big size can start to repeat things.",
+  hiresSteps: "The second pass's steps, run from its strength down. Blank uses the run's steps.",
+  enhance: "Before generating, the caption provider (set in Settings) rewrites your prompt into a more detailed one, with an instruction for this workflow. The rewrite is kept and used again while the prompt, seed and inputs stay the same.",
   model: "The diffusion model to generate with: the profile's, or a finetune job's checkpoint (a whole model trained from it) in its place, with the profile's text encoder and VAE. Switching reloads only the diffusion model.",
   loras: "LoRAs applied while generating, each at its own strength: 1 is full strength, 0 is off, and a negative strength pushes the other way (as with a slider). Pick a job's checkpoint (★ is the one the checkpoint picker recommended) or any LoRA file.",
   megapixels: "How big to make it, at the shape chosen above. A megapixel is 1024×1024 pixels, and each side is rounded to a multiple of 64. Bigger takes more VRAM and time.",
@@ -157,18 +180,8 @@ const INFO = {
   advanced: "The sampler and its schedule, the GPU, and how much of the model to keep in system RAM while generating.",
 };
 
-function Num(props: { label: string; v: number; on: (n: number) => void; step?: number; min?: number; max?: number; disabled?: boolean; help?: string; info?: string }) {
-  return (
-    <label className="field">
-      <span>{props.label}{props.info && <Info text={props.info} />}</span>
-      <input type="number" value={Number.isFinite(props.v) ? props.v : ""} step={props.step} min={props.min} max={props.max}
-        disabled={props.disabled} onChange={(e) => props.on(e.target.value === "" ? NaN : Number(e.target.value))} />
-      {props.help && <span className="help">{props.help}</span>}
-    </label>
-  );
-}
-
-/** A checkpoint grid's outputs: per seed, a column per checkpoint and a row per strength, the base model first. */
+/** A checkpoint grid's outputs: per seed, a column per checkpoint and a row per strength, the render without LoRAs
+ * first. */
 type Open = (src: string, video: boolean, audio?: { poster?: string; score?: string }) => void;
 // a song's poster and score as URLs, for the lightbox's player
 const audioOf = (run: SandboxRun, o: SandboxOutput) => o.kind === "audio"
@@ -196,7 +209,7 @@ function GridView({ run, onOpen }: { run: SandboxRun; onOpen: Open }) {
           <div className="sbx-grid-wrap">
             <div className="sbx-grid" style={{ gridTemplateColumns: `auto repeat(${cols}, minmax(96px, 1fr))` }}>
               <div />
-              {g.base && <div className="sbx-grid-head">Base model</div>}
+              {g.base && <div className="sbx-grid-head">Without LoRAs</div>}
               {g.checkpoints.map((c) => <div key={c.path} className="sbx-grid-head" title={c.path}>{c.label}</div>)}
               {g.strengths.map((st, si) => [
                 <div key={`l${si}`} className="sbx-grid-label">LoRA {st}</div>,
@@ -211,23 +224,33 @@ function GridView({ run, onOpen }: { run: SandboxRun; onOpen: Open }) {
   );
 }
 
-/** One run's outputs, per seed: with the LoRAs and (comparing) the base model side by side, each under its name and
- * over what made it (``meta``, the run's settings, then its seed and LoRAs). An image or video has an Upscale button. */
+/** One run's outputs, per seed: with the LoRAs and (comparing) without them side by side, each under its name and
+ * over what made it (``meta``, the run's settings, then its seed and LoRAs). With the hi-res fix, each render's first
+ * pass is beside it, with its size (and comparing, the render without LoRAs and its first pass make a row below). An
+ * image or video has an Upscale button. */
 function RunView({ run, meta, onOpen, onUpscale }: { run: SandboxRun; meta: string; onOpen: Open; onUpscale: (o: SandboxOutput) => void }) {
-  if (run.params.grid) return <GridView run={run} onOpen={onOpen} />;
+  type Slot = "lora" | "base" | "pass1" | "pass1_base";
   const bySeed = useMemo(() => {
-    const m = new Map<number, Partial<Record<"lora" | "base", SandboxOutput>>>();
-    for (const o of run.outputs || []) m.set(o.seed, { ...(m.get(o.seed) || {}), [o.variant]: o });
+    const m = new Map<number, Partial<Record<Slot, SandboxOutput>>>();
+    for (const o of run.outputs || []) {
+      const slot: Slot = o.variant === "pass1" ? (o.of === "base" ? "pass1_base" : "pass1") : o.variant === "base" ? "base" : "lora";
+      m.set(o.seed, { ...(m.get(o.seed) || {}), [slot]: o });
+    }
     return [...m.entries()];
   }, [run.outputs]);
+  if (run.params.grid) return <GridView run={run} onOpen={onOpen} />;
   const compare = run.params.compare_base;
+  const hires = run.params.hires;
   const loras = run.params.loras;
   const song = run.params.seconds != null;
-  const panel = (o: SandboxOutput | undefined, variant: "lora" | "base", seed: number) => {
-    const label = variant === "base" ? "Base model" : loras.length ? (loras.length > 1 ? "With LoRAs" : "With LoRA") : "Result";
-    const withLoras = variant === "lora" && loras.length > 0;
+  const withLabel = loras.length > 1 ? "With LoRAs" : "With LoRA";
+  const panel = (o: SandboxOutput | undefined, slot: Slot, seed: number) => {
+    const first = slot === "pass1" || slot === "pass1_base";
+    const label = first ? (!compare ? "Pass 1" : slot === "pass1" ? `Pass 1 · ${withLabel.toLowerCase()}` : "Pass 1 · without LoRAs")
+      : slot === "base" ? "Without LoRAs" : loras.length ? withLabel : hires ? "Hi-res fix" : "Result";
+    const withLoras = slot === "lora" && loras.length > 0;
     return (
-      <div className="sbx-out" key={variant}>
+      <div className="sbx-out" key={slot}>
         <div className="sbx-out-head">
           <strong>{label}</strong>
           {withLoras && <span className="faint ellipsis" title={loras.map((l) => `${base(l.path)} @ ${l.strength}`).join("\n")}>{loras.map((l) => base(l.path)).join(", ")}</span>}
@@ -245,15 +268,20 @@ function RunView({ run, meta, onOpen, onUpscale }: { run: SandboxRun; meta: stri
             <img src={fileUrl(run, o.file)} alt="" onClick={() => onOpen(fileUrl(run, o.file), false)} />
           )}
         <div className="sbx-out-meta">
-          <div>{meta}</div>
-          <div>Seed {o?.seed ?? seed}{withLoras ? (loras.length === 1 ? ` · LoRA strength ${loras[0].strength}` : ` · ${loras.length} LoRAs`) : variant === "base" ? " · without LoRAs" : ""}</div>
+          {first ? <div>{run.params.width}×{run.params.height} · the first pass, before the hi-res fix</div> : <div>{meta}</div>}
+          <div>Seed {o?.seed ?? seed}{withLoras ? (loras.length === 1 ? ` · LoRA strength ${loras[0].strength}` : ` · ${loras.length} LoRAs`) : ""}</div>
         </div>
       </div>
     );
   };
   return (
     <div className="stack" style={{ gap: 14 }}>
-      {bySeed.map(([seed, o]) => (
+      {bySeed.map(([seed, o]) => hires ? (
+        <div key={seed} className="stack" style={{ gap: 14 }}>
+          <div className="sbx-pair two">{panel(o.pass1, "pass1", seed)}{panel(o.lora, "lora", seed)}</div>
+          {compare && <div className="sbx-pair two">{panel(o.pass1_base, "pass1_base", seed)}{panel(o.base, "base", seed)}</div>}
+        </div>
+      ) : (
         <div key={seed} className={"sbx-pair" + (compare ? " two" : "")}>
           {panel(o.lora, "lora", seed)}
           {compare && panel(o.base, "base", seed)}
@@ -271,7 +299,7 @@ function StepCounter({ p }: { p: SandboxProgress }) {
   const parts = (p.steps ? [
     (p.images ?? 1) > 1 ? `Image ${p.image}/${p.images}` : "",
     `Step ${p.step ?? 0}/${p.steps}`,
-    rate ? (rate >= 1 ? `${rate.toFixed(1)} s/step` : `${(1 / rate).toFixed(1)} steps/s`) : "",
+    fmtSpeed(rate),
   ] : [
     (p.inputs ?? 1) > 1 ? `File ${p.input}/${p.inputs}` : "",
     p.total > (p.inputs ?? 1) ? `Frame ${p.done}/${p.total}` : "",
@@ -301,6 +329,8 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
   const [defaults, setDefaults] = useState<SandboxDefaults | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [light, setLight] = useState<{ src: string; video: boolean; audio?: { poster?: string; score?: string } } | null>(null);
+  const [deleting, setDeleting] = useState<SandboxRun | null>(null); // a history run whose Delete is being confirmed
+  const attempt = useToastErrors();
   const [upscaling, setUpscaling] = useState<UpscaleTarget | null>(null); // the Upscale dialog's file
   const [busy, setBusy] = useState(false);
   const [enhancing, setEnhancing] = useState(false);
@@ -428,8 +458,23 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
   const grid = { ...BLANK.grid, ...form.grid };
   const gridStrengths = parseStrengths(grid.strengths);
   const gridImages = grid.on ? (grid.checkpoints.length * gridStrengths.length + (grid.base ? 1 : 0)) * form.count : 0;
+  // the hi-res fix: for images, from models with the generic samplers; its upscalers are looked up once it's on
+  const hires = { ...BLANK.hires, ...form.hires };
+  const setHires = (patch: Partial<HiresForm>) => setForm({ hires: { ...hires, ...patch } });
+  const hiresAble = wf?.output === "image" && !!defaults?.supports_samplers;
+  const hiresOn = hires.on && hiresAble;
+  const [upscalerList] = usePoll<Upscalers>(hiresOn ? "/api/upscalers" : null, 0, [hiresOn]);
+  const upscalers = upscalerList?.models || [];
+  // the upscaler it uses: Resize, the one chosen, or (none chosen) the one picked last; null: one chosen that's gone
+  const hiresModel = hires.model === "resize" ? "resize" : !upscalerList ? null
+    : hires.model ? (upscalers.some((m) => m.path === hires.model && usableUpscaler(m)) ? hires.model : null)
+    : pickUpscaler(upscalers, "image")?.path ?? "resize";
+  const div = defaults?.divisibility || 16;
+  const [hiresW, hiresH] = [scaled(Math.floor(width / div) * div, hires.factor, div), scaled(Math.floor(height / div) * div, hires.factor, div)];
+  const hiresSteps = hires.steps.trim() === "" ? null : Number(hires.steps);
   const vram = useVramProjection(form.profile_id || undefined, {
-    width, height, frames: video ? form.frames : 1, ...(music ? { seconds: form.seconds } : {}),
+    // the hi-res fix's second pass is the bigger one
+    width: hiresOn ? hiresW : width, height: hiresOn ? hiresH : height, frames: video ? form.frames : 1, ...(music ? { seconds: form.seconds } : {}),
     ...(form.model.trim() ? { model: form.model.trim() } : {}), // a finetuned model is bf16: often bigger than the profile's
     // a grid applies one of its checkpoints at a time, next to the LoRAs
     loras: [...form.loras.map((l) => l.path.trim()), ...(grid.on ? grid.checkpoints.slice(0, 1) : [])].filter(Boolean),
@@ -476,6 +521,8 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
         ...(wf?.refmods ? { refmods: refmods.map((l) => ({ path: l.path, strength: l.strength })) } : {}),
         ...(wf?.audio ? { audio: audioRefs } : {}),
         grid: grid.on ? { job_id: grid.job_id, checkpoints: grid.checkpoints, strengths: gridStrengths, base: grid.base } : null,
+        ...(form.workflow === "i2i" ? { strength: form.strength } : {}),
+        hires: hiresOn ? { factor: hires.factor, model: hiresModel, strength: hires.strength, steps: hiresSteps } : null,
       };
       const run = await api.post<SandboxRun>("/api/sandbox/generate", body);
       setSelected(run.id);
@@ -509,6 +556,9 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
       enhanced: src ? { prompt: src.trim(), seed: p.seed, workflow: p.workflow, images: p.images.join(", "), text: p.prompt } : null,
       grid: p.grid ? { on: true, job_id: p.grid.job_id, checkpoints: p.grid.checkpoints.map((c) => c.path), strengths: p.grid.strengths.join(", "), base: p.grid.base }
         : { ...grid, on: false },
+      strength: p.strength ?? form.strength,
+      hires: p.hires ? { on: true, factor: p.hires.factor, model: p.hires.model, strength: p.hires.strength, steps: p.hires.steps == null ? "" : String(p.hires.steps) }
+        : { ...hires, on: false },
     });
     toast("Settings loaded");
   };
@@ -526,13 +576,16 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
   const runMeta = (r: SandboxRun) => {
     const p = r.params;
     const song = p.seconds != null;
+    const hi = p.hires;
     return [
       r.profile_name, p.images.length ? workflows.find((w) => w.id === r.workflow)?.label : "",
-      song ? `${p.seconds} s${p.lyrics ? " with lyrics" : ""}` : `${p.width}×${p.height}`, p.frames > 1 ? `${p.frames} frames` : "",
+      p.strength != null ? `strength ${p.strength}` : "",
+      song ? `${p.seconds} s${p.lyrics ? " with lyrics" : ""}` : hi ? `${hi.width}×${hi.height}` : `${p.width}×${p.height}`, p.frames > 1 ? `${p.frames} frames` : "",
       `${p.steps} steps`, song ? "" : status?.samplers[p.sampler] || p.sampler,
       p.scheduler !== "default" ? status?.schedulers[p.scheduler] : "", p.shift != null ? `shift ${p.shift}` : "",
       p.cfg !== 1 ? `CFG ${p.cfg}` : "",
       p.grid ? `${p.grid.job_name || "checkpoints"}: ${p.grid.checkpoints.length} × ${p.grid.strengths.length} strength${p.grid.strengths.length === 1 ? "" : "s"}` : "",
+      hi ? `hi-res ${hi.factor}× from ${p.width}×${p.height} with ${hi.model === "resize" ? "a Lanczos resize" : hi.model_name} at ${hi.strength}${hi.steps ? `, ${hi.steps} steps` : ""}` : "",
     ].filter(Boolean).join(" · ");
   };
   const setLora = (i: number, patch: Partial<LoraRow>) => setForm({ loras: form.loras.map((l, j) => (j === i ? { ...l, ...patch } : l)) });
@@ -560,8 +613,29 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
   const setGrid = (patch: Partial<GridForm>) => setForm({ grid: { ...grid, ...patch } });
   const pickGridJob = (id: string) => setGrid({ job_id: id, checkpoints: (gridJobs.get(id)?.opts || []).slice(-12).map((o) => o.path) });
   const fit = offloadFit(vram, offload, gpuTarget(gpus, gpu));
-  const gridOk = !grid.on || (grid.checkpoints.length > 0 && gridStrengths.length > 0 && gridImages <= 64);
-  const canGo = !!profile && !!wf && form.prompt.trim() !== "" && !blocked && !busy && gridOk && mpOk;
+  // why Generate can't be pressed yet (shown under it), as the server would refuse it
+  const gridWhy = !grid.on ? ""
+    : !grid.checkpoints.length ? "Pick at least one checkpoint to compare."
+    : !gridStrengths.length ? "Give at least one strength to compare at."
+    : gridStrengths.length > 6 ? `Compare at 6 strengths at most (${gridStrengths.length} given).`
+    : gridStrengths.some((x) => x < -10 || x > 10) ? "Each strength is from -10 to 10."
+    : gridImages > 64 ? "Keep the grid to 64 images: fewer checkpoints, strengths or seeds."
+    : "";
+  const hiresWhy = !hiresOn ? ""
+    : !hiresModel ? "Choose an upscaler for the hi-res fix, or Resize only."
+    : Math.max(hiresW, hiresH) > MAX_SIDE ? `With the hi-res fix it would be ${hiresW}×${hiresH}: a side can be at most ${MAX_SIDE} pixels.`
+    : !(hires.strength >= 0.1 && hires.strength <= 0.9) ? "The hi-res fix's strength is from 0.1 to 0.9."
+    : hiresSteps != null && !(Number.isInteger(hiresSteps) && hiresSteps >= 1 && hiresSteps <= 200) ? "The hi-res fix's steps are 1–200, or blank for the run's."
+    : "";
+  const imagesMin = wf?.images && !refmods.length ? wf.images.min : 0;
+  const why = profiles && !profiles.length ? "Add a profile in Models to generate."
+    : !profile ? "Choose a profile to generate."
+    : !wf ? "Choose a workflow this profile's model supports."
+    : images.length < imagesMin ? `Add the ${wf.images!.label.replace(/ *\(.*?\)/g, "").toLowerCase()} to generate.`
+    : form.prompt.trim() === "" ? `Write ${music ? "a style" : "a prompt"} to generate.`
+    : !mpOk ? `Choose a smaller size: a side can be at most ${MAX_SIDE} pixels.`
+    : gridWhy || hiresWhy;
+  const canGo = !why && !blocked && !busy;
 
   return (
     <div className="page wide">
@@ -597,7 +671,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
                   <optgroup key={kind} label={label}>
                     {workflows.filter((w) => w.output === kind).map((w) => {
                       const ok = supported.some((s) => s.id === w.id);
-                      return <option key={w.id} value={w.id} disabled={!ok}>{w.label}{ok ? "" : ` — not for ${family?.label || "this model"}`}</option>;
+                      return <option key={w.id} value={w.id} disabled={!ok}>{w.label}{ok ? "" : ` · not for ${family?.label || "this model"}`}</option>;
                     })}
                   </optgroup>
                 ))}
@@ -609,6 +683,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
             <span>{music ? "Style" : "Prompt"}<Info text={music ? INFO.style : INFO.prompt} /></span>
             <textarea rows={music ? 2 : 4} value={form.prompt}
               placeholder={form.workflow === "edit" ? "The edit instruction, e.g. Make it night"
+                : form.workflow === "i2i" ? "What the image should become, e.g. An oil painting of the same scene"
                 : music ? "Genre, instruments, mood and voice: indie pop, upbeat, electric guitar, female vocals, English" : "Describe what to generate"}
               onChange={(e) => setForm({ prompt: e.target.value })}
               onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && canGo) generate(); }} />
@@ -624,7 +699,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
           {!music && <div className="field sbx-enhance">
             <label className="check">
               <input type="checkbox" checked={form.enhance} onChange={(e) => setForm({ enhance: e.target.checked, enhanced: null })} />
-              Enhance prompt with the local LLM<Info text={INFO.enhance} />
+              Enhance prompt with the caption provider<Info text={INFO.enhance} />
             </label>
             {form.enhance && (reusable ? (
               <div className="sbx-enhanced">
@@ -633,7 +708,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
               </div>
             ) : (
               <span className="help">
-                When you press Generate, the LLM set in Settings rewrites the prompt{form.random_seed ? " for each new seed" : ""}.
+                When you press Generate, the caption provider set in Settings rewrites the prompt{form.random_seed ? " for each new seed" : ""}.
                 {form.enhanced ? " The prompt, seed or input changed since the last rewrite." : ""}
               </span>
             ))}
@@ -645,7 +720,19 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
                 : wf.images.min === wf.images.max ? wf.images.min : `${wf.images.min}–${wf.images.max}`}</span></span>
               <ImagesInput value={form.images} onChange={(v) => setForm({ images: v })} multiple={wf.images.max > 1}
                 placeholder={wf.images.max > 1 ? "comma-separated image paths" : "image path"} />
+              {wf.images.help && <span className="help">{wf.images.help}</span>}
             </label>
+          )}
+          {wf?.id === "i2i" && (
+            <div className="field">
+              <span>Strength<Info text={INFO.strength} /></span>
+              <div className="row">
+                <input type="range" min={0.05} max={1} step={0.05} value={form.strength} aria-label="Strength" style={{ flex: 1 }}
+                  onChange={(e) => setForm({ strength: Number(e.target.value) })} />
+                <span className="mono" style={{ minWidth: 36, textAlign: "right" }}>{form.strength.toFixed(2)}</span>
+              </div>
+              <span className="help">How much of the image is redone: low keeps it, 1 ignores it</span>
+            </div>
           )}
 
           {wf?.refmods && (
@@ -737,7 +824,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
                     <PathInput value={l.path} onChange={(v) => setLora(i, { path: v })} exts=".safetensors" placeholder="/path/to/lora.safetensors" />
                   ) : (
                     <select value={l.path} onChange={(e) => e.target.value === "__custom" ? setLora(i, { custom: true, path: "" }) : setLora(i, { path: e.target.value })}>
-                      <option value="">Choose a checkpoint…</option>
+                      <option value="">Choose a LoRA…</option>
                       {jobs.map(([name, opts]) => (
                         <optgroup key={name} label={name}>
                           {opts.map((o) => <option key={o.path} value={o.path}>{o.final ? "final" : `step ${o.step}`}{o.recommended ? " ★ recommended" : ""} · {o.file}</option>)}
@@ -760,9 +847,9 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
           </div>
 
           <div className="sbx-checks">
-            <label className="check" title={grid.on ? "Compare checkpoints has its own: Include the base model" : undefined}>
+            <label className="check" title={grid.on ? "Compare checkpoints has its own: Include one without LoRAs" : undefined}>
               <input type="checkbox" checked={form.compare_base && !grid.on} disabled={!form.loras.length || grid.on} onChange={(e) => setForm({ compare_base: e.target.checked })} />
-              Compare with base model<Info text={INFO.compareBase} />
+              Compare without LoRAs<Info text={INFO.compareBase} />
             </label>
             <label className="check">
               <input type="checkbox" checked={grid.on} onChange={(e) => {
@@ -809,7 +896,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
                     <input value={grid.strengths} onChange={(e) => setGrid({ strengths: e.target.value })} placeholder="0.6, 0.8, 1.0" />
                   </label>
                   <label className="check" style={{ alignSelf: "end", paddingBottom: 9 }}>
-                    <input type="checkbox" checked={grid.base} onChange={(e) => setGrid({ base: e.target.checked })} /> Include the base model
+                    <input type="checkbox" checked={grid.base} onChange={(e) => setGrid({ base: e.target.checked })} /> Include one without LoRAs
                   </label>
                 </div>
                 <span className={gridImages > 64 ? "validation error" : "help"}>
@@ -888,6 +975,46 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
                 <input value={form.negative} onChange={(e) => setForm({ negative: e.target.value })} />
               </label>
             )}
+            {hiresAble && (
+              <label className="check">
+                <input type="checkbox" checked={hires.on} onChange={(e) => setHires({ on: e.target.checked })} />
+                Hi-res fix<Info text={INFO.hires} />
+              </label>
+            )}
+            {hiresOn && (
+              <div className="sbx-sub stack" style={{ gap: 10 }}>
+                <div className="grid cols-2">
+                  <div className="field">
+                    <span>Factor</span>
+                    <div className="seg" role="group" aria-label="Hi-res factor" style={{ alignSelf: "flex-start" }}>
+                      {HIRES_FACTORS.map((f) => (
+                        <button key={f} type="button" className={hires.factor === f ? "on" : ""} aria-pressed={hires.factor === f}
+                          onClick={() => setHires({ factor: f })}>{f}×</button>
+                      ))}
+                    </div>
+                  </div>
+                  <label className="field">
+                    <span>Upscaler<Info text={INFO.hiresModel} /></span>
+                    <UpscalerSelect models={upscalers} value={hiresModel ?? ""} onChange={(v) => setHires({ model: v })} extra={<>
+                      {!hiresModel && <option value="" disabled>{upscalerList ? "Choose an upscaler…" : "Looking for upscalers…"}</option>}
+                      <option value="resize">Resize only</option>
+                    </>} />
+                  </label>
+                </div>
+                <div className="grid cols-2">
+                  <Num label="Second pass strength" info={INFO.hiresStrength} v={hires.strength} on={(n) => setHires({ strength: n })} step={0.05} min={0.1} max={0.9} />
+                  <label className="field">
+                    <span>Second pass steps<Info text={INFO.hiresSteps} /></span>
+                    <input type="number" min={1} max={200} value={hires.steps} placeholder={`${form.steps}, the run's`}
+                      onChange={(e) => setHires({ steps: e.target.value })} />
+                  </label>
+                </div>
+                <span className={Math.max(hiresW, hiresH) > MAX_SIDE ? "validation error" : "help"}>
+                  {width}×{height} → {hiresW}×{hiresH}{Math.max(hiresW, hiresH) > MAX_SIDE ? `: a side can be at most ${MAX_SIDE} pixels` : ""}
+                  {upscalerList && !upscalers.some(usableUpscaler) && <> · No upscaler yet: <a href="#/profiles/files">Model files</a> downloads Real-ESRGAN and SeedVR2.</>}
+                </span>
+              </div>
+            )}
           </div>
 
           <div className="sbx-advanced">
@@ -896,7 +1023,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
                 <IconRight /> Advanced settings
               </button>
               <Info text={INFO.advanced} />
-              {!advanced && fit === "over" && <span className="pill failed" title="Open Advanced settings and raise Layer offloading">Won't fit in VRAM</span>}
+              {!advanced && fit === "over" && <span className="pill warn" title="Open Advanced settings and raise Layer offloading">Won't fit in VRAM</span>}
               {!advanced && fit === "tight" && <span className="pill warn" title="Close to the GPU's memory: see Layer offloading">Tight on VRAM</span>}
             </div>
             {advanced && (
@@ -931,7 +1058,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
                   <label className="field">
                     <span>GPU</span>
                     <select value={gpu ?? ""} onChange={(e) => setForm({ gpu: Number(e.target.value) })}>
-                      {gpus.map((g) => <option key={g.index} value={g.index} disabled={training.has(g.index)}>GPU {g.index}{training.has(g.index) ? " — training" : ""}</option>)}
+                      {gpus.map((g) => <option key={g.index} value={g.index} disabled={training.has(g.index)}>GPU {g.index}{training.has(g.index) ? " · training" : ""}</option>)}
                     </select>
                     <span className="help">The Sandbox holds this GPU; training uses the others until you release it.</span>
                   </label>
@@ -948,9 +1075,11 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
               <IconPlayFill /> {enhancing ? "Enhancing prompt…" : `Generate ${music ? "audio" : video ? (form.count > 1 ? "videos" : "video") : form.count > 1 || grid.on ? "images" : "image"}`}
             </button>
             {active.length > 0 && (
-              <button className="btn lg" onClick={() => active.forEach((r) => api.post(`/api/sandbox/runs/${r.id}/cancel`).then(reload))}><IconStop /> Cancel{active.length > 1 ? ` ${active.length}` : ""}</button>
+              <button className="btn lg" onClick={() => active.forEach((r) => attempt(api.post(`/api/sandbox/runs/${r.id}/cancel`), `Couldn't cancel run ${runNumber(r)}`).then(reload))}>
+                <IconStop /> Cancel{active.length > 1 ? ` ${active.length}` : ""}</button>
             )}
           </div>
+          {why && <div className="help sbx-why">{why}</div>}
         </div>
 
         <div className="stack sbx-output">
@@ -967,7 +1096,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
               </span>
               <span className="spacer" />
               {session && session.state !== "off" && (
-                <button className="btn sm" onClick={() => api.post("/api/sandbox/release").then(reload)} title="Unload the models and free the GPU">Release GPU</button>
+                <button className="btn sm" onClick={() => attempt(api.post("/api/sandbox/release"), "Couldn't release the GPU").then(reload)} title="Unload the models and free the GPU">Release GPU</button>
               )}
             </div>
             {progress && progress.total > 0 && <>
@@ -1036,12 +1165,13 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
               <div className="card-head"><h3>History</h3><span className="count-pill">{runs.length}</span></div>
               <div className="sbx-history">
                 {runs.map((r) => {
-                  const first = r.outputs?.[0];
+                  const first = r.outputs?.find((o) => o.variant !== "pass1") || r.outputs?.[0]; // a hi-res fix's result
                   const thumb = first ? fileUrl(r, first.poster || first.file) : null;
                   const p = r.params;
                   const up = upscaleParams(r);
                   const note = r.status !== "done" ? r.status.charAt(0).toUpperCase() + r.status.slice(1)
                     : up ? `${up.factor}× upscale`
+                    : p.strength != null || p.hires ? [p.strength != null ? `i2i ${p.strength}` : "", p.hires ? `hi-res ${p.hires.factor}×` : ""].filter(Boolean).join(" · ")
                     : p.seconds != null ? fmtClock(p.seconds) : p.frames > 1 ? `${p.frames} frames` : `${p.width}×${p.height}`;
                   return (
                     <div key={r.id} className={"sbx-thumb" + (r.id === current?.id ? " on" : "")} role="button" tabIndex={0}
@@ -1050,7 +1180,8 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
                       <div className="sbx-thumb-img">
                         {thumb ? <img src={thumb} alt="" loading="lazy" className={first?.kind === "audio" ? "song" : undefined} /> : <div className="sbx-wait">…</div>}
                         {r.status !== "queued" && r.status !== "running" && (
-                          <button className="btn ghost icon danger" title="Delete" onClick={(e) => { e.stopPropagation(); api.del(`/api/sandbox/runs/${r.id}`).then(reload, (er) => toast(er.message, true)); }}><IconTrash /></button>
+                          <button className="btn ghost icon danger" title="Delete" aria-label={`Delete run ${runNumber(r)}`}
+                            onClick={(e) => { e.stopPropagation(); setDeleting(r); }} onKeyDown={(e) => e.stopPropagation()}><IconTrash /></button>
                         )}
                       </div>
                       <div className="sbx-thumb-name">Run {runNumber(r)}</div>
@@ -1066,13 +1197,18 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
         </div>
       </div>
       {light && <Lightbox src={light.src} video={light.video} audio={light.audio} onClose={() => setLight(null)} />}
+      {deleting && (
+        <ConfirmDialog title={`Delete run ${runNumber(deleting)}`} danger confirmLabel="Delete" onClose={() => setDeleting(null)}
+          onConfirm={() => api.del(`/api/sandbox/runs/${deleting.id}`).then(reload, (er) => toast(er.message, true))}
+          message="Its outputs are deleted from disk, and it leaves the history." />
+      )}
       {upscaling && (
         <UpscaleDialog target={upscaling} gpu={gpu} onClose={() => setUpscaling(null)}
           onQueued={(run) => { setSelected(run.id); reload(); }} />
       )}
       {refmodOpen && (
         <MakeRefModDialog draft={refmodDraft} setDraft={setRefmodDraft} profileId={form.profile_id} gpu={gpu} making={making}
-          onMake={setMakingId} onBack={() => setMakingId(null)} onClose={() => setRefmodOpen(false)} />
+          onMake={setMakingId} onBack={() => setMakingId(null)} onClose={() => setRefmodOpen(false)} frameRule={family?.frame_rule} />
       )}
     </div>
   );

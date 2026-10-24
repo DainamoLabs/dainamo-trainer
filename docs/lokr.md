@@ -1,6 +1,6 @@
 # LoKr
 
-**LoKr**, under Training method in Create Job, trains a LoKr (LyCORIS's
+**LoKr**, under Training method in New job, trains a LoKr (LyCORIS's
 Kronecker-product adapter) instead of a LoRA. A LoKr can make a full-rank change with fewer
 weights than a LoRA.
 

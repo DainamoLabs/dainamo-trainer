@@ -108,5 +108,49 @@ def test_a_new_default_caption_style_joins_saved_ones_once(tmp_path):
     c.commit()
     db.migrate(c)
     styles = json.loads(c.execute("SELECT value FROM settings WHERE key='caption_styles'").fetchone()[0])
-    assert [st["id"] for st in styles["styles"]] == ["tags", "moss"] and styles["default"] == "tags"
+    assert [st["id"] for st in styles["styles"]] == ["tags", "moss", "flux3"] and styles["default"] == "tags"
     assert db.MOSS_CAPTION_STYLE in db.CAPTION_STYLES  # and new installs have it among the defaults
+
+
+def test_the_flux3_style_joins_saved_styles_and_stays_deleted(tmp_path):
+    c = sqlite3.connect(tmp_path / "flux3.db")
+    db.migrate(c, steps=db.MIGRATIONS[:4])
+    saved = {"default": "mine", "styles": [{"id": "mine", "name": "Mine", "prompt": "Describe it."}]}
+    c.execute("INSERT INTO settings (key, value) VALUES ('caption_styles', ?)", (json.dumps(saved),))
+    c.commit()
+    db.migrate(c)
+    styles = json.loads(c.execute("SELECT value FROM settings WHERE key='caption_styles'").fetchone()[0])
+    assert styles["styles"] == [saved["styles"][0], db.FLUX3_CAPTION_STYLE] and styles["default"] == "mine"
+    assert db.FLUX3_CAPTION_STYLE in db.CAPTION_STYLES and db.DEFAULT_SETTINGS["caption_styles"]["default"] == "detailed"
+    c.execute("UPDATE settings SET value=? WHERE key='caption_styles'", (json.dumps(saved),))  # deleted later
+    c.commit()
+    db.migrate(c)
+    assert json.loads(c.execute("SELECT value FROM settings WHERE key='caption_styles'").fetchone()[0]) == saved
+
+
+def test_the_flux3_style_keeps_the_upsampler_rules_word_for_word():
+    """Built from the prompt upsampler's text-to-image system prompt (the bundled pup_prompts.json): its own
+    framing, rules about what an image shows where the upsampler's are about a request, and its caption format
+    as written, less the one rule for inventing text a request needs."""
+    import os
+    import re
+
+    path = os.path.join(os.path.dirname(db.__file__), "..", "assets", "flux3_pup_prompts.json")
+    with open(path, encoding="utf-8") as f:
+        t2i = json.load(f)["t2i"]
+    style = db.FLUX3_CAPTION_STYLE
+    framing, fidelity, caption_format, end = style["system"].split("\n\n")
+    assert "Describe the attached image as ONE detailed, self-contained caption" in framing
+    assert "Expand" not in style["system"] and "request" not in style["system"]
+    assert framing.endswith(" Output only the caption, with no greetings, explanations, refusals, questions, Markdown, "
+                            "headings, JSON, coordinates, ids or angle-bracket tokens, and no quotes around it.")
+    assert framing.split(". ", 2)[-1] in t2i
+    kept = ["Give a photograph a few ordinary, non-ideal specifics drawn from the scene's own objects instead of the "
+            "stock-photo ideal.", "Time of day is lighting, not rendered text.", "turn moods into observable physical "
+            "facts", "open with the medium convention (\"Full-color outdoor photograph, ...\"", "Do not invent names, "
+            "brands, logos or celebrities", "drop appraisal and sales vocabulary"]
+    assert all(k.lower() in t2i.lower() and k.lower() in fidelity.lower() for k in kept)
+    request_only = " author concrete, domain-correct wording when the request needs text it does not supply, and"
+    assert re.search(r"^Caption format: .*$", t2i, re.M)[0].replace(request_only, "") == caption_format
+    assert end == "Output only the caption." and t2i.endswith(end)
+    assert style["temperature"] == 0 and style["max_tokens"] == 1024  # the upsampler's greedy sampling, shorter

@@ -1,8 +1,8 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { go } from "../App";
 import { api, type Sample } from "../api";
 import { SANDBOX_PRESET } from "../pages/Sandbox";
-import { AudioCard, useToast } from "./ui";
+import { Lightbox, useToast } from "./ui";
 
 type View = "grid" | "steps";
 type Size = "s" | "m" | "l";
@@ -42,15 +42,16 @@ function useTable(samples: Sample[]) {
 
 const stepLabel = (step: number) => (step === 0 ? "Step 0 · before training" : `Step ${step}`);
 
-/** A sample's settings; the LoRA strength when it isn't 1, and always on a slider's (its cards render at several). */
-function meta(s: Sample, slider = false) {
+/** A sample's settings (its size unless ``size`` is false); the LoRA strength when it isn't 1, and always on a
+ * slider's (its cards render at several). */
+function meta(s: Sample, slider = false, size = true) {
   if (s.width == null) return "";
   const strength = slider ? ` · slider ${s.lora_scale! > 0 ? "+" : ""}${s.lora_scale}` : s.lora_scale !== 1 ? ` · LoRA ${s.lora_scale}` : "";
   if (s.kind === "audio") return `${s.seconds} s${s.lyrics ? " · with lyrics" : ""} · seed ${s.seed}${strength}`;
-  return `${s.width}×${s.height}${s.frames && s.frames > 1 ? ` · ${s.frames}f` : ""} · seed ${s.seed}${strength}`;
+  const dims = size ? `${s.width}×${s.height}${s.frames && s.frames > 1 ? ` · ${s.frames}f` : ""} · ` : s.frames && s.frames > 1 ? `${s.frames}f · ` : "";
+  return `${dims}seed ${s.seed}${strength}`;
 }
 
-/** Full-size sample; arrow keys walk the grid: left/right through steps, up/down through prompts. */
 /** Load a training sample's settings (and that step's checkpoint) into the Sandbox and go there. */
 function useOpenInSandbox(jobId: string) {
   const toast = useToast();
@@ -65,6 +66,7 @@ function useOpenInSandbox(jobId: string) {
   };
 }
 
+/** A sample full size, in the shared lightbox: left and right walk the steps, up and down the prompts. */
 function Viewer(props: { url: (f: string) => string; table: ReturnType<typeof useTable>; at: { index: number; step: number };
   onMove: (at: { index: number; step: number }) => void; onClose: () => void; onSandbox: (s: Sample) => void; slider: boolean }) {
   const { table, at } = props;
@@ -77,47 +79,17 @@ function Viewer(props: { url: (f: string) => string; table: ReturnType<typeof us
       if (table.at(table.indexes[r], table.steps[c])) return props.onMove({ index: table.indexes[r], step: table.steps[c] });
     }
   };
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const keys: Record<string, [number, number]> = { ArrowLeft: [0, -1], ArrowRight: [0, 1], ArrowUp: [-1, 0], ArrowDown: [1, 0] };
-      if (e.key === "Escape") props.onClose();
-      else if (keys[e.key]) {
-        e.preventDefault();
-        move(...keys[e.key]);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  });
   if (!s) return null;
-  const video = s.kind === "video";
-  const audio = s.kind === "audio";
   return (
-    <div className="lightbox sample-viewer" onClick={props.onClose}>
-      <div className="sv-stage" onClick={(e) => e.stopPropagation()}>
-        <button className="sv-nav prev" disabled={si <= 0} onClick={() => move(0, -1)} aria-label="Previous step">‹</button>
-        {audio ? <AudioCard key={s.file} src={props.url(s.file)} poster={s.poster && props.url(s.poster)} score={s.score && props.url(s.score)}
-          autoPlay title={s.lyrics || undefined} />
-          : video ? <video key={s.file} src={props.url(s.file)} controls autoPlay loop /> : <img src={props.url(s.file)} alt={s.prompt} />}
-        <button className="sv-nav next" disabled={si >= table.steps.length - 1} onClick={() => move(0, 1)} aria-label="Next step">›</button>
-      </div>
-      <div className="sv-caption" onClick={(e) => e.stopPropagation()}>
-        <strong>{stepLabel(s.step)}</strong>
-        <span className="sv-prompt" title={s.prompt}>{s.prompt}</span>
-        <span className="faint">{meta(s, props.slider)}</span>
-        {table.indexes.length > 1 && (
-          <span className="row" style={{ gap: 4 }}>
-            <button className="btn sm" disabled={ri <= 0} onClick={() => move(-1, 0)} aria-label="Previous prompt">↑</button>
-            <button className="btn sm" disabled={ri >= table.indexes.length - 1} onClick={() => move(1, 0)} aria-label="Next prompt">↓</button>
-          </span>
-        )}
-        {s.width != null && (
+    <Lightbox key={s.file} src={props.url(s.file)} video={s.kind === "video"} onClose={props.onClose}
+      audio={s.kind === "audio" ? { poster: s.poster ? props.url(s.poster) : undefined, score: s.score ? props.url(s.score) : undefined, title: s.lyrics || undefined } : undefined}
+      nav={{ at: si, count: table.steps.length, go: (d) => move(0, d), noun: "step" }}
+      navY={{ at: ri, count: table.indexes.length, go: (d) => move(d, 0), noun: "prompt" }}
+      info={{ name: stepLabel(s.step), caption: s.prompt, details: [meta(s, props.slider, false)].filter(Boolean),
+        actions: s.width != null && (
           <button className="btn sm" title="Re-create this sample in the Sandbox: same prompt, seed, size, sampler and this step's checkpoint"
             onClick={() => props.onSandbox(s)}>Open in Sandbox</button>
-        )}
-        <span className="faint sv-keys">← → steps{table.indexes.length > 1 ? " · ↑ ↓ prompts" : ""} · Esc</span>
-      </div>
-    </div>
+        ) }} />
   );
 }
 

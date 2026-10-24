@@ -35,7 +35,7 @@ class Download:
     """A file for a profile's path field that the model manager offers to download from Hugging Face, from a pinned
     commit so it's the file described here. Only files Dainamo can read are listed (no w4a8, GPTQ, w6a8 or mxfp8)."""
 
-    field: str  # the profile field it fills
+    field: str  # the profile field it fills, or one of the driver's ``extra_fields``
     repo: str
     path: str  # in the repo; its folder is the ComfyUI models folder it goes in
     size: int  # bytes
@@ -109,6 +109,7 @@ def transformer_shapes(path: str) -> tuple[str, dict[str, list[int]]]:
 # What a Sandbox generation takes and makes. Families list the workflows they support.
 WORKFLOWS = {
     "t2i": {"label": "Text-to-Image", "output": "image"},
+    "i2i": {"label": "Image-to-Image", "output": "image"},
     "edit": {"label": "Image Edit", "output": "image"},
     "t2v": {"label": "Text-to-Video", "output": "video"},
     "i2v": {"label": "Image-to-Video", "output": "video"},
@@ -191,6 +192,23 @@ def takes_sources(info: FamilyInfo, profile: dict) -> bool:
         return True
     field_ = next((f for f in info.profile_fields if f.key == "variant"), None)
     return str(profile.get("variant") or (field_.default if field_ else "")) in variants
+
+
+# Image-to-Image: the Sandbox offers it for every image family that samples with the generic samplers, whose
+# ``FamilyDriver.sample`` starts from an input image (``sandbox_workflows``); the image isn't a condition or reference
+IMAGE_TO_IMAGE = Workflow("i2i", images={"label": "Input image", "min": 1, "max": 1,
+                                         "help": "Cover-cropped to the output size."})
+
+
+def sandbox_workflows(F, data: dict) -> list[Workflow]:
+    """The workflows the Sandbox offers with a profile of family ``F`` (``data``: its settings): the family's own at
+    the profile's variant, and Image-to-Image after Text-to-Image for an image family with the generic samplers."""
+    variant = str(data.get("variant") or "")
+    out = [w for w in F.info.workflows if not w.variants or variant in w.variants]
+    if F.supports_samplers and F.info.media == ["image"] and not any(w.id == "i2i" for w in out):
+        at = next((k + 1 for k, w in enumerate(out) if w.id == "t2i"), len(out))
+        out.insert(at, IMAGE_TO_IMAGE)
+    return out
 
 
 class FamilyDriver:
@@ -465,8 +483,9 @@ class FamilyDriver:
 
     # --- sampling -----------------------------------------------------------
     # Image families give the starting noise, a velocity function and their default schedule; the
-    # sampler and scheduler are generic (engine.sampling). A family with its own sampling loop
-    # (MiniMax's joint video + audio) sets supports_samplers = False and overrides ``sample``.
+    # sampler and scheduler are generic (engine.sampling), and so is image-to-image (``sample``'s init).
+    # A family with its own sampling loop (MiniMax's joint video + audio) sets supports_samplers = False
+    # and overrides ``sample``.
     supports_samplers = True
 
     @classmethod
@@ -502,11 +521,20 @@ class FamilyDriver:
     @torch.no_grad()
     def sample(self, model: nn.Module, cond, uncond, width: int, height: int, steps: int, cfg: float, seed: int,
                frames: int = 1, images: list | None = None, sampler: str = "euler", scheduler: str = "default",
-               shift: float | None = None, callback=None):
-        """Returns latents for ``to_media``. ``cfg`` is a standard scale (see ``cfg_scale``)."""
+               shift: float | None = None, callback=None, init: torch.Tensor | None = None,
+               strength: float | None = None):
+        """Returns latents for ``to_media``. ``cfg`` is a standard scale (see ``cfg_scale``). With ``init`` (an
+        image's latents at this size, as ``encode_image`` gives them) it's image-to-image: sampling starts from
+        them noised to sigma = ``strength`` with this seed's noise, and runs ``steps`` steps from there to 0
+        (``sampling.img2img_sigmas``); ``images`` are still the family's conditioning images, if any."""
         from .. import sampling
         x, velocity = self.prepare_sampling(model, cond, uncond, width, height, cfg, seed, images)
-        sigmas = sampling.make_sigmas(self, scheduler, int(steps), width, height, shift)
+        if init is None:
+            sigmas = sampling.make_sigmas(self, scheduler, int(steps), width, height, shift)
+        else:
+            sigmas = sampling.img2img_sigmas(self, scheduler, int(steps), width, height, shift,
+                                             1.0 if strength is None else float(strength))
+            x = sampling.noised(init, x, sigmas[0])
         return sampling.run(sampler, x, sigmas, velocity, callback)
 
     # --- generic hooks (image families use these defaults) -----------------
@@ -603,6 +631,9 @@ class FamilyDriver:
     signature_shapes: dict[str, dict[str, tuple[int, ...]]] = {}
     # the files the model manager can download for the path fields
     downloads: list[Download] = []
+    # downloads that fill no profile field (a model that captions for this family): {field: (label, hint)}. Model
+    # files shows each as an optional row of the family
+    extra_fields: dict[str, tuple[str, str]] = {}
 
     @classmethod
     def matches(cls, field: str, tensors: dict[str, tuple[str, tuple[int, ...]]]) -> bool:

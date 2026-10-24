@@ -200,7 +200,7 @@ def describe(settings: dict) -> dict:
     try:
         if provider(settings) == "encoder":
             _, enc = encoder_file(settings["text_encoder"])
-            name, what = enc.name, f"{enc.name} ({enc.whose}'s text encoder)"
+            name, what = enc.name, enc.label
         else:
             _, model, mmproj, _ = llama_files(settings["llama"])
             name = os.path.basename(model)

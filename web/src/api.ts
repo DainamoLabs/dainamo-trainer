@@ -46,8 +46,6 @@ export type FamilyWorkflow = Workflow & {
 export type Gpu = { index: number; name: string; mem_used: number; mem_total: number; util: number; temp: number };
 export type SystemRam = { total_gb: number; available_gb: number; used_gb: number };
 // the CPU's temperature is null where it isn't reported (Windows, or a Linux machine without the sensor driver)
-export type Cpu = { name: string; percent: number; temp: number | null; cores: number; threads: number };
-export type Hardware = { gpus: Gpu[]; cpu: Cpu; ram: SystemRam };
 
 export type Profile = { id: string; name: string; family: string; data: Record<string, unknown>; updated: number };
 
@@ -120,6 +118,13 @@ export type SandboxParams = {
   low_vram?: boolean; // the text encoder streamed from system RAM
   source_prompt?: string; // what was typed, when ``prompt`` is the enhanced version
   grid?: SandboxGrid | null;
+  strength?: number; // Image-to-Image: how much of the input image was redone
+  hires?: SandboxHires | null;
+};
+// the hi-res fix: each render made ``factor`` times bigger (an upscaler's file, or "resize") and rendered again from
+// there at ``strength``, with ``steps`` (null: the run's), to ``width`` × ``height``
+export type SandboxHires = {
+  factor: number; model: string; model_name: string; strength: number; steps: number | null; width: number; height: number;
 };
 // compare checkpoints: each checkpoint at each strength (and the base model, if asked), per seed
 export type SandboxGrid = {
@@ -127,9 +132,10 @@ export type SandboxGrid = {
   strengths: number[]; base: boolean;
 };
 export type SandboxOutput = {
-  file: string; kind: MediaKind; poster?: string; score?: string; seed: number; variant: "lora" | "base" | "grid";
+  file: string; kind: MediaKind; poster?: string; score?: string; seed: number; variant: "lora" | "base" | "grid" | "pass1";
   checkpoint?: number; strength?: number; // a grid image: indexes into the grid's checkpoints and strengths
-  source?: string; width?: number; height?: number; // an upscale's: the file it was made from, and its size
+  of?: "lora" | "base" | "grid"; // a hi-res fix's first pass ("pass1"): the variant it's the first pass of
+  source?: string; width?: number; height?: number; // an upscale's: the file it was made from; and its size
 };
 export type SandboxRun = {
   id: string; created: number; started: number | null; status: "queued" | "running" | "done" | "failed" | "cancelled";
@@ -266,6 +272,7 @@ export type Job = {
   refmod: boolean; // makes a RefMod of its datasets instead of training
   extract: boolean; // extracts a LoRA from a finetune's checkpoint instead of training
   merge: boolean; // merges LoRAs into one instead of training
+  resumable: boolean; // its training state is kept, so Resume trains on from its last save (else Restart)
 };
 
 // the RefMod a job made: its file, shape (latent frames of height × width cells), the reference tokens it puts into
@@ -297,7 +304,6 @@ export type MergeMade = {
 export type JobDetail = Job & {
   config: any;
   dir: string;
-  resumable: boolean; // its training state is kept, so it can train on from its last step
   status_detail: Progress & {
     samples?: Sample[]; checkpoints?: Checkpoint[];
     evals?: Eval[]; recommended?: Recommendation | null; sweep?: Sweep | null;
@@ -309,7 +315,9 @@ export type JobDetail = Job & {
 };
 
 export type NotifyKind = "ntfy" | "discord" | "slack" | "json";
-export type CaptionStyle = { id: string; name: string; prompt: string };
+/** A caption style: the prompt sent with each file, and optionally a system prompt and its own temperature and max
+ *  tokens (left out: the caption provider's). */
+export type CaptionStyle = { id: string; name: string; prompt: string; system?: string; temperature?: number; max_tokens?: number };
 export type Settings = {
   queue: { mode: "sequential" | "parallel_single" | "parallel_multi"; gpus: number[]; max_per_gpu: number };
   sandbox: { idle_minutes: number };
@@ -352,8 +360,12 @@ export type ModelDownloadOption = {
 export type FoundModel = {
   path: string; name: string; size: number; where: string; quant: string[]; unsupported: string[];
   download: string | null; // the catalog file it is
+  // where it was found: the models folder (or a profile's file), or the Hugging Face cache, named as on the hub
+  // ("owner/repo", or "owner/repo/vae/ae.safetensors" for one file), with its "owner/repo"
+  source: "models" | "hf_cache"; repo: string;
 };
-export type ModelField = { key: string; label: string; hint: string; required: boolean; downloads: ModelDownloadOption[]; found: FoundModel[] };
+// ``profile: false``: a row no profile uses (FLUX 3's prompt upsampler, for captions)
+export type ModelField = { key: string; label: string; hint: string; required: boolean; downloads: ModelDownloadOption[]; found: FoundModel[]; profile?: boolean };
 export type ModelFamily = { id: string; label: string; fields: ModelField[] };
 export type ModelTask = {
   id: string; download: string; family: string; family_label: string; field: string; repo: string; name: string;
@@ -362,6 +374,7 @@ export type ModelTask = {
 };
 export type ModelsOverview = {
   folder: string; folder_ok: boolean; folders: Record<string, string>; token: boolean;
+  hf_cache: string; hf_cache_ok: boolean; // the Hugging Face cache searched too, and whether it's there yet
   families: ModelFamily[]; tasks: ModelTask[];
   // the Upscalers card: like a family, with one field to download into upscale_models, and what's there
   upscalers: ModelFamily & { folder: string; folder_ok: boolean; models: Upscaler[]; error: string };
@@ -377,9 +390,10 @@ export type LlmStatus = {
   idle_seconds: number | null; auto_ctx: number; on_path: string; provider: "llama" | "encoder"; what: string;
 };
 
-/** A text encoder file: which one it is, or why it can't write text. */
+/** A text encoder file: which one it is, or why it can't write text. ``tuned_from``: a model that isn't a text
+ *  encoder (FLUX 3's prompt upsampler), the model it was tuned from. */
 export type EncoderInfo = {
-  path: string; ok: boolean; name?: string; whose?: string; vision?: boolean; error?: string; profiles?: string[];
+  path: string; ok: boolean; name?: string; whose?: string; vision?: boolean; tuned_from?: string; error?: string; profiles?: string[];
 };
 
 /** Fired when the server asks for sign-in (remote access with a password); the app shows the sign-in page. */
@@ -418,6 +432,12 @@ export const api = {
 
 export const q = encodeURIComponent;
 
+// a dataset task going now (GET /api/tasks), for the top bar: what it is, the dataset whose page shows it, how far
+// it is (total 0: not counted)
+export type BackgroundTask = {
+  kind: "caption" | "split" | "download" | "upscale"; label: string; dataset_id: string; dataset: string; done: number; total: number;
+};
+
 /** A clock-style duration: 0:09, 1:05, 1:02:03. */
 export function fmtClock(sec: number): string {
   sec = Math.max(0, Math.round(sec));
@@ -434,6 +454,18 @@ export function fmtDuration(sec: number | null | undefined): string {
   if (h) return `${h}h ${m}m`;
   if (m) return `${m}m ${s}s`;
   return `${s}s`;
+}
+
+/** Time left: "1h 5m left", "5m 3s left", "" when it isn't known. */
+export function fmtLeft(sec: number | null | undefined): string {
+  return sec == null || !isFinite(sec) ? "" : `${fmtDuration(sec)} left`;
+}
+
+/** How long a step takes: "1.2 s/step" ("0.25 s/step" under a second), "" when it isn't known. A job's progress
+ * gives steps per second: pass ``1 / it_per_sec``. */
+export function fmtSpeed(secPerStep: number | null | undefined): string {
+  if (!secPerStep || !isFinite(secPerStep)) return "";
+  return `${secPerStep >= 1 ? secPerStep.toFixed(1) : secPerStep.toFixed(2)} s/step`;
 }
 
 export function fmtTime(ts: number | null | undefined): string {

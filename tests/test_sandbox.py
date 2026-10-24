@@ -857,6 +857,124 @@ def test_upscaling_cancels_between_inputs(upscale_worker, tmp_path):
     assert session.upscaler is not None  # still loaded for the next run
 
 
+class FakeClipUpscaler(FakeUpscaler):
+    """One that takes clips as clips, in passes of 5 frames sharing 2 (as SeedVR2 says through ``frames_per_pass``
+    and ``overlap_frames``); each call adds 0.2 times the calls before it, so where the worker's pieces meet
+    shows."""
+
+    def __init__(self, path):
+        super().__init__(path, kind="seedvr2", scale=0, video=True)
+        self.hints = []
+
+    def frames_per_pass(self, size, options=None):
+        self.hints.append(options)
+        return 5
+
+    def overlap_frames(self, size, options=None):
+        return 2
+
+    @torch.inference_mode()  # as SeedVR2's: the frames it gives can't be changed in place outside it
+    def upscale(self, frames, size, progress=None, check=None, **kw):
+        k = len(self.calls)
+        return super().upscale(frames, size, progress, check, **kw) + 0.2 * k
+
+
+def _grey_clip(tmp_path, frames=24):
+    """A clip of flat greys, a different one each frame, at 30000/1001 with sound -> (path, its frames' greys as
+    the worker reads them)."""
+    import numpy as np
+
+    from dainamo.engine import sandbox as worker
+    from dainamo.engine.media import VideoWriter
+
+    greys = (40 + 3 * np.arange(frames)).astype(np.uint8)
+    with VideoWriter(str(tmp_path), "long", "30000/1001", audio=_clip(tmp_path / "sound.mp4", frames=30)) as video:
+        video.write(np.ascontiguousarray(np.broadcast_to(greys[:, None, None, None], (frames, 24, 32, 3))))
+    path = str(tmp_path / "long.mp4")
+    read = next(worker._clip_frames(path, 32, 24, 1000))
+    return path, read.reshape(frames, -1).mean(1)
+
+
+def _upscale_clip_msg(tmp_path, path, model="/m/seedvr2.safetensors", options=None):
+    return {"id": "c", "out_dir": str(tmp_path / "run"), "model": model, "factor": 2,
+            "inputs": [{"path": path, "kind": "video"}], **({"options": options} if options else {})}
+
+
+def test_a_long_clip_is_upscaled_in_pieces_that_crossfade(upscale_worker, tmp_path, monkeypatch):
+    """A clip whose frames don't fit in CLIP_RAM goes in pieces of whole passes (m * (5 - 2) + 2 frames), each
+    starting with the last 2 frames of the piece before; those are crossfaded, as passes are, and written once.
+    The video streams out as it's made: every frame, the frame rate as it was, the sound. Progress counts each
+    frame once. A clip that fits goes whole, the upscaler making its own passes."""
+    import numpy as np
+
+    from dainamo.engine import sandbox as worker
+
+    session, _, sent = upscale_worker
+    path, greys = _grey_clip(tmp_path)
+    session.upscaler, session.upscaler_path = FakeClipUpscaler("/m/seedvr2.safetensors"), "/m/seedvr2.safetensors"
+    per = 4 * 3 * (32 * 24 + 64 * 48)  # a frame in and out, as floats
+    monkeypatch.setattr(worker, "CLIP_RAM", 12 * per)  # 12 frames: pieces of 11, three passes each
+    session.upscale(_upscale_clip_msg(tmp_path, path, options={"max_frames": 5}), lambda: False)
+    up = session.upscaler
+    assert [c[0][0] for c in up.calls] == [11, 11, 6]  # frames 0-10, 9-19, 18-23
+    assert up.hints == [{"max_frames": 5}]  # asked with the options, once
+    events = sent()
+    out = [e["item"] for e in events if e["event"] == "output"]
+    assert out == [{"file": "0_long_x2.mp4", "poster": "0_long_x2_poster.png", "kind": "video", "source": path,
+                    "width": 64, "height": 48}]
+    video, audio = _probe(tmp_path / "run" / "0_long_x2.mp4")
+    assert (video["width"], video["height"], video["nb_read_frames"], video["avg_frame_rate"]) == \
+        (64, 48, "24", "30000/1001")
+    assert audio["codec_type"] == "audio"
+    made = next(worker._clip_frames(str(tmp_path / "run" / "0_long_x2.mp4"), 64, 48, 1000))
+    shift = made.reshape(24, -1).mean(1) - greys  # what each piece added, crossfaded where they meet
+    ramp = [0] * 9 + [0.05, 0.15] + [0.2] * 7 + [0.25, 0.35] + [0.4] * 4
+    assert np.abs(shift - 255 * np.array(ramp)).max() < 2.5, shift.round(1)
+    progress = [e for e in events if e["event"] == "progress" and ": frame " in e["message"]]
+    assert [(e["done"], e["message"]) for e in progress] == [(11, "long.mp4: frame 11 of 24"),
+                                                              (20, "long.mp4: frame 20 of 24"),
+                                                              (24, "long.mp4: frame 24 of 24")]
+    assert any(e["message"].startswith("long.mp4: part 2 of 3: Frame") for e in events if e["event"] == "progress")
+
+    monkeypatch.setattr(worker, "CLIP_RAM", 8e9)  # it fits: one call, the whole clip
+    up.calls.clear()
+    session.upscale({**_upscale_clip_msg(tmp_path, path), "id": "c2"}, lambda: False)
+    assert [c[0][0] for c in up.calls] == [24]
+    monkeypatch.setattr(worker, "CLIP_RAM", 2 * per)  # not even the 3 frames a piece needs
+    with pytest.raises(ValueError, match="system RAM"):
+        session.upscale({**_upscale_clip_msg(tmp_path, path), "id": "c3"}, lambda: False)
+
+
+def test_a_clip_that_fails_part_way_leaves_no_video(upscale_worker, tmp_path, monkeypatch):
+    """An error after some pieces are written, or cancelling, removes the partial video and its poster."""
+    from dainamo.engine import sandbox as worker
+    from dainamo.engine.sampling import Cancelled
+
+    session, _, _ = upscale_worker
+    path, _ = _grey_clip(tmp_path)
+    session.upscaler, session.upscaler_path = FakeClipUpscaler("/m/seedvr2.safetensors"), "/m/seedvr2.safetensors"
+    monkeypatch.setattr(worker, "CLIP_RAM", 12 * 4 * 3 * (32 * 24 + 64 * 48))
+
+    def fail():
+        if len(session.upscaler.calls) == 2:
+            raise RuntimeError("CUDA out of memory")
+
+    session.upscaler.after = fail
+    with pytest.raises(RuntimeError):
+        session.upscale(_upscale_clip_msg(tmp_path, path), lambda: False)
+    assert os.listdir(tmp_path / "run") == []
+    session.upscaler.calls.clear()
+    session.upscaler.after = None
+    with pytest.raises(Cancelled):
+        session.upscale(_upscale_clip_msg(tmp_path, path), lambda: len(session.upscaler.calls) >= 2)
+    assert os.listdir(tmp_path / "run") == []
+    pixel = FakeUpscaler("/m/4x.pth")  # a pixel upscaler, a frame at a time
+    session.upscaler, session.upscaler_path = pixel, "/m/4x.pth"
+    with pytest.raises(Cancelled):
+        session.upscale(_upscale_clip_msg(tmp_path, path, model="/m/4x.pth"), lambda: len(pixel.calls) >= 5)
+    assert os.listdir(tmp_path / "run") == [] and len(pixel.calls) == 5
+
+
 def test_the_worker_upscales_a_datasets_small_images_in_place(upscale_worker, tmp_path):
     """"upscale_dataset": small images replaced by <stem>.png at the size a job trains at (by the max factor at
     most), the originals in _originals beside them, captions untouched; large images, clips and clashing or broken
@@ -969,3 +1087,201 @@ def test_an_upscaler_without_room_beside_the_models_has_them_parked(upscale_work
     monkeypatch.setitem(worker.UPSCALE_WORK, "pixel", 0)
     session.upscale(msg, lambda: False)
     assert seen == [False, True]
+
+
+# --- image-to-image and the hi-res fix in the worker -------------------------------------------------------------
+def _gen_driver():
+    from PIL import Image
+
+    from dainamo.engine.families.base import FamilyDriver, FamilyInfo
+
+    class GenDriver(FamilyDriver):
+        """Stands in for an image family in the worker's ``generate``: an image's latents are its 8 px averages, and
+        sampling gives back the input image's latents (or grey from noise), noting what it was asked."""
+        info = FamilyInfo(id="tiny", label="Tiny", media=["image"], profile_fields=[])
+
+        def __init__(self):
+            super().__init__({"diffusion_model": "dm.safetensors"}, torch.device("cpu"), log=lambda m: None)
+            self.calls, self.encoded, self.spec = [], [], None
+
+        def sample_condition(self, spec):
+            self.spec = spec
+            return spec["prompt"], None
+
+        def load_vae(self):
+            pass
+
+        def encode_image(self, pixels):
+            self.encoded.append(tuple(pixels.shape))
+            return nn.functional.avg_pool2d(pixels, 8)[0]
+
+        def sample(self, model, cond, uncond, width, height, steps, cfg, seed, frames=1, images=None,
+                   sampler="euler", scheduler="default", shift=None, callback=None, init=None, strength=None):
+            self.calls.append({"size": (width, height), "steps": steps, "strength": strength, "images": images,
+                               "init": None if init is None else tuple(init.shape)})
+            for k in range(steps):
+                callback(k + 1, steps)
+            return init[None] if init is not None else torch.zeros(1, 3, height // 8, width // 8)
+
+        def to_media(self, latents):
+            arr = ((latents[0].permute(1, 2, 0).numpy() + 1) * 127.5).clip(0, 255).astype("uint8")
+            img = Image.fromarray(arr)
+            return [img.resize((img.width * 8, img.height * 8), Image.Resampling.NEAREST)]
+
+    return GenDriver()
+
+
+@pytest.fixture
+def gen_worker(upscale_worker, monkeypatch):
+    """The upscale worker's Session with a stand-in image family loaded (prompts encode to nothing, LoRAs apply to
+    nothing), the profile it's for, and the upscalers it made room for."""
+    import json
+
+    session, loads, sent = upscale_worker
+    d = _gen_driver()
+    profile = {"id": "p", "family": "tiny", "data": dict(d.profile)}
+    session.driver, session.profile_key = d, ("p", json.dumps(profile["data"], sort_keys=True))
+    session.model, session.vae_loaded = nn.Linear(2, 2), True
+    enabled = []
+
+    class Adapters:
+        def set(self, files):
+            return []
+
+        def set_enabled(self, on):
+            enabled.append(on)
+
+    session.adapters = Adapters()
+    monkeypatch.setattr(session, "encode", lambda conds: session.texts.update({k: torch.zeros(1) for k in conds}))
+    monkeypatch.setattr(session, "apply_loras", lambda loras: [])
+    rooms = []
+    monkeypatch.setattr(session, "_upscaler_room", lambda path: rooms.append(path) or [])
+    return session, d, profile, loads, sent, rooms, enabled
+
+
+def test_the_hires_fix_renders_again_bigger_from_the_upscaled_first_pass(gen_worker, tmp_path):
+    """Hi-res fix: the render, decoded, upscaled to the size asked with the Session's cached upscaler (the profile's
+    models given room), encoded, and sampled again from there at the second pass's strength and steps; the first
+    pass is an output (variant "pass1") before the final, each with its size."""
+    from PIL import Image
+
+    session, d, profile, loads, sent, rooms, _ = gen_worker
+    out = tmp_path / "g"
+    hires = {"factor": 2, "model": "/m/4x.pth", "model_name": "4x", "strength": 0.35, "steps": 3, "width": 128,
+             "height": 96}
+    msg = {"id": "g", "out_dir": str(out), "profile": profile,
+           "params": {"workflow": "t2i", "prompt": "a cat", "width": 64, "height": 48, "steps": 4, "seed": 5,
+                      "count": 1, "cfg": 1.0, "hires": hires}}
+    session.generate(msg, lambda: False)
+    events = sent()
+    items = [e["item"] for e in events if e["event"] == "output"]
+    assert items == [
+        {"file": "0_lora_pass1.png", "kind": "image", "seed": 5, "variant": "pass1", "of": "lora", "width": 64,
+         "height": 48},
+        {"file": "0_lora.png", "kind": "image", "seed": 5, "variant": "lora", "width": 128, "height": 96}]
+    assert Image.open(out / "0_lora_pass1.png").size == (64, 48) and Image.open(out / "0_lora.png").size == (128, 96)
+    assert [(c["size"], c["steps"], c["init"], c["strength"]) for c in d.calls] == [
+        ((64, 48), 4, None, None), ((128, 96), 3, (3, 12, 16), 0.35)]
+    assert d.encoded == [(1, 3, 96, 128)]  # the upscaled first pass
+    assert loads == ["/m/4x.pth"] and rooms == ["/m/4x.pth"] and session.upscaler.calls[0][:2] == ((1, 3, 48, 64),
+                                                                                                    (128, 96))
+    assert session.upscaler_path == "/m/4x.pth"  # a pixel upscaler stays loaded for the next run
+    progress = [e for e in events if e["event"] == "progress"]
+    assert progress[-1]["done"] == progress[-1]["total"] == 4 + 3 and progress[-1]["images"] == 2
+    assert {(e["image"], e["steps"]) for e in progress} == {(1, 4), (2, 3)}
+    assert any("upscaling to 128×96 with 4x" in (e.get("message") or "") for e in progress)
+    assert events[-1]["event"] == "done"
+
+
+def test_image_to_image_starts_from_the_input_and_compares_with_the_hires_fix_on_both(gen_worker, tmp_path):
+    """Image-to-Image: the input image, cover-cropped to the size and encoded once, is where every render starts (at
+    the strength), not a condition; with Compare without LoRAs and a hi-res fix that only resizes, both renders get
+    a second pass, and no upscaler is loaded."""
+    from PIL import Image
+
+    session, d, profile, loads, sent, rooms, enabled = gen_worker
+    src = tmp_path / "in.png"
+    Image.new("RGB", (100, 50), (200, 40, 40)).save(src)
+    hires = {"factor": 1.5, "model": "resize", "model_name": "Resize", "strength": 0.4, "steps": None, "width": 96,
+             "height": 72}
+    msg = {"id": "g", "out_dir": str(tmp_path / "g"), "profile": profile,
+           "params": {"workflow": "i2i", "prompt": "a cat", "width": 64, "height": 48, "steps": 4, "seed": 9,
+                      "count": 1, "cfg": 1.0, "images": [str(src)], "strength": 0.6, "hires": hires,
+                      "compare_base": True, "loras": [{"path": "a.safetensors", "strength": 1.0}]}}
+    session.generate(msg, lambda: False)
+    assert d.spec["images"] == [] and d.encoded[0] == (1, 3, 48, 64)
+    assert [(c["size"], c["steps"], c["init"], c["strength"], c["images"]) for c in d.calls] == [
+        ((64, 48), 4, (3, 6, 8), 0.6, None), ((64, 48), 4, (3, 6, 8), 0.6, None),
+        ((96, 72), 4, (3, 9, 12), 0.4, None), ((96, 72), 4, (3, 9, 12), 0.4, None)]
+    items = [e["item"] for e in sent() if e["event"] == "output"]
+    assert [(o["variant"], o.get("of"), o["width"]) for o in items] == [
+        ("pass1", "lora", 64), ("pass1", "base", 64), ("lora", None, 96), ("base", None, 96)]
+    first = Image.open(tmp_path / "g" / "0_lora_pass1.png").convert("RGB")
+    assert first.size == (64, 48) and first.getpixel((32, 24))[0] > 150  # the input, as it came back
+    assert enabled == [True, False, True, False, True] and not loads and not rooms
+
+
+def test_image_to_image_and_the_hires_fix_are_checked(client, profiles, monkeypatch, tmp_path):
+    """Image-to-Image is offered for every image family with the generic samplers (not video or music ones), takes
+    one input image and a strength; the hi-res fix is for images, at 1.5× or 2× with a usable upscaler or a resize,
+    and its final size within the caps. Both are kept in the run's params."""
+    from PIL import Image
+
+    from dainamo.engine import upscale
+    from dainamo.engine.families import FAMILIES
+    from dainamo.engine.families.base import sandbox_workflows
+
+    monkeypatch.setattr(sbx, "gpu_count", lambda: 2)
+    for fid, F in FAMILIES.items():
+        ids = [w.id for w in sandbox_workflows(F, {"variant": "fl2va"})]
+        assert ("i2i" in ids) == (F.info.media == ["image"] and F.supports_samplers), fid
+        if "i2i" in ids:
+            assert ids.index("i2i") == ids.index("t2i") + 1
+    d = client.get(f"/api/sandbox/defaults?profile_id={profiles['krea']}").json()
+    i2i = next(w for w in d["workflows"] if w["id"] == "i2i")
+    assert i2i["label"] == "Image-to-Image" and (i2i["images"]["min"], i2i["images"]["max"]) == (1, 1)
+    assert "i2i" not in [w["id"] for w in client.get(f"/api/sandbox/defaults?profile_id={profiles['ref2va']}").json()["workflows"]]
+    assert any(w["id"] == "i2i" for w in client.get("/api/system").json()["workflows"])
+
+    img = tmp_path / "in.png"
+    Image.new("RGB", (64, 64)).save(img)
+    with pytest.raises(HTTPException, match="needs 1 input image"):
+        check(profile_id=profiles["krea"], workflow="i2i")
+    with pytest.raises(HTTPException, match="needs 1 input image"):
+        check(profile_id=profiles["krea"], workflow="i2i", images=[str(img)] * 2)
+    for bad in (0.01, 1.2):
+        with pytest.raises(HTTPException, match="Strength must be 0.05–1"):
+            check(profile_id=profiles["krea"], workflow="i2i", images=[str(img)], strength=bad)
+    _, p, _ = check(profile_id=profiles["krea"], workflow="i2i", images=[str(img)], strength=0.6)
+    assert p["workflow"] == "i2i" and p["strength"] == 0.6 and p["images"] == [str(img)] and p["hires"] is None
+    assert "strength" not in check(profile_id=profiles["krea"], workflow="t2i", strength=0.3)[1]
+
+    # the hi-res fix
+    _, p, _ = check(profile_id=profiles["krea"], workflow="t2i", width=1000, height=760,
+                    hires={"factor": 2, "model": "resize", "strength": 0.35, "steps": None})
+    assert p["hires"] == {"factor": 2.0, "model": "resize", "model_name": "Resize", "strength": 0.35, "steps": None,
+                          "width": 1984, "height": 1504}  # (992 × 752) × 2, on the 16 px grid
+    _, p, _ = check(profile_id=profiles["qwen"], workflow="edit", images=[str(img)], width=1024, height=768,
+                    hires={"factor": 1.5, "model": "resize", "strength": 0.5, "steps": 12})
+    assert (p["hires"]["width"], p["hires"]["height"], p["hires"]["steps"]) == (1536, 1152, 12)
+    up = tmp_path / "4x.pth"
+    up.write_bytes(b"x")
+    monkeypatch.setattr(upscale, "identify", lambda path, files=None: upscale.Info(
+        path, "unknown" if "bad" in path else "pixel", "4x", scale=4, error="unreadable" if "bad" in path else None))
+    _, p, _ = check(profile_id=profiles["krea"], workflow="i2i", images=[str(img)],
+                    hires={"factor": 2, "model": str(up), "strength": 0.3})
+    assert p["hires"]["model"] == str(up) and p["hires"]["model_name"] == "4x" and p["strength"] == 0.6
+    bad = tmp_path / "bad.pth"
+    bad.write_bytes(b"x")
+    for hires, why in (({"factor": 3, "model": "resize"}, "1.5× or 2×"),
+                       ({"factor": 2, "model": "resize", "strength": 0.95}, "0.1–0.9"),
+                       ({"factor": 2, "model": "resize", "steps": 0}, "1–200"),
+                       ({"factor": 2, "model": ""}, "Choose an upscaler"),
+                       ({"factor": 2, "model": str(tmp_path / "nope.pth")}, "not found"),
+                       ({"factor": 2, "model": str(bad)}, "unreadable")):
+        with pytest.raises(HTTPException, match=why):
+            check(profile_id=profiles["krea"], workflow="t2i", hires=hires)
+    with pytest.raises(HTTPException, match="at most 4096"):
+        check(profile_id=profiles["krea"], workflow="t2i", width=2304, height=1024, hires={"factor": 2, "model": "resize"})
+    with pytest.raises(HTTPException, match="for images"):
+        check(profile_id=profiles["fl2va"], workflow="t2v", hires={"factor": 2, "model": "resize"})

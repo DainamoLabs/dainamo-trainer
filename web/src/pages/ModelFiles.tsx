@@ -10,6 +10,7 @@ export function profileFrom(fam: ModelFamily, info: Family | undefined): Partial
   const data: Record<string, unknown> = {};
   info?.profile_fields.forEach((x) => { if (x.default != null) data[x.key] = x.default; });
   for (const f of fam.fields) {
+    if (f.profile === false) continue; // e.g. FLUX 3's prompt upsampler: for captions, not the profile
     const pick = f.found.find((x) => !x.unsupported.length);
     if (pick) data[f.key] = pick.path;
   }
@@ -21,9 +22,29 @@ export function profileFrom(fam: ModelFamily, info: Family | undefined): Partial
 
 const usable = (f: ModelField) => f.found.filter((x) => !x.unsupported.length);
 
-/** A found file's name; where it is, and its precision, on hover. */
-function FoundFile({ x }: { x: ModelField["found"][number] }) {
-  return <span className="mf-found mono ellipsis" title={[x.path, x.quant.join(", ")].filter(Boolean).join(" · ")}>{x.name.replace(/\.safetensors$/, "")}</span>;
+/** What the server says beyond ``ModelsOverview``: where each file was found ("models": the models folder or a
+ *  profile; "hf_cache": the Hugging Face cache, with its "owner/repo"), and the cache's folder. */
+type Found = ModelField["found"][number] & { source?: "models" | "hf_cache"; repo?: string };
+type Overview = ModelsOverview & { hf_cache?: string; hf_cache_ok?: boolean };
+
+/** A found file's name (a Hugging Face cache's also tagged, with the repo it's in); where it is, and its precision,
+ *  on hover. The cache's are named as on the hub: "owner/repo" for a folder of shards, "owner/repo/vae/ae.safetensors"
+ *  for a file, shown as its name over the folder it's in. */
+function FoundFile({ x }: { x: Found }) {
+  const title = [x.path, x.quant.join(", ")].filter(Boolean).join(" · ");
+  if (x.source !== "hf_cache") return <span className="mf-found mono ellipsis" title={title}>{x.name.replace(/\.safetensors$/, "")}</span>;
+  const file = x.name.endsWith(".safetensors");
+  const cut = x.name.lastIndexOf("/");
+  return (
+    <span className="mf-found" title={title} style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 3 }}>
+      <span className="mono ellipsis" style={{ maxWidth: "100%" }}>{file ? x.name.slice(cut + 1).replace(/\.safetensors$/, "") : x.name}</span>
+      {/* the repo goes under the tag where there's no room beside it */}
+      <span className="row wrap" style={{ gap: "3px 6px", maxWidth: "100%" }}>
+        <span className="pill" style={{ flex: "none" }}>Hugging Face cache</span>
+        {file && cut > 0 && <span className="faint small ellipsis" style={{ maxWidth: "100%" }}>{x.name.slice(0, cut)}</span>}
+      </span>
+    </span>
+  );
 }
 
 function FieldRow({ f, overview, searched, onDownload }: { f: ModelField; overview: ModelsOverview; searched: boolean; onDownload: () => void }) {
@@ -64,9 +85,9 @@ function FieldRow({ f, overview, searched, onDownload }: { f: ModelField; overvi
   );
 }
 
-/** The ComfyUI models folder Dainamo looks in: set here (saved straight away, unlike on the Settings page, which saves
- * everything at once), offering the folder the profiles' files are in. */
-function FolderCard({ ov, suggested, onSaved }: { ov: ModelsOverview; suggested: string; onSaved: () => void }) {
+/** The ComfyUI models folder Dainamo looks in and downloads into: the one place it's set (Settings links here), saved
+ * straight away, offering the folder the profiles' files are in. The Hugging Face cache is searched as well. */
+function FolderCard({ ov, suggested, onSaved }: { ov: Overview; suggested: string; onSaved: () => void }) {
   const toast = useToast();
   const [draft, setDraft] = useState<string | null>(null); // null: not edited, so the folder (or the suggestion)
   const [browsing, setBrowsing] = useState(false);
@@ -87,6 +108,9 @@ function FolderCard({ ov, suggested, onSaved }: { ov: ModelsOverview; suggested:
   };
   const changed = !!value.trim() && value.trim() !== ov.folder;
   const [badge, tone] = !ov.folder ? ["Not configured", "warn"] : !ov.folder_ok ? ["Folder not found", "error"] : ["Configured", "ok"];
+  const others = ov.hf_cache ? "the Hugging Face cache and the files your profiles use" : "the files your profiles use";
+  // the families with a download Hugging Face wants a sign-in for
+  const gated = ov.families.filter((f) => f.fields.some((x) => x.downloads.some((o) => o.gated))).map((f) => f.label.replace(/ \(.*\)$/, ""));
   return (
     <div className="card mf-folder">
       <div className="mf-folder-top">
@@ -96,14 +120,22 @@ function FolderCard({ ov, suggested, onSaved }: { ov: ModelsOverview; suggested:
             <span className={`mf-badge ${tone}`}>{tone === "ok" ? <IconCheck /> : <IconAlert />}{badge}</span>
           </div>
           <p className="muted">
-            {!ov.folder ? "Only the files your profiles use have been checked."
-              : !ov.folder_ok ? "This folder isn't there, so only the files your profiles use have been checked."
-              : "Its diffusion_models (or unet), text_encoders (or clip), vae, loras and checkpoints folders are searched."}
+            {!ov.folder ? `Only ${others} have been checked.`
+              : !ov.folder_ok ? `This folder isn't there, so only ${others} have been checked.`
+              : "Its diffusion_models (or unet), text_encoders (or clip), vae, loras and checkpoints folders are searched, and downloads go there."}
           </p>
+          {ov.hf_cache && (
+            <p className="muted" style={{ overflowWrap: "anywhere" }} title="Text encoders, VAEs and single model files are found there; diffusion models in the diffusers layout aren't">
+              Also searched: <span className="mono">{ov.hf_cache}</span> (the Hugging Face cache{ov.hf_cache_ok ? "" : ", not there yet"})
+            </p>
+          )}
         </div>
-        <a className="mf-hf" href="#/settings" title={ov.token ? "Signed in to Hugging Face (Settings)" : "Sign in to Hugging Face in Settings"}>
-          <i className={ov.token ? "on" : ""} />{ov.token ? "Hugging Face connected" : <>Hugging Face not connected<span className="faint"> · needed only for LTX 2.5</span></>}
-        </a>
+        {/* the dot stays by the first line when the advice wraps */}
+        <span className="mf-hf" style={{ alignItems: "flex-start" }} title={ov.token ? "A Hugging Face sign-in was found on this machine"
+          : `Gated downloads need one${gated.length ? ` (some ${gated.join(", ")} files)` : ""}: accept the model's terms on Hugging Face, then sign in`}>
+          <i className={ov.token ? "on" : ""} style={{ marginTop: 5 }} />{ov.token ? "Hugging Face connected"
+            : <span>Hugging Face not connected<span className="faint"> · for gated downloads, run <code>hf auth login</code> (or set HF_TOKEN) before starting Dainamo</span></span>}
+        </span>
       </div>
       <div className="mf-folder-row">
         <input className="mono" value={value} placeholder="/path/to/ComfyUI/models" aria-label="ComfyUI models folder"
@@ -176,9 +208,10 @@ function UpscalersCard({ ov, onDownload }: { ov: ModelsOverview; onDownload: () 
 type Status = "all" | "ready" | "missing" | "unchecked";
 const STATUSES: [Status, string][] = [["all", "All statuses"], ["ready", "Required files found"], ["missing", "Missing files"], ["unchecked", "Not checked"]];
 
-/** Profiles → Model files: what each family needs, what's on this machine, and downloads of the rest. */
+/** Model files: what each family needs, what's on this machine (the models folder and the Hugging Face cache), and
+ *  downloads of the rest. */
 export default function ModelFiles({ families, onCreate }: { families: Family[]; onCreate: (p: Partial<Profile>) => void }) {
-  const [ov, reload, err] = usePoll<ModelsOverview>("/api/models", 0);
+  const [ov, reload, err] = usePoll<Overview>("/api/models", 0);
   const [dialog, setDialog] = useState<{ family: string; field: string } | null>(null);
   const [suggested, setSuggested] = useState<string[]>([]); // models folders the profiles' files are in
   const [search, setSearch] = useState("");
@@ -262,8 +295,9 @@ export default function ModelFiles({ families, onCreate }: { families: Family[];
       </div>
       <div className="card ds-note">
         <IconInfo />
-        <span>Files are recognised by what's in them, whatever they're called. Downloads come from Hugging Face, from the commit
-          Dainamo was checked against, and each is checked against its published size and checksum.</span>
+        <span>Files are recognised by what's in them, whatever they're called, in the models folder and the Hugging Face cache.
+          Downloads come from Hugging Face, from the commit Dainamo was checked against, into the models folder, and each is
+          checked against its published size and checksum.</span>
       </div>
 
       {dialog && <DownloadDialog family={dialog.family} field={dialog.field} onClose={() => setDialog(null)} onStarted={reload} />}

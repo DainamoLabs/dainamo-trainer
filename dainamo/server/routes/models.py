@@ -1,4 +1,5 @@
-"""Model files: what each family needs, what's in the ComfyUI models folder, and downloads from Hugging Face."""
+"""Model files: what each family needs, what's in the ComfyUI models folder and the Hugging Face cache, and downloads
+from Hugging Face (into the models folder)."""
 
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ def overview():
 
 @router.get("/suggest")
 def suggest():
-    """Models folders the profiles' files are in, for Settings to offer."""
+    """Models folders the profiles' files are in, for Model files to offer."""
     return {"folders": model_files.suggested_folders()}
 
 

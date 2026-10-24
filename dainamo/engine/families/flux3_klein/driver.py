@@ -20,8 +20,9 @@ Conditioning, token layout and sampling follow Black Forest Labs' reference code
   * the velocity noise - clean, Euler, sigmas t' = 16 t / (1 + 15 t) for t from 1 to 0 (``ALPHA``), CFG 4 against
     the empty prompt; training noise levels drawn uniformly through the same shift by default
 
-The model was trained on captions its prompt upsampler writes (long, detailed descriptions); the upsampler isn't
-part of this, so captions and prompts should be written that way.
+The model was trained on captions its prompt upsampler writes (long, detailed descriptions), so captions and
+prompts should be written that way. The upsampler isn't part of training or sampling; Model files downloads it for
+the caption provider, and the "FLUX 3 (prompt upsampler style)" caption style asks any captioner for its captions.
 """
 
 from __future__ import annotations
@@ -197,7 +198,18 @@ class Flux3KleinDriver(FamilyDriver):
                  gated=True, sha256="f0b24fc5c8d7c0ea6ca909da14c20af5cac53f22506be942c6c956f838b9630f"),
         Download("vae", HF_REPO, "vae/flux2-vae.safetensors", 336_211_292, "bf16", HF_REV, gated=True,
                  recommended=True, sha256="868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3"),
+        # the prompt upsampler (a Qwen3.5-9B, Apache 2.0), which wrote the captions the model was trained on: no
+        # profile uses it, but the caption provider can run it as a text encoder (docs/captions.md). Its bf16 file is
+        # byte for byte black-forest-labs/flux-3-image-klein-pup's model.safetensors
+        Download("prompt_upsampler", HF_REPO,
+                 "text_encoders/qwen3.5_9b_flux3_prompt_upsampler_int8_convrot.safetensors", 9_748_113_996,
+                 "int8 convrot", HF_REV, gated=True, recommended=True,
+                 sha256="cb8cb9b9dcd2569509de755dca54d96fd93a16a7aabfd2f4051f0a144230620f"),
+        Download("prompt_upsampler", HF_REPO, "text_encoders/qwen3.5_9b_flux3_prompt_upsampler_bf16.safetensors",
+                 18_819_722_392, "bf16", HF_REV, gated=True,
+                 sha256="f5062a1fba3e63afe5c88349a311903fec06c959b362f1247127e63d5c860ed4"),
     ]
+    extra_fields = {"prompt_upsampler": ("Prompt upsampler", "for captions")}
 
     def __init__(self, profile: dict, device: torch.device, log=print):
         super().__init__(profile, device, log)

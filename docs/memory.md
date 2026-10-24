@@ -2,7 +2,7 @@
 
 ## Layer offloading
 
-The **Layer offloading** slider (0–100%), in Create Job and the Sandbox, keeps
+The **Layer offloading** slider (0–100%), in New job and the Sandbox, keeps
 that share of the diffusion model's blocks in pinned system RAM and copies each
 to the GPU just before it runs. The output is the same either way. Because the
 copies overlap with computation, it often costs no speed: Krea 2 at 1024 px with
@@ -16,7 +16,7 @@ Offloading saves little in training without gradient checkpointing.
 
 Dainamo projects the peak VRAM of each phase of the job (encoding captions and
 images, training steps, sampling) and compares the highest with the selected
-GPU (with "Auto", the smallest): in Create Job's **Memory estimate**, with each
+GPU (with "Auto", the smallest): in New job's **Memory estimate**, with each
 phase under **Memory breakdown**, and next to the Sandbox's slider. **Fit to GPU** picks
 the lowest offload that fits, with about 0.75 GB to spare.
 

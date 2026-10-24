@@ -15,10 +15,14 @@ you chose:
 - **List**: smaller cards, every file on one page. Click a caption to edit it.
 
 **Search** matches file names and captions, and **Missing captions** shows the
-files without one. On an uploaded dataset, **Select files** (or a card's
-checkbox) picks files to delete together. A linked folder's files are only
-deleted in the folder itself. The **⋯** beside Auto-Caption holds Split into
-clips, Upscale small images, Export and Remove dataset.
+files without one. On an uploaded dataset, **Select** (or a card's checkbox)
+picks files to delete together. A linked folder's files are only deleted in the
+folder itself. **Tools**, beside Auto-Caption, holds Split into clips (Edit
+clips on a split's copy), Upscale small images, Export and Delete dataset.
+
+Captioning, a split, a download or an upscale shows its progress on the page,
+and in the top bar while it runs, so it stays in view on other pages; the top
+bar's chip opens the dataset.
 
 Click a file to enlarge it. The **Left/Right** arrow keys, or the on-screen
 buttons, move between files in the grid's order. You can edit the caption
@@ -44,7 +48,8 @@ again, so the download starts at once. **Put the trigger word in each caption**
 writes the captions as training reads them: Dainamo adds the trigger word when
 it trains, but other trainers read captions as they are. **Delete** removes the
 selected datasets. Linked folders are left alone; uploaded files are deleted
-only if you tick the box. Esc or **Done** leaves Select.
+only if you tick the box. If a queued or running job uses one, the dialog names
+the job, since deleting the files makes it fail. Esc or **Done** leaves Select.
 
 ## Edit datasets: sources and results
 
@@ -57,7 +62,7 @@ image after, and an instruction. Keep them as two datasets:
   (`photo.jpg` pairs with `photo.png`; the type doesn't matter). They need no
   captions.
 
-In Create Job, choose the results as the dataset and the sources as its
+In New job, choose the results as the dataset and the sources as its
 **Source dataset**. A second or third source dataset adds more images to each
 edit. The two folders can be nested either way: sources in a subfolder of the
 results are only sources, and results in a subfolder of the sources (`photos/`
@@ -82,7 +87,7 @@ chosen, and checked and shown the same way.
 
 ## Masks
 
-**Masked loss** (in Create Job) trains on part of each image, such as the
+**Masked loss** (in New job) trains on part of each image, such as the
 subject and not its background. Put a greyscale mask for an image in a `_masks`
 folder beside it, with the image's name: `_masks/photo.png` is the mask of
 `photo.jpg`. White is where the loss counts, black where it doesn't, and grey
@@ -127,14 +132,14 @@ Folded, it still shows how the last check went:
 - masks of another shape than their image (stretched to fit it), and notes:
   how many images have a mask, and masks with no image of their name.
 
-Each dataset in Create Job runs the same check for that job. For songs, see
+Each dataset in New job runs the same check for that job. For songs, see
 [Music](music.md#datasets).
 
 ## Upscale small images
 
-**Upscale small images**, in the **⋯** menu of a dataset with images, upscales
-the images with fewer pixels than the resolution you train at, so they train
-at full size. Each result is saved as a PNG with the image's name, the original
+**Upscale small images**, in the **Tools** menu of a dataset with images,
+upscales the images with fewer pixels than the resolution you train at, so they
+train at full size. Each result is saved as a PNG with the image's name, the original
 is moved into an `_originals` folder beside it (which training skips), and the
 captions stay as they are. A linked folder is changed in place. Pick the
 upscaler (Real-ESRGAN, SeedVR2 or another file in the models folder's
@@ -153,8 +158,8 @@ last edit can be undone.
 
 A job trains only the start of each clip, up to the clip length (39 frames,
 1.6 s, by default for MiniMax H3; with Auto, up to 10 s), so most of a long
-video is never used. **Split into clips**, in the **⋯** menu of a dataset with
-videos, makes a new dataset with each video cut into clips a job trains on
+video is never used. **Split into clips**, in the **Tools** menu of a dataset
+with videos, makes a new dataset with each video cut into clips a job trains on
 whole. The original is left as it is.
 
 - **Clip length**: pick a video profile, GPU, resolution, offload and Low VRAM.

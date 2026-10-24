@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type MutableRefObject, type RefObject } from "react";
 import { api, fmtClock, q } from "../api";
-import { IconLeft, IconPlay, IconPlus, IconRefresh, IconRight, IconScissors, IconStop, IconTrash, IconX } from "../components/icons";
-import { useToast } from "../components/ui";
+import { IconLeft, IconPlay, IconPlus, IconRefresh, IconRight, IconScissors, IconStop, IconTrash } from "../components/icons";
+import { ConfirmDialog, TaskProgress, useToast } from "../components/ui";
 
 type Crop = [number, number, number, number]; // x, y, width, height in the video's pixels
 type Clip = { id: number; start: number; frames: number; crop: Crop | null };
@@ -123,6 +123,7 @@ export default function ClipEditor({ id }: { id: string }) {
   const edits = useRef(new Map<string, number>());
   const inflight = useRef(new Set<Promise<unknown>>());
   const askedToLook = useRef(false);
+  const [replanning, setReplanning] = useState<string | null>(null); // the video whose Plan again is being confirmed
 
   const load = () => api.get<Plan>(`/api/datasets/${id}/clips`).then((p) => {
     setError(null);
@@ -198,7 +199,6 @@ export default function ClipEditor({ id }: { id: string }) {
   };
 
   const replan = async (r: string) => {
-    if (!confirm(`Plan this video's clips again, at ${newLen} frames each? Its clips are replaced; any already cut are removed when you cut.`)) return;
     clearTimeout(waiting.current.get(r)?.timer);
     waiting.current.delete(r);
     edits.current.set(r, (edits.current.get(r) || 0) + 1);
@@ -258,19 +258,12 @@ export default function ClipEditor({ id }: { id: string }) {
       </div>
 
       {job && (job.running || job.errors.length > 0) && (
-        <div className="card card-pad" style={{ marginBottom: 16 }}>
-          <div className="row small" style={{ marginBottom: 6 }}>
-            <IconScissors width={14} style={{ color: "var(--accent)" }} />
-            {job.running
-              ? <span>{job.mode === "cut" ? "Cutting" : "Looking at the videos"} {job.done} / {job.total} files{job.mode === "cut" ? ` · ${job.clips} cut` : ""}{" "}
-                <span className="faint">{job.current}{job.message ? ` · ${job.message}` : ""}</span></span>
-              : <span>{job.mode === "cut" ? `Cut ${job.clips} clip${job.clips === 1 ? "" : "s"}${job.removed ? `, removed ${job.removed}` : ""}` : "Looked at the videos"}</span>}
-            <span className="spacer" />
-            {job.running && <button className="btn sm" onClick={() => api.del(`/api/datasets/${id}/clips/job`).then(load)}><IconX /> Stop</button>}
-          </div>
-          {job.running && <div className="progress"><div style={{ width: `${(100 * job.done) / Math.max(1, job.total)}%` }} /></div>}
-          {job.errors.length > 0 && <div className="error-box" style={{ marginTop: 8 }}>{job.errors.slice(-5).map((e) => <div key={e}>{e}</div>)}</div>}
-        </div>
+        <TaskProgress className="card card-pad ce-task" icon={<IconScissors />} running={job.running} errors={job.errors}
+          label={job.running ? (job.mode === "cut" ? "Cutting" : "Looking at the videos")
+            : job.mode === "cut" ? `Cut ${job.clips} clip${job.clips === 1 ? "" : "s"}${job.removed ? `, removed ${job.removed}` : ""}` : "Looked at the videos"}
+          done={job.done} total={job.total}
+          detail={job.running && `files${job.mode === "cut" ? ` · ${job.clips} cut` : ""} ${job.current}${job.message ? ` · ${job.message}` : ""}`}
+          onCancel={() => api.del(`/api/datasets/${id}/clips/job`).then(load)} />
       )}
 
       {!plan.videos.length && <div className="empty"><strong>No videos</strong>{plan.source.name} has no videos to cut clips from.</div>}
@@ -293,8 +286,12 @@ export default function ClipEditor({ id }: { id: string }) {
           })}
         </div>
         {v && <VideoEditor key={v.rel} plan={plan} v={v} selId={selId} onSelect={setSelId} locked={cutting || !v.looked || !v.path}
-          onClips={(clips, save) => setClips(v.rel, clips, save)} newLen={newLen} setNewLen={setNewLen} onReplan={() => replan(v.rel)} />}
+          onClips={(clips, save) => setClips(v.rel, clips, save)} newLen={newLen} setNewLen={setNewLen} onReplan={() => setReplanning(v.rel)} />}
       </div>
+      {replanning && (
+        <ConfirmDialog title="Plan the clips again" danger confirmLabel="Plan again" onClose={() => setReplanning(null)} onConfirm={() => replan(replanning)}
+          message={`This video's clips are replaced by new ones of ${newLen} frames each; any already cut are removed when you cut.`} />
+      )}
     </div>
   );
 }

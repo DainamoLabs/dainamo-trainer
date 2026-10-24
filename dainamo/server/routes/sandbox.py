@@ -54,10 +54,16 @@ class SandboxIn(BaseModel):
     # compare checkpoints: {job_id, checkpoints: [paths], strengths: [numbers], base: bool}; every image of the
     # grid also has ``loras``
     grid: dict | None = None
+    strength: float = 0.6  # Image-to-Image: how much of the input image is redone (1: all of it, ignoring it)
+    # the hi-res fix, for images: {factor (1.5 or 2), model (an upscaler file, or "resize"), strength (0.1–0.9), steps
+    # (None: the run's)}: each render made bigger, then rendered again from there at that size
+    hires: dict | None = None
 
 
 MAX_GRID = 64  # images in one run of a grid (all seeds)
 MAX_REFMODS = 4
+MAX_SIDE = 4096  # a render's longest side (the hi-res fix's too)
+HIRES_FACTORS = (1.5, 2.0)
 
 
 def check_refmods(raw: list[dict], audio_ok: bool) -> tuple[list[dict], list[str]]:
@@ -171,10 +177,47 @@ def check_model(F, profile: dict, raw: str) -> str | None:
     return path
 
 
+def check_hires(F, wf, raw: dict, width: int, height: int) -> dict:
+    """The hi-res fix's request -> {factor, model (an upscaler file, or "resize"), model_name, strength, steps (None:
+    the run's), width, height (the size it makes)}."""
+    from ...engine.families.base import WORKFLOWS
+    from ...engine.upscale import target_size
+    from .upscale import check_model as check_upscaler
+
+    if WORKFLOWS[wf.id]["output"] != "image" or not F.supports_samplers:
+        raise HTTPException(400, f"The hi-res fix is for images; {WORKFLOWS[wf.id]['label']} can't take it"
+                                 + ("" if F.supports_samplers else f" with {F.info.label}"))
+    try:
+        factor = float(raw.get("factor", 2))
+        strength = float(raw.get("strength", 0.35))
+        steps = None if raw.get("steps") in (None, "") else int(raw["steps"])
+    except (TypeError, ValueError):
+        raise HTTPException(400, "The hi-res fix's factor, strength and steps must be numbers")
+    if factor not in HIRES_FACTORS:
+        raise HTTPException(400, "The hi-res factor must be 1.5× or 2×")
+    if not 0.1 <= strength <= 0.9:
+        raise HTTPException(400, "The hi-res strength must be 0.1–0.9")
+    if steps is not None and not 1 <= steps <= 200:
+        raise HTTPException(400, "Hi-res steps must be 1–200 (blank for the run's)")
+    model = str(raw.get("model") or "").strip()
+    if model == "resize":
+        name = "Resize"
+    elif not model:
+        raise HTTPException(400, "Choose an upscaler for the hi-res fix, or Resize only")
+    else:
+        info = check_upscaler(model)
+        model, name = info["path"], info["name"]
+    w, h = target_size(width, height, factor, F.bucket_divisibility)
+    if max(w, h) > MAX_SIDE:
+        raise HTTPException(400, f"With the hi-res fix it would be {w}×{h}: a side can be at most {MAX_SIDE} pixels")
+    return {"factor": factor, "model": model, "model_name": name, "strength": strength, "steps": steps, "width": w,
+            "height": h}
+
+
 def _workflow_for(F, profile: dict, workflow_id: str):
-    variant = str(profile["data"].get("variant") or "")
-    return next((w for w in F.info.workflows if w.id == workflow_id and (not w.variants or variant in w.variants)),
-                None)
+    from ...engine.families.base import sandbox_workflows
+
+    return next((w for w in sandbox_workflows(F, profile["data"]) if w.id == workflow_id), None)
 
 
 def check_sandbox(body: SandboxIn) -> tuple[dict, dict, int]:
@@ -219,8 +262,8 @@ def check_sandbox(body: SandboxIn) -> tuple[dict, dict, int]:
             raise HTTPException(400, f"Length must be {MIN_SONG_SECONDS}–{MAX_SONG_SECONDS} seconds")
         if len(body.lyrics) > MAX_LYRICS:
             raise HTTPException(400, f"Lyrics are limited to {MAX_LYRICS} characters")
-    elif not (128 <= width <= 4096 and 128 <= height <= 4096):
-        raise HTTPException(400, f"Width and height must be 128–4096 (multiples of {div})")
+    elif not (128 <= width <= MAX_SIDE and 128 <= height <= MAX_SIDE):
+        raise HTTPException(400, f"Width and height must be 128–{MAX_SIDE} (multiples of {div})")
     frames = int(body.frames) if video else 1
     if video and not 1 <= frames <= MAX_FRAMES:
         raise HTTPException(400, f"Frames must be 1–{MAX_FRAMES}")
@@ -267,12 +310,18 @@ def check_sandbox(body: SandboxIn) -> tuple[dict, dict, int]:
         gpu = 0
     grid = check_grid(body.grid, int(body.count)) if body.grid else None
     model = check_model(F, profile, body.model)
+    if wf.id == "i2i" and not 0.05 <= body.strength <= 1:
+        raise HTTPException(400, "Strength must be 0.05–1")
+    hires = check_hires(F, wf, body.hires, width, height) if body.hires else None
     params = {"workflow": wf.id, "prompt": prompt, "negative": body.negative, "width": width, "height": height,
               "frames": frames, "steps": int(body.steps), "cfg": float(body.cfg), "sampler": sampler,
               "scheduler": scheduler, "shift": body.shift, "seed": int(seed), "count": int(body.count),
               "loras": loras, "model": model, "images": images, "refmods": refmods, "audio": audio_refs,
               "compare_base": bool(body.compare_base and loras and not grid),
-              "offload": offload, "low_vram": bool(body.low_vram and F.info.streams_text_encoder), "grid": grid}
+              "offload": offload, "low_vram": bool(body.low_vram and F.info.streams_text_encoder), "grid": grid,
+              "hires": hires}
+    if wf.id == "i2i":
+        params["strength"] = float(body.strength)
     if audio:
         params.update(seconds=int(body.seconds), lyrics=body.lyrics.strip())
     if body.source_prompt.strip() and body.source_prompt.strip() != prompt:
@@ -308,7 +357,9 @@ def enhance(body: EnhanceIn):
         raise HTTPException(400, f"Prompt enhancement isn't available for {WORKFLOWS[wf.id]['label']}")
     instruction = cfg[kind]
     images = [p for p in (os.path.expanduser(i.strip()) for i in body.images if i and i.strip()) if os.path.isfile(p)]
-    if images and wf.images:
+    if images and wf.id == "i2i":
+        instruction += " The attached image is the starting image; describe what it should become."
+    elif images and wf.images:
         instruction += (f" The attached image{'s are' if len(images) > 1 else ' is'} the "
                         f"{re.sub(r' *[(].*?[)]', '', wf.images['label']).lower()} for this generation; stay consistent with "
                         f"{'them' if len(images) > 1 else 'it'}.")
@@ -364,17 +415,18 @@ def sandbox_status():
 def sandbox_defaults(profile_id: str):
     import torch
 
+    from ...engine.families.base import sandbox_workflows
+
     profile = profile_or_404(profile_id)
     F = get_family(profile["family"])
     d, td = F(profile["data"], torch.device("cpu")), F.info.training_defaults
-    variant = str(profile["data"].get("variant") or "")
     return {"steps": d.sample_steps(), "cfg": d.cfg_scale(F.profile_value(profile["data"], "sample_cfg")),
             "negative": str(profile["data"].get("sample_negative") or ""),
             "width": int(td.get("sample_width") or 1024), "height": int(td.get("sample_height") or 1024),
             "frames": int(td.get("sample_frames") or 1), "seconds": int(td.get("sample_seconds") or 30),
             "supports_samplers": F.supports_samplers,
             "divisibility": F.bucket_divisibility, "offload": float(td.get("offload", 0)),
-            "workflows": [w.to_json() for w in F.info.workflows if not w.variants or variant in w.variants]}
+            "workflows": [w.to_json() for w in sandbox_workflows(F, profile["data"])]}
 
 
 @router.get("/loras")

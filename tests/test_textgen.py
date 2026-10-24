@@ -34,6 +34,23 @@ def test_knows_the_text_encoders_that_can_write(fake_encoder):
     assert detect(fake_encoder("gemma")) == Encoder("gemma4", "Gemma 4 12B", "Gemma 4", True, True)
 
 
+def test_names_flux3s_prompt_upsampler_from_its_file(tmp_path):
+    """A Qwen3.5-9B like MOSS Image's encoder, told apart by its name (BFL's header says nothing), or a header that
+    says so."""
+    from conftest import FAKE_ENCODERS, header_only_safetensors
+
+    moss, _ = FAKE_ENCODERS["moss"]
+    pup = Encoder("qwen3_5", "FLUX 3 prompt upsampler", "FLUX 3 Image Klein", True, False, tuned_from="Qwen3.5-9B")
+    for name, meta, want in (("qwen3.5_9b_flux3_prompt_upsampler_int8_convrot", None, pup),
+                             ("flux3-pup-bf16", None, pup), ("mine", {"modelspec.title": "FLUX 3 prompt upsampler"}, pup),
+                             ("pupil", None, Encoder("qwen3_5", "Qwen3.5-9B", "MOSS Image", True, False))):
+        assert detect(header_only_safetensors(tmp_path / f"{name}.safetensors", moss, meta)) == want, name
+    assert pup.label == "FLUX 3 prompt upsampler (Qwen3.5-9B)" and pup.to_json()["tuned_from"] == "Qwen3.5-9B"
+    assert KREA.label == "Qwen3-VL-4B (Krea 2's text encoder)" and "tuned_from" not in KREA.to_json()
+    krea, _ = FAKE_ENCODERS["krea"]  # only a Qwen3.5-9B can be the upsampler
+    assert detect(header_only_safetensors(tmp_path / "krea_upsampler.safetensors", krea)) == KREA
+
+
 @pytest.mark.parametrize("name, said", [
     ("minimax", "MiniMax H3's text encoder: it stops after 50 of Qwen3-VL-32B's 64 layers"),
     ("ltx", "LTX 2.5's text encoder, Lightricks' custom Gemma 4"),

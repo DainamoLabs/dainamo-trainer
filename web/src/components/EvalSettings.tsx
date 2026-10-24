@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, type Dataset, type JobDetail } from "../api";
-import { IconPlus, IconX } from "./icons";
+import { IconPlus, IconQueueAdd, IconX } from "./icons";
 import { Modal, Num, usePoll, useToast } from "./ui";
 
 type S = Record<string, any>;
@@ -40,7 +40,7 @@ export function EvalSettings({ s, set, datasets, triggers, holdout, heldOut = 0,
       {picker && <div className={"toggle-card" + (s.picker_enabled ? " on" : "")}>
         <label className="check toggle-head">
           <input type="checkbox" checked={s.picker_enabled} onChange={(e) => set("picker_enabled")(e.target.checked)} />
-          <span><strong>Best checkpoint picker</strong>
+          <span><strong>Checkpoint picker</strong>
             <span className="help">Scores every saved checkpoint on images kept out of training, with the same noise each time, and recommends the one that generalises best.</span></span>
         </label>
         {s.picker_enabled && (
@@ -90,7 +90,7 @@ export function EvalSettings({ s, set, datasets, triggers, holdout, heldOut = 0,
       {bleed && <div className={"toggle-card" + (s.bleed_enabled ? " on" : "")}>
         <label className="check toggle-head">
           <input type="checkbox" checked={s.bleed_enabled} onChange={(e) => set("bleed_enabled")(e.target.checked)} />
-          <span><strong>Concept bleed detector</strong>
+          <span><strong>Concept bleed</strong>
             <span className="help">Renders prompts without your trigger word at every checkpoint and checks whether they start to look like your training images (bleed), and how much they change at all versus the base model (drift). Some bleed is expected for style LoRAs.</span></span>
         </label>
         {s.bleed_enabled && (
@@ -162,7 +162,7 @@ export function EvaluateDialog({ job, onClose, onQueued }: { job: JobDetail; onC
     setBusy(true);
     try {
       await api.post(`/api/jobs/${job.id}/evaluate`, { settings: s });
-      toast("Checkpoint evaluation queued");
+      toast("Queued to evaluate the checkpoints");
       onQueued();
       onClose();
     } catch (e: any) {
@@ -176,7 +176,7 @@ export function EvaluateDialog({ job, onClose, onQueued }: { job: JobDetail; onC
     <Modal title="Evaluate checkpoints" wide onClose={onClose} footer={
       <>
         <button className="btn ghost" onClick={onClose}>Cancel</button>
-        <button className="btn primary" disabled={busy || !ready} onClick={start}>Queue evaluation</button>
+        <button className="btn primary" disabled={busy || !ready} onClick={start}><IconQueueAdd /> Add to queue</button>
       </>
     }>
       <div className="stack" style={{ gap: 14 }}>

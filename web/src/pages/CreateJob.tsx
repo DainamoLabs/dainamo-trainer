@@ -3,10 +3,10 @@ import { go } from "../App";
 import { api, byFamily, type Dataset, type Family, type FamilySources, type Gpu, type JobDetail, type Profile, type SystemRam } from "../api";
 import { type CheckPairs, CheckIssues, PairSummary, useDatasetCheck } from "../components/DatasetCheck";
 import { EVAL_DEFAULTS, EvalSettings, evalCost } from "../components/EvalSettings";
-import { REFMOD_CONCEPTS, REFMOD_INFO } from "../components/MakeRefMod";
+import { REFMOD_CONCEPTS, REFMOD_INFO, RefModAbout, RefModEncoding, refLatentFrames, type RefModEncodingValues } from "../components/MakeRefMod";
 import { PairsDialog } from "../components/Pairs";
 import { IconPlay, IconPlus, IconSave, IconX } from "../components/icons";
-import { ConfirmDialog, ImagesInput, Info, Num, ProfileOptions, usePoll, useToast } from "../components/ui";
+import { ConfirmDialog, ImagesInput, Info, Num, ProfileOptions, fmtSize, usePoll, useToast } from "../components/ui";
 import { MemoryEstimate, gpuTarget, useVramProjection } from "../components/Vram";
 
 type S = Record<string, any>;
@@ -68,12 +68,10 @@ const AUDIO_CONCEPTS: [string, string][] = [
   ["ambience", "Ambience"], ["generic", "Generic"],
 ];
 const AUDIO_TOKENS_PER_SECOND = 80; // 40 audio latents a second, one token for each in each stereo channel
-// MiniMax H3 clips: 17n + 5 frames are 5n + 2 latent frames, and fewer than 5 is the first frame alone
-const refFrames = (frames: number) => (frames < 5 ? 1 : Math.floor((frames - 5) / 17) * 5 + 2);
 
 // what the "i" beside a setting says, for the ones whose name doesn't
 const INFO = {
-  profile: "The model files to train with (the model, its text encoder and VAE), set up on the Profiles page.",
+  profile: "The model files to train with (the model, its text encoder and VAE), set up in Models.",
   gpu: "Auto starts the job on whichever of the GPUs chosen in Settings is least busy. Picking one makes the job wait for that GPU.",
   outputName: "What the saved files are called (name.safetensors, name_000250.safetensors, …). Blank: the job's name.",
   saveEvery: "How often a checkpoint is saved, in steps, besides the final one. 0 saves only at the end.",
@@ -110,10 +108,7 @@ const INFO = {
   minSnrGamma: "Min-SNR's cap: lower counts the low-noise steps less. 5 is the usual value.",
   finetuneLr: "How big each update to the model's weights is. A finetune changes the model itself, so it takes a far lower rate than a LoRA (about a tenth); too high and the model forgets what it knew.",
   finetuneOptimizer: "Adafactor keeps almost no state beside the model, so it fits where AdamW 8-bit, which keeps 2 bytes a weight (as much again as the model), may not. Either way each weight is updated as soon as its gradient is ready, so the model's gradients never all exist at once.",
-  refmodMode: REFMOD_INFO.mode,
   refmodTokens: REFMOD_INFO.tokens,
-  refmodMerge: REFMOD_INFO.merge,
-  refmodConcept: REFMOD_INFO.concept,
   refmodKind: "Pictures encodes the datasets' images and clips with the video VAE: a subject, a look or a motion to take after. Sound encodes their sound with the audio VAE (sound files, and clips' soundtracks): a voice, singing, a style of music or a sound. The model takes a sound reference only beside a picture one (a reference image or a visual RefMod).",
   refmodSeconds: "How much sound the RefMod holds: the datasets' sound files and clips with sound, each from its start, in order, until there's this much. A generation uses as much of it as the video is long (MiniMax H3 makes up to 10 s), from the start, as the released pipeline does; ComfyUI may use more.",
 };
@@ -230,7 +225,6 @@ const strengthsOk = (raw: unknown, most: number) => {
   const v = String(raw ?? "").replace(/,/g, " ").split(/\s+/).filter(Boolean).map(Number);
   return v.length >= 1 && v.length <= most && v.every((x) => x >= -10 && x <= 10);
 };
-const fmtSize = (bytes: number) => (bytes < 1e6 ? `${Math.max(1, Math.round(bytes / 1e3))} KB` : `${(bytes / 1e6).toFixed(1)} MB`);
 
 /** The health check of a dataset card's dataset, for this model at the card's resolutions (music: clip length);
  * ``onLongest`` hears its longest clip's frames. With ``pairing`` (a model that trains with reference images), it
@@ -436,7 +430,14 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
   const refSounds = chosen.reduce((n, c) => n + (c.d.audio || 0), 0) + refClips;
   const refCompressed = s.refmod_mode !== "full";
   const perFrame = refCompressed ? (Math.round(Number(s.refmod_grid) / 2) || 1) ** 2 : Math.max(1, Math.round(Number(s.refmod_size) / 32)) ** 2;
-  const clipLatents = refFrames(Number(s.refmod_frames) || 1);
+  const clipLatents = refLatentFrames(Number(s.refmod_frames) || 1);
+  // the shared RefMod fields name the settings without their refmod_
+  const refEncoding: RefModEncodingValues = {
+    mode: refCompressed ? "compressed" : "full", size: s.refmod_size, frames: s.refmod_frames, grid: s.refmod_grid,
+    refine: s.refmod_refine, merge: !!s.refmod_merge, max_tokens: s.refmod_max_tokens,
+  };
+  const setRefEncoding = (p: Partial<RefModEncodingValues>) =>
+    setS((x) => ({ ...x, ...Object.fromEntries(Object.entries(p).map(([k, v]) => [`refmod_${k}`, v])) }));
   const refMerged = refCompressed && !!s.refmod_merge && refImages + refClips > 1;
   const refTokens = perFrame * (refMerged ? (refClips ? clipLatents : 1) : refImages + refClips * clipLatents);
   const refCap = Number(s.refmod_max_tokens) || 0;
@@ -537,12 +538,12 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
     : !refmod && !slider && !finetune && s.picker_enabled && s.sweep_enabled && !strengthsOk(s.sweep_strengths, 8)
       ? "Give the strength sweep 1–8 strengths, each -10 to 10, to continue."
     : !refmod && !finetune && !isAudio && s.bleed_enabled && !(s.bleed_prompts || []).some((p: string) => p.trim())
-      ? "Add a probe prompt to the concept bleed detector to continue." : "";
+      ? "Add a probe prompt under Concept bleed to continue." : "";
   // what each save of a finetune takes on disk: the whole model, in bf16
   const saveGb = finetune && vram && !vram.error ? (vram.adapter_params * 2) / 1e9 : 0;
 
   return (
-    <div className="page create">
+    <div className="page wide create">
       <div className="page-head">
         {edit ? (
           <div style={{ minWidth: 0 }}>
@@ -556,7 +557,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
           </div>
         ) : (
           <div>
-            <h1>Create job</h1>
+            <h1>New job</h1>
             <p>{refmod ? "Make a RefMod of your datasets and add it to the queue." : finetune ? "Configure a finetune of the whole model and add it to the queue." : "Configure a training run and add it to the queue."}</p>
           </div>
         )}
@@ -583,7 +584,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
               <Sel label="GPU" info={INFO.gpu} v={gpu} on={setGpu} opts={[["auto", "Auto · Queue decides"], ...(sys?.gpus || []).map((g) => [String(g.index), `GPU ${g.index} · ${g.name.replace("NVIDIA GeForce ", "")}`] as [string, string])]} />
               {family && (
                 <div className="field">
-                  <span>{family.refmods ? "Make" : "Training method"}</span>
+                  <span>Training method</span>
                   <div className="seg method" role="group" aria-label="What to train">
                     {KINDS.filter(([k]) => (k !== "slider" || family.sliders) && (k !== "refmod" || family.refmods) && (k !== "finetune" || family.finetune)).map(([k, label]) => (
                       <button key={k} type="button" className={kind === k ? "on" : ""} aria-pressed={kind === k} onClick={() => setKind(k)}>{label}</button>
@@ -688,48 +689,12 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
                     <Num label="Token cap" info={INFO.refmodTokens} v={s.refmod_max_tokens} on={set("refmod_max_tokens")} step={512} min={0}
                       help={soundCapped ? `The sound is cut to ${(refCap / AUDIO_TOKENS_PER_SECOND).toFixed(1)} s.` : undefined} />
                   </div>
-                ) : <>
-                <div className="field">
-                  <span>Encoding<Info text={INFO.refmodMode} /></span>
-                  <div className="seg" role="group" aria-label="How the references are encoded">
-                    {([["compressed", "Compressed"], ["full", "Full"]] as const).map(([m, label]) => (
-                      <button key={m} type="button" className={(refCompressed ? "compressed" : "full") === m ? "on" : ""}
-                        aria-pressed={(refCompressed ? "compressed" : "full") === m} onClick={() => set("refmod_mode")(m)}>{label}</button>
-                    ))}
-                  </div>
-                  <span className="help">{refCompressed
-                    ? "Each reference as a small grid, refined to match its full encode: few tokens, less detail."
-                    : "Each reference's encode as it is: the most detail, and the most tokens."}</span>
-                </div>
-                <div className="grid cols-3">
-                  <Num label="Size (short edge, px)" v={s.refmod_size} on={set("refmod_size")} step={32} min={256}
-                    help={refCompressed ? "What each reference is encoded at before it's compressed; scaled down to it, never up." : "Scaled down to it, never up, in multiples of 32."} />
-                  <Num label="Frames per clip" v={s.refmod_frames} on={set("refmod_frames")} min={1}
-                    help={`A clip's first frames at 24 fps, snapped down to ${family?.frame_rule || "a length the model takes"}: ${refFrames(Number(s.refmod_frames) || 1)} latent frame(s). Images are one.`} />
-                  <Num label="Token cap" info={INFO.refmodTokens} v={s.refmod_max_tokens} on={set("refmod_max_tokens")} step={512} min={0} />
-                  {refCompressed && <>
-                    <Num label="Grid (cells, long edge)" v={s.refmod_grid} on={set("refmod_grid")} step={2} min={2}
-                      help={`Even; the short edge keeps the first reference's shape. ${s.refmod_grid} is ${perFrame} tokens per square frame.`} />
-                    <Num label="Refinement steps" v={s.refmod_refine} on={set("refmod_refine")} step={50} min={0}
-                      help="How long each grid is refined to match its full encode. 0: the plain average." />
-                    <label className="check" style={{ alignSelf: "end", paddingBottom: 8 }}>
-                      <input type="checkbox" checked={!!s.refmod_merge} onChange={(e) => set("refmod_merge")(e.target.checked)} /> Merge into one reference<Info text={INFO.refmodMerge} />
-                    </label>
-                  </>}
-                </div>
-                </>}
-                <div className="grid cols-2">
-                  <Sel label="Concept" info={INFO.refmodConcept} v={s.refmod_concept} on={set("refmod_concept")} opts={refSound ? AUDIO_CONCEPTS : REFMOD_CONCEPTS} />
-                  <label className="field">
-                    <span>Save a copy to <span className="faint">· optional</span></span>
-                    <input value={s.refmod_copy_to} onChange={(e) => set("refmod_copy_to")(e.target.value)} placeholder="/path/to/ComfyUI/models/refmods" />
-                    <span className="help">A folder the finished file is copied to, such as ComfyUI's models/refmods.</span>
-                  </label>
-                </div>
-                <label className="field">
-                  <span>Description <span className="faint">· optional</span></span>
-                  <textarea rows={2} value={s.refmod_description} onChange={(e) => set("refmod_description")(e.target.value)} placeholder="Who or what it is, and how it was made" />
-                </label>
+                ) : (
+                  <RefModEncoding v={refEncoding} set={setRefEncoding} frameRule={family?.frame_rule} perFrame={perFrame} />
+                )}
+                <RefModAbout concept={s.refmod_concept} copyTo={s.refmod_copy_to} description={s.refmod_description}
+                  concepts={refSound ? AUDIO_CONCEPTS : REFMOD_CONCEPTS}
+                  set={(p) => setS((x) => ({ ...x, ...Object.fromEntries(Object.entries(p).map(([k, v]) => [`refmod_${k}`, v])) }))} />
                 {!refFits && (refSound
                   ? <div className="validation warning">The token cap is below one audio latent (2 tokens): raise it, or set 0 for no cap.</div>
                   : <div className="validation warning">One {refCompressed ? "grid" : "frame"} takes {perFrame} tokens, more than the cap: {refCompressed ? "lower the grid" : "lower the size"}, or raise the cap.</div>)}
@@ -1190,12 +1155,12 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
               <div className="kv"><span>Epochs</span><span>{epochs ? epochs.toFixed(1) : "—"}</span></div>
             </>)}
             <div className="kv"><span>Steps</span><span>{Number(s.steps).toLocaleString()}</span></div>
-            <div className="kv"><span>Save events<Info text="Checkpoints saved during the run, the final one included (Save every)." /></span><span>{(s.save_every ? Math.floor((s.steps - 1) / s.save_every) + 1 : 1)}</span></div>
-            <div className="kv"><span>Keep latest<Info text="How many of the step saves stay on disk (Keep last N saves); the final save is always kept." /></span><span>{Number(s.keep_last) ? s.keep_last : "All"}</span></div>
+            <div className="kv"><span>Saves<Info text="Checkpoints saved during the run, the final one included (Save every)." /></span><span>{(s.save_every ? Math.floor((s.steps - 1) / s.save_every) + 1 : 1)}</span></div>
+            <div className="kv"><span>Keep last N saves<Info text="How many of the step saves stay on disk; the final save is always kept." /></span><span>{Number(s.keep_last) ? s.keep_last : "All"}</span></div>
             {!slider && s.picker_enabled && <div className="kv"><span>Checkpoint picker</span><span>On</span></div>}
             {!isAudio && s.bleed_enabled && <div className="kv"><span>Concept bleed</span><span>On</span></div>}
             </>}
-            {!slider && !refmod && missingCaps > 0 && <div className="validation warning" style={{ marginTop: 10 }}>{missingCaps} file(s) have no caption — they'll train on the trigger word only.</div>}
+            {!slider && !refmod && missingCaps > 0 && <div className="validation warning" style={{ marginTop: 10 }}>{missingCaps} file{missingCaps === 1 ? " has" : "s have"} no caption: {missingCaps === 1 ? "it trains" : "they train"} on the trigger word only.</div>}
           </div>
           {!refmod && (
             <MemoryEstimate proj={vram} value={Number(s.offload) || 0} onChange={set("offload")} gpu={target} ram={sys?.ram} noProfile={!profileId}

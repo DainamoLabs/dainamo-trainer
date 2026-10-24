@@ -138,10 +138,27 @@ def _check_models(v: dict) -> dict:
     return {"folder": folder}
 
 
+def _style_number(st: dict, key: str, what: str, kind, low: float, high: float):
+    """A caption style's own temperature or max_tokens, checked; None (left out) when it's blank."""
+    val = st.get(key)
+    if val is None or val == "":
+        return None
+    try:
+        val = kind(val)
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"Caption style {st.get('name')!r}: {what} must be a number")
+    if not low <= val <= high:
+        raise HTTPException(400, f"Caption style {st.get('name')!r}: {what} must be {low:g}–{high:g}, or blank for "
+                                 "the caption provider's")
+    return val
+
+
 def _check_caption_styles(v: dict) -> dict:
+    from ..captioner import MAX_TOKENS
+
     styles, seen = [], set()
     for st in v.get("styles") or []:
-        sid, name, prompt = (str(st.get(k) or "").strip() for k in ("id", "name", "prompt"))
+        sid, name, prompt, system = (str(st.get(k) or "").strip() for k in ("id", "name", "prompt", "system"))
         if not re.fullmatch(r"[a-z0-9-]{1,40}", sid) or sid in seen:
             raise HTTPException(400, f"Caption style {name or sid!r} has a bad or repeated id")
         if not name:
@@ -149,7 +166,14 @@ def _check_caption_styles(v: dict) -> dict:
         if not prompt:
             raise HTTPException(400, f"Caption style {name!r} needs a prompt")
         seen.add(sid)
-        styles.append({"id": sid, "name": name, "prompt": prompt})
+        # the optional fields only when set: a style without them uses the caption provider's settings
+        out = {"id": sid, "name": name, "prompt": prompt, **({"system": system} if system else {})}
+        for key, what, kind, low, high in (("temperature", "Temperature", float, 0, 2),
+                                           ("max_tokens", "Max tokens", int, 16, MAX_TOKENS)):
+            val = _style_number(st, key, what, kind, low, high)
+            if val is not None:
+                out[key] = val
+        styles.append(out)
     if not 1 <= len(styles) <= 30:
         raise HTTPException(400, "Keep between 1 and 30 caption styles")
     default = v.get("default") if v.get("default") in seen else styles[0]["id"]

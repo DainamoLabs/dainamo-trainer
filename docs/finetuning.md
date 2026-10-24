@@ -5,7 +5,7 @@ can learn more than a LoRA, which matters when one model should learn many
 concepts or a lot of data. Training several concepts together, each with its
 own trigger, also avoids the interference of stacking separate LoRAs.
 
-Choose **Finetune** under Training method in Create Job (MOSS-Image and Krea 2 profiles).
+Choose **Finetune** under Training method in New job (MOSS-Image and Krea 2 profiles).
 It starts at a learning rate of 1e-5, with Adafactor, keeping the last 2 saves
 (Krea 2: the last one).
 
@@ -53,9 +53,11 @@ of VRAM at most, so the projection, at 22.7 GB, is on the safe side.
 changed from the profile's model as a LoRA: a much smaller file to use on the
 original model, in the Sandbox or ComfyUI, and to combine with other LoRAs.
 
-Choose a rank (the form shows the file size: about 290 MB for MOSS-Image at 64)
-and a name. It runs as a job of its own, using about 3 GB of VRAM; the time is
-mostly reading the two models. Changes to norms and biases are kept whole
+It opens the same form as [Merge & extract](merge-and-extract.md#extract-a-lora)
+has, on that checkpoint. Choose a rank (the form shows the file size: about
+290 MB for MOSS-Image at 64) and a name, then **Add to queue**. It runs as a
+job of its own, using about 3 GB of VRAM; the time is mostly reading the two
+models. Changes to norms and biases are kept whole
 (`.diff`, `.diff_b` keys, which ComfyUI and the Sandbox apply).
 
 The job's page says how much of the change the LoRA keeps. If the result looks

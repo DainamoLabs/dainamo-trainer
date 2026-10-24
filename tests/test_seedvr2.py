@@ -1,7 +1,8 @@
 """SeedVR2 (the 3B upscaler): the DiT against ByteDance's reference code on a small config (dual-stream and shared
 blocks, windows and shifted windows, the output layer's shared modulation), RoPE and the window cuts, the causal
 VAE's convs, shuffles and slicing, its tiles, the 4n + 1 padding, the color fix, the one-step schedule, the
-upscaler end to end on tiny models, and that the real files' tensors are the modules' parameters.
+upscaler end to end on tiny models (passes that overlap and crossfade, its options checked and clamped), and that
+the real files' tensors are the modules' parameters.
 
 The reference pieces below are copied from ByteDance Seed's SeedVR (https://github.com/ByteDance-Seed/SeedVR at
 e4de8c2, ``models/dit_v2``; Copyright (c) 2025 Bytedance Ltd. and/or its affiliates, Apache License 2.0) and from
@@ -701,11 +702,23 @@ def test_tiled_vae_close_to_whole():
 def test_padding_to_4n_plus_1():
     """The reference's cut_videos: 1 stays 1, 2 to 5 become 5, then up to the next 4n + 1."""
     assert [V.padded_length(t) for t in (1, 2, 4, 5, 6, 9, 10, 13, 81)] == [1, 5, 5, 5, 9, 9, 13, 13, 81]
-    for frames, per in [(1, 41), (41, 41), (42, 41), (100, 41), (7, 5), (300, 9)]:
-        parts = P.chunks(frames, per)
-        assert parts[0][0] == 0 and parts[-1][1] == frames
-        assert all(b - a <= per and (b - a - 1) % 4 == 0 for a, b in parts[:-1])
-        assert all(a1 == b0 for (_, b0), (a1, _) in zip(parts, parts[1:]))
+
+
+def test_passes_cover_a_clip_sharing_frames():
+    """As few passes as cover the clip, each at most a pass long and 4n + 1 frames (all but the last the same),
+    neighbours sharing the overlap (at most half a pass, less one), the last longer than it."""
+    for frames, per in [(1, 41), (41, 41), (42, 41), (60, 41), (100, 41), (7, 5), (300, 9), (12, 1), (2, 5)]:
+        for overlap in (0, 2, 8):
+            parts = P.passes(frames, per, overlap)
+            o = min(overlap, (per - 1) // 2) if frames > per else 0
+            assert parts[0][0] == 0 and parts[-1][1] == frames
+            assert all(b - a == parts[0][1] - parts[0][0] <= per and (b - a - 1) % 4 == 0 for a, b in parts[:-1])
+            assert all(b0 - a1 == o for (_, b0), (a1, _) in zip(parts, parts[1:]))
+            assert parts[-1][1] - parts[-1][0] > o
+            assert len(parts) == (1 if frames <= per else math.ceil((frames - o) / (per - o)))
+    assert P.passes(60, 41, 8) == [(0, 37), (29, 60)]  # 60 frames at 1080p
+    assert P.passes(100, 41, 0) == [(0, 37), (37, 74), (74, 100)]  # no overlap: side by side, as before
+    assert P.passes(8 + 3 * 33, 41, 8) == [(0, 41), (33, 74), (66, 107)]  # m * (41 - 8) + 8: m whole passes
 
 
 def test_color_fix_keeps_input_colors():
@@ -747,6 +760,7 @@ def _tiny_upscaler():
     up.info = Info("seedvr2.safetensors", "seedvr2", "seedvr2", video=True, companion="vae.safetensors")
     up.device, up.log = torch.device("cpu"), print
     up.seed, up.max_tokens, up.vram_limit, up.vae_tile, up.vae_memory = P.SEED, P.MAX_TOKENS, None, None, "gpu"
+    up.pass_overlap = P.PASS_OVERLAP
     torch.manual_seed(4)
     cfg = dict(SMALL, in_channels=9, out_channels=4)
     up.dit = M.SeedVR2DiT(M.SeedVR2Config(**cfg)).eval()
@@ -770,9 +784,78 @@ def test_upscaler_end_to_end():
     assert up.upscale(frames[:1], (32, 32)).shape == (1, 3, 32, 32)
     seen = []
     up.max_tokens = up.tokens_for((32, 32), 5)
-    assert up.frames_per_pass((32, 32)) == 5
+    assert up.frames_per_pass((32, 32)) == 5 and up.overlap_frames((32, 32)) == 2
     assert up.upscale(torch.rand(7, 3, 16, 16), (32, 32), progress=seen.append).shape == (7, 3, 32, 32)
-    assert seen == ["Upscaling frames 1-5 of 7", "Upscaling frames 6-7 of 7"]
+    assert seen == ["Upscaling frames 1-5 of 7", "Upscaling frames 4-7 of 7"]  # sharing two frames
+    for t in range(1, 13):  # any frame count, in passes of 5 (padded to 4n + 1 inside) sharing 2
+        out = up.upscale(torch.rand(t, 3, 16, 16), (24, 40))
+        assert out.shape == (t, 3, 40, 24) and torch.isfinite(out).all() and 0 <= out.min() and out.max() <= 1
+
+
+def test_overlapping_passes_crossfade():
+    """Passes that make the same frames give what one pass gives; passes that differ (here by a constant per pass)
+    go from one to the next in a straight line over the frames they share, so there's no step. With a pass of one
+    nearest-neighbour resize, each frame a flat grey of its own."""
+    up = _tiny_upscaler()
+    offset = []  # added to each pass's frames
+
+    def one_pass(frames, size, gen, check):
+        y = F.interpolate(frames, size=(size[1], size[0]), mode="nearest")
+        offset.append(len(offset))
+        return y + 0.1 * offset[-1] if shift else y
+
+    up._clip = one_pass
+    up.max_tokens = up.tokens_for((8, 8), 9)  # passes of 9 frames sharing 4
+    for t in range(1, 13):
+        x = torch.linspace(0, 0.5, t).view(t, 1, 1, 1).expand(t, 3, 4, 4).contiguous()
+        shift = False
+        offset.clear()
+        out = up.upscale(x, (8, 8))
+        assert out.shape == (t, 3, 8, 8)
+        torch.testing.assert_close(out, F.interpolate(x, size=(8, 8), mode="nearest"))  # as one pass
+        assert len(offset) == len(P.passes(t, 9, 4)) == (1 if t <= 9 else 2)
+    shift = True
+    offset.clear()
+    x = torch.linspace(0, 0.5, 12).view(12, 1, 1, 1).expand(12, 3, 4, 4).contiguous()
+    out = up.upscale(x, (8, 8), options={"overlap": 4})
+    assert P.passes(12, 9, 4) == [(0, 9), (5, 12)]
+    step = (out - F.interpolate(x, size=(8, 8), mode="nearest")).mean((1, 2, 3))
+    ramp = [0.0] * 5 + [0.1 * (j + 0.5) / 4 for j in range(4)] + [0.1] * 3  # frames 5-8 are both passes'
+    torch.testing.assert_close(step, torch.tensor(ramp), rtol=0, atol=1e-6)
+    offset.clear()
+    out = up.upscale(x, (8, 8), options={"overlap": 0})  # side by side: a step of the whole 0.1 between 8 and 9
+    step = (out - F.interpolate(x, size=(8, 8), mode="nearest")).mean((1, 2, 3))
+    torch.testing.assert_close(step, torch.tensor([0.0] * 9 + [0.1] * 3), rtol=0, atol=1e-6)
+
+
+def test_options_are_checked_and_clamped():
+    """The Sandbox's names (max_frames, tile, seed, overlap) and the attributes: unknown keys and values that aren't
+    numbers dropped, numbers clamped to their range, each with a line in the log and never an error; checked
+    options come back the same without a line."""
+    up = _tiny_upscaler()
+    said = []
+    up.log = said.append
+    opts = up.check_options({"max_frames": 5000, "tile": 10, "seed": -3, "overlap": 99, "bogus": 1})
+    assert opts == {"max_frames": 1001, "tile": P.MIN_TILE, "seed": 0, "overlap": 32}
+    assert len(said) == 5 and "bogus" in said[-1] and "1001" in said[0]
+    said.clear()
+    assert up.check_options(opts) == opts and not said
+    assert up.check_options({"max_frames": "20", "tile": "0", "seed": "7", "overlap": None, "vae_memory": "cpu",
+                             "max_tokens": 4096}) == {"max_frames": 17, "tile": 0, "seed": 7, "vae_memory": "cpu",
+                                                      "max_tokens": 4096}
+    assert not said  # 20 frames a pass is 17 (4n + 1, at most what was asked), a tile of 0 whole frames: no line
+    assert up.check_options({"max_frames": "lots", "seed": True, "tile": -1, "vae_memory": "disk", "seed2": 1,
+                             "overlap": float("nan")}) == {}
+    assert len(said) == 6
+    said.clear()
+    out = up.upscale(torch.rand(3, 3, 16, 16), (32, 32), options={"max_frames": 0, "tile": 1, "seed": 2**70, "x": 1})
+    assert out.shape == (3, 3, 32, 32) and len(said) == 4
+    assert (up.seed, up.vae_tile, up.max_tokens, up.pass_overlap) == (P.SEED, None, P.MAX_TOKENS, P.PASS_OVERLAP)
+    assert up.frames_per_pass((1920, 1080)) == 41 and up.overlap_frames((1920, 1080)) == 8
+    assert up.frames_per_pass((32, 32), {"max_frames": 9}) == 9 and up.overlap_frames((32, 32), {"max_frames": 9}) == 4
+    assert up.overlap_frames((32, 32), {"max_frames": 9, "overlap": 1}) == 1
+    assert up.overlap_frames((32, 32), {"max_frames": 1}) == 0  # a pass of one frame shares none
+    assert up.max_tokens == P.MAX_TOKENS and up.pass_overlap == P.PASS_OVERLAP
 
 
 def test_upscaler_cancels():

@@ -22,7 +22,7 @@ dainamo/
     hf_assets.py          tokenizers and configs from Hugging Face, pinned to a commit
     upscale.py            upscalers: what each file of upscale_models is, loading one, fitting sizes
     upscalers/            pixel.py (the spandrel architectures, tiled) and seedvr2/ (the SeedVR2 3B port)
-  assets/                 bundled copies of those for the families whose licenses allow it (see its README)
+  assets/                 bundled copies of those for the families whose licenses allow it, and FLUX 3's upsampler prompts (see its README)
     families/             one driver per model family
       base.py             driver interface
       krea2/              Krea 2 model + driver
@@ -118,10 +118,10 @@ only the header matters.
 | `test_merge.py` | an exact merge is the stacked LoRAs, a cut one the best approximation of their sum, kohya files, LoKrs only at a rank, whole changes added up, layers another model has left out, the Sandbox applying a merge as its LoRAs, merge jobs, the Merge & extract routes |
 | `test_lokr.py` | LoKr factor splits, a LoKr layer against the full Kronecker product, `lokr_w1`/`lokr_w2` keys saved and loaded, the Sandbox applying LoKr files and explaining the ones it can't, a tiny LoKr job |
 | `test_slider.py` | the slider step (base predictions with the LoRA off, the guided target, the strength during backward) and a tiny slider job without a dataset |
-| `test_sampling.py` | samplers on Gaussian data with a known solution (Heun and DPM++ 2M converge at second order), DPM++ 2M against k-diffusion, the beta schedule |
-| `test_sandbox.py` | Sandbox requests per family and workflow, GPU rules shared with the queue, the LoRA stack, parking models in RAM, Low VRAM's VAE, checkpoint grids, the step counter, making RefMods (checks, the clip VRAM warning, sheets, listing), the worker's upscale and dataset upscale commands |
-| `test_upscale.py` | pixel upscalers: tiles that add up to a whole-image pass, seamless overlaps, odd sizes, greyscale and alpha, fitting to another factor, fp16 overflow, cancelling between tiles, telling files apart. With a GPU and RealESRGAN_x4plus, the real file |
-| `test_seedvr2.py` | the SeedVR2 3B port: the DiT against the reference on small grids (windows, shifted windows), window cuts and RoPE at 1080p, the causal VAE whole vs sliced vs tiled, 4n+1 padding, the colour fix, the one-step schedule, the upscaler end to end on tiny models (odd sizes, frame counts, options, cancelling), and the real files' keys |
+| `test_sampling.py` | image-to-image schedules (cut to the strength, the noised start, a tiny family keeping or ignoring its input), samplers on Gaussian data with a known solution (Heun and DPM++ 2M converge at second order), DPM++ 2M against k-diffusion, the beta schedule |
+| `test_sandbox.py` | Sandbox requests per family and workflow (image-to-image and the hi-res fix among them: pass 1 and final outputs, the second pass's start), GPU rules shared with the queue, the LoRA stack, parking models in RAM, Low VRAM's VAE, checkpoint grids, the step counter, making RefMods (checks, the clip VRAM warning, sheets, listing), the worker's upscale and dataset upscale commands (a long clip in pieces that crossfade, written as it's made, nothing left when it fails) |
+| `test_upscale.py` | pixel upscalers: tiles that add up to a whole-image pass, seamless overlaps, odd sizes, greyscale and alpha, fitting to another factor, fp16 overflow, cancelling between tiles, telling files apart; the streaming video writer (written in chunks the same as at once, the sound from the clip, nothing left when it fails). With a GPU and RealESRGAN_x4plus, the real file |
+| `test_seedvr2.py` | the SeedVR2 3B port: the DiT against the reference on small grids (windows, shifted windows), window cuts and RoPE at 1080p, the causal VAE whole vs sliced vs tiled, 4n+1 padding, the colour fix, the one-step schedule, the upscaler end to end on tiny models (odd sizes, frame counts, passes that overlap and crossfade, options checked and clamped, cancelling), and the real files' keys |
 | `test_upscale_routes.py` | upscaling's routes: the upscalers listed from upscale_models, a run's output or an uploaded file upscaled as a run (the command sent, the run's events), a dataset's small images upscaled one dataset at a time (the plan, progress, cancelling, the worker stopping) |
 | `test_evaluation.py` | the hold-out split, recommendation rules, deterministic validation loss, bleed normalisation, multi-resolution items and per-dataset settings with their cache keys |
 | `test_trainer.py` | a tiny stand-in model on the GPU: a job trains, saves, finishes and continues; Evaluate checkpoints; jobs sharing a dataset's encodings; a job with EMA weights saving the average and carrying it on |
@@ -130,20 +130,20 @@ only the header matters.
 | `test_timesteps.py` | the noise range on every family's timestep mode, Min-SNR and cosine-map weights, none applied at a pinned sigma, the Validator drawing inside the range |
 | `test_cache.py` | which model files and settings share cache folders, and that a model file is known by its contents |
 | `test_hf_assets.py` | Hugging Face files read from the cache offline, downloaded once at the pinned commit, and a clear error offline without them |
-| `test_model_files.py` | the families' download lists, the models folder setting, finding files by their contents, downloads pausing, resuming and checking their checksum, gated and impossible downloads, the Turbo-without-adapter warning, the Upscalers card and its downloads into upscale_models |
+| `test_model_files.py` | the families' download lists, the models folder setting, finding files by their contents, downloads pausing, resuming and checking their checksum, gated and impossible downloads, the Turbo-without-adapter warning, FLUX 3's prompt upsampler as an optional row (never MOSS-Image's encoder), the Upscalers card and its downloads into upscale_models |
 | `test_dataset_check.py` | each kind of health check problem (loss masks among them), upscaled images' _originals left out and noted, and that a file is read once |
 | `test_sources.py` | source datasets: files pairing by name across image types and subfolders, the _refs folder without them, which models take them, the health check's pairing findings, the pairs route, jobs keeping them, the VRAM projection counting them |
 | `test_clip_split.py` | Split into clips: planning inside shots, cutting at 24 fps with sound, captions and references, cancelling, each video once per epoch |
 | `test_clip_editor.py` | the clip editor: a reviewed split cut as planned, then again only where it changed (captions kept, removed clips gone, deleted ones not brought back), crops, splits from before the editor, replanning, checks on edits, and its frames being the clips' own |
 | `test_export.py` | exporting datasets: a folder each in one stored .zip, unsafe and repeated names, captions as they are or with the trigger word (a song's on its style tags), masks and references once each |
-| `test_captioner.py` | reading LLM replies: thinking left out, cut-off replies retried, errors reported, the contact sheet fallback |
+| `test_captioner.py` | reading LLM replies: thinking left out, cut-off replies retried, errors reported, the contact sheet fallback; a caption style's system prompt (sent before the image) and its own temperature and max tokens |
 | `test_llama_server.py` | the caption server against a stand-in (`tests/fake_llama_server.py`): command lines, waiting while loading, GPU choice, failed starts with hints, idle stops, handing over the GPU; the text encoder server's GPU rules |
-| `test_textgen.py` | which text encoders can write (from header-only copies), OpenAI messages to chat templates, the server's answers, quantized layers expanded only while there's room. With a GPU, a tiny random Qwen3-VL end to end |
+| `test_textgen.py` | which text encoders can write (from header-only copies), FLUX 3's prompt upsampler named from its file, OpenAI messages to chat templates, the server's answers, quantized layers expanded only while there's room. With a GPU, a tiny random Qwen3-VL end to end |
 | `test_server.py` | the API: settings, job validation, dataset path sandboxing, the host check, sign-in, notifications against a local webhook, jobs that ended while the server was down, evaluations, continuing and editing jobs, disk use and caches, bulk caption edits, worker processes, Auto-Caption and Enhance prompt through the caption server, the loss curves on Queue cards |
 | `test_hardware.py` | GPUs from `nvidia-smi`, CPU names and temperatures on Linux (Intel and AMD sensor drivers) and Windows |
 | `test_media_download.py` | Add from URL with a stand-in yt-dlp: the command for each choice, files moved into the dataset safely, playlists, cancelling, updating yt-dlp, the network warning |
-| `test_db.py` | schema migrations: fresh databases, pre-versioning ones, backups, failed steps, newer databases refused |
-| `test_webui.py` | the launchers rebuild the web UI only when its source changes |
+| `test_db.py` | schema migrations: fresh databases, pre-versioning ones, backups, failed steps, newer databases refused; new default caption styles joining saved ones once, and the FLUX 3 style keeping the prompt upsampler's rules word for word |
+| `test_webui.py` | the launchers rebuild the web UI only when its source changes; its source keeps the settled conventions (no browser dialogs, no em-dashes in copy, two page widths, the page names); the dataset tasks the top bar shows, and when a job can resume |
 
 ## Smoke test
 

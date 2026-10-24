@@ -198,6 +198,31 @@ def test_profile_check_tells_text_encoders_and_vaes_apart(tmp_path):
     assert all(f.hint for F in FAMILIES.values() for f in F.info.profile_fields if f.kind == "path")
 
 
+def test_a_hugging_face_folder_passes_the_profile_check(tmp_path):
+    """Model files offers a Hugging Face cache folder of shards (here Qwen3-VL-4B-Instruct, in transformers' key
+    layout) for Krea 2's text encoder: the profile check reads every shard, of the cache folder at refs/main too."""
+    import json
+
+    from dainamo.engine.families import get_family
+
+    repo = tmp_path / "models--Qwen--Qwen3-VL-4B-Instruct"
+    snap = repo / "snapshots" / ("1" * 40)
+    snap.mkdir(parents=True)
+    (repo / "refs").mkdir()
+    (repo / "refs" / "main").write_text("1" * 40)
+    shards = {"model-00001-of-00002.safetensors": {"model.language_model.layers.35.mlp.down_proj.weight":
+                                                   ("BF16", (2560, 9728))},
+              "model-00002-of-00002.safetensors": {"model.visual.blocks.0.attn.qkv.weight": ("BF16", (8, 8))}}
+    for name, tensors in shards.items():
+        _header_only(snap / name, tensors)
+    (snap / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {
+        k: name for name, tensors in shards.items() for k in tensors}}))
+    for path in (repo, snap, snap / "model.safetensors.index.json"):
+        r = next(r for r in get_family("krea2").validate_profile({"text_encoder": str(path)})
+                 if r["field"] == "text_encoder")
+        assert r["level"] == "ok" and r["message"].startswith("2 tensors"), (path, r)
+
+
 def test_log_chunks_resume_where_they_left_off(client, tmp_path):
     import os
 
@@ -1167,6 +1192,27 @@ def test_enhance_prompt_asks_the_local_llm(client, llm, tmp_path):
         client.put("/api/settings", json={"captioner": {"endpoint": "http://127.0.0.1:8080/v1", "model": ""}})
 
 
+def test_enhance_prompt_for_image_to_image_describes_what_the_image_becomes(client, llm, tmp_path):
+    from PIL import Image
+
+    url, got, _ = llm
+    client.put("/api/settings", json={"captioner": {"endpoint": f"{url}/v1", "model": "qwen-vl"}})
+    krea = client.post("/api/profiles", json={"name": "ei", "family": "krea2", "data": {}}).json()["id"]
+    img = tmp_path / "start.png"
+    Image.new("RGB", (64, 32)).save(img)
+    try:
+        r = client.post("/api/sandbox/enhance", json={"profile_id": krea, "workflow": "i2i", "prompt": "as a painting",
+                                                      "images": [str(img)]})
+        assert r.status_code == 200
+        body = got[-1]["body"]
+        system, user = body["messages"][0]["content"], body["messages"][1]["content"]
+        assert "text-to-image" in system and system.endswith(
+            "The attached image is the starting image; describe what it should become.")
+        assert user[0] == {"type": "text", "text": "as a painting"} and user[1]["type"] == "image_url"
+    finally:
+        client.put("/api/settings", json={"captioner": {"endpoint": "http://127.0.0.1:8080/v1", "model": ""}})
+
+
 def test_enhancer_settings_and_input_image_size(client, tmp_path):
     from PIL import Image
 
@@ -1191,6 +1237,14 @@ def test_caption_styles_are_validated(client):
         assert client.put("/api/settings", json={"caption_styles": {"default": "a", **bad}}).status_code == 400, bad
     r = client.put("/api/settings", json={"caption_styles": {"default": "gone", "styles": good["styles"]}}).json()
     assert r["caption_styles"]["default"] == "a"  # a default that doesn't exist falls back to the first
+    # a system prompt and the style's own sampling are optional, and kept only when set
+    own = {"id": "c", "name": "C", "prompt": "z", "system": "Be exact.", "temperature": 0, "max_tokens": 1024}
+    blank = {"id": "d", "name": "D", "prompt": "w", "system": " ", "temperature": "", "max_tokens": None}
+    r = client.put("/api/settings", json={"caption_styles": {"default": "c", "styles": [own, blank]}}).json()
+    assert r["caption_styles"]["styles"] == [own, {"id": "d", "name": "D", "prompt": "w"}]
+    for bad in ({"temperature": 3}, {"temperature": "warm"}, {"max_tokens": 8}, {"max_tokens": 100_000}):
+        r = client.put("/api/settings", json={"caption_styles": {"default": "c", "styles": [{**own, **bad}]}})
+        assert r.status_code == 400 and ("caption provider's" in r.text or "a number" in r.text), bad
     from dainamo.server import db
     client.put("/api/settings", json={"caption_styles": db.DEFAULT_SETTINGS["caption_styles"]})
 
@@ -1213,7 +1267,8 @@ def test_auto_caption_uses_the_chosen_style_and_remembers_it(client, llm, tmp_pa
         end = time.time() + 10
         while client.get(f"/api/datasets/{did}/autocaption").json()["running"] and time.time() < end:
             time.sleep(0.05)
-        return r, [g["body"]["messages"][0]["content"][0]["text"] for g in got[n:]]
+        return r, [next(c["text"] for c in g["body"]["messages"][-1]["content"] if c["type"] == "text")
+                   for g in got[n:]]
 
     try:
         r, prompts = caption(style="tags")
@@ -1224,6 +1279,18 @@ def test_auto_caption_uses_the_chosen_style_and_remembers_it(client, llm, tmp_pa
         r, prompts = caption()  # no style given: the one this dataset used last time
         assert r.json()["style"] == "tags" and prompts == [tags["prompt"]] * 2
         assert client.post(f"/api/datasets/{did}/autocaption", json={"style": "gone"}).status_code == 400
+        # FLUX 3's style: its system prompt first, the image before its prompt, and its own temperature and length
+        from dainamo.server import db
+        n = len(got)
+        r, prompts = caption(style="flux3")
+        assert r.json()["style"] == "flux3" and prompts == [db.FLUX3_CAPTION_STYLE["prompt"]] * 2
+        flux3 = db.FLUX3_CAPTION_STYLE
+        for g in got[n:]:
+            system, user = g["body"]["messages"]
+            assert system == {"role": "system", "content": flux3["system"]}
+            assert [c["type"] for c in user["content"]] == ["image_url", "text"]
+            assert user["content"][1]["text"] == flux3["prompt"]
+            assert (g["body"]["temperature"], g["body"]["max_tokens"]) == (0, 1024)
     finally:
         client.put("/api/settings", json={"captioner": {"endpoint": "http://127.0.0.1:8080/v1"}})
 

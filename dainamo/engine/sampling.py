@@ -3,7 +3,8 @@
 Every image family here uses the same parameterisation: x_sigma = (1 - sigma) * x0 + sigma * noise,
 with sigma running from 1 (noise) to 0, and the model (with any CFG) gives the velocity
 v = dx/dsigma = noise - x0. A driver supplies the starting noise and a ``velocity(x, sigma)``
-function; the sampler and the sigma schedule are chosen here.
+function; the sampler and the sigma schedule are chosen here. Image-to-image starts part way: the input
+image's latents noised to sigma = strength (``noised``), then a schedule from there to 0 (``img2img_sigmas``).
 
 Samplers:
   euler      first order, one model call per step (what training samples use)
@@ -92,6 +93,59 @@ def make_sigmas(driver, scheduler: str, steps: int, width: int, height: int, shi
         return driver.default_sigmas(steps, width, height)
     s = float(shift) if shift is not None else driver.default_shift(width, height)
     return [shift_sigma(u, s) for u in spacing("simple" if scheduler == "default" else scheduler, steps)]
+
+
+def cut_sigmas(sigmas: list[float], strength: float) -> list[float]:
+    """A schedule started part way, for image-to-image: ``strength`` first, then the sigmas below it, so it still ends
+    at 0 (and has at least one step). The schedule's sigma nearest the strength is the one it takes the place of:
+    the one above it, or the one below when that's nearer, so the first step isn't a sliver of one."""
+    s = float(strength)
+    if not 0 < s <= 1:
+        raise ValueError(f"Strength must be above 0 and at most 1, not {strength}")
+    above, below = [x for x in sigmas if x >= s], [x for x in sigmas if x < s]
+    if above and len(below) > 1 and s - below[0] < min(above) - s:
+        below = below[1:]
+    return [s] + below
+
+
+MAX_SCHEDULE = 20000  # steps in the longest schedule ``img2img_sigmas`` cuts from
+
+
+def img2img_sigmas(driver, scheduler: str, steps: int, width: int, height: int, shift: float | None,
+                   strength: float) -> list[float]:
+    """``steps`` steps from ``strength`` down to 0, spaced as the model's schedule spaces them: a schedule of as many
+    steps as has ``steps`` below ``strength``, cut there (``cut_sigmas``). Cutting the run's own schedule would
+    leave few steps at a low strength, as a schedule shifted toward the noisy end has most of its steps above it.
+    (A schedule that never has exactly ``steps`` there gives the nearest count.)"""
+    steps = max(1, int(steps))
+
+    def cut(n: int) -> list[float]:
+        return cut_sigmas(make_sigmas(driver, scheduler, n, width, height, shift), strength)
+
+    n, tried = steps, {}
+    for _ in range(12):
+        sig = tried[n] = cut(n)
+        have = len(sig) - 1
+        if have == steps:
+            return sig
+        # about (have - 1) / n of a schedule's steps lie below the strength (with the last one, to 0)
+        share = max(have - 1, 0.5) / n
+        nxt = max(1, min(MAX_SCHEDULE, round((steps - 1) / share) if steps > 1 else 1))
+        if nxt in tried:
+            nxt = n + (1 if have < steps else -1)
+        if nxt in tried or not 1 <= nxt <= MAX_SCHEDULE:
+            break
+        n = nxt
+    return min(tried.values(), key=lambda s: (abs(len(s) - 1 - steps), len(s)))
+
+
+def noised(init: torch.Tensor, noise: torch.Tensor, sigma: float) -> torch.Tensor:
+    """An image's latents noised to ``sigma`` on the flow-matching path: (1 - sigma) * init + sigma * noise, in the
+    noise's shape, dtype and device (``init`` may lack its batch dimension, as ``encode_image`` gives it)."""
+    if init.numel() != noise.numel() or init.shape[-2:] != noise.shape[-2:]:
+        raise ValueError(f"The input image's latents {tuple(init.shape)} don't match the sample's {tuple(noise.shape)}")
+    init = init.reshape(noise.shape).to(noise.device, noise.dtype)
+    return (1 - sigma) * init + sigma * noise
 
 
 def model_calls(sampler: str, steps: int) -> int:

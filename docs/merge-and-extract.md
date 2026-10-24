@@ -1,17 +1,18 @@
 # Merge & extract
 
-**Merge & extract**, the Profiles page's third tab, makes LoRAs from files you
+**Merge & extract**, the Models page's third tab, makes LoRAs from files you
 already have. Each one runs in the queue as a job of its own: you see its
 progress and log there, it gets a folder in `data/jobs/`, and its LoRA is listed
 in the Sandbox with the family's others. Neither loads a model or trains
 anything.
 
 Choose the profile first. The LoRAs' layers are checked against its diffusion
-model, shown beside it as **Base model** (read from the file's header only), and
+model, shown beside it as **Base model file** (read from the file's header
+only), and
 what's made is listed with its family. Each form's **Output name** is the file's
 name, `.safetensors` added; left empty, it's named after its inputs. **How
 merging works** and **How extraction works** fold the details away. The button
-under each form says what's missing until it can be queued.
+under each form, **Add to queue**, says what's missing until it can be queued.
 
 ## Merge LoRAs
 
@@ -44,14 +45,15 @@ It takes seconds to a few minutes, a layer at a time on the GPU.
 ## Extract a LoRA
 
 Extracting saves what a finetuned model changed from the model it was finetuned
-from, as a LoRA to use on that model. It works as **Extract LoRA** on a finetune
-job's checkpoints does ([Full finetuning](finetuning.md#lora-from-a-finetune)),
-for any finetuned file: choose one of the family's finetune checkpoints, or
+from, as a LoRA to use on that model. It's the same form as **Extract LoRA** on
+a finetune job's checkpoints
+([Full finetuning](finetuning.md#lora-from-a-finetune)), for any finetuned file: choose one of the family's finetune checkpoints, or
 **Other file…** for another trainer's.
 
-**Base model** (an optional override) is the original model. Leave it empty to
-use the profile's diffusion model. The two have to be the same kind of model, with tensors named
-the same way, or extracting is refused. Add the finetune's trigger words if it
+**Base model file** (optional) is the original model. Leave it empty to use the
+profile's diffusion model (for a finetune job's checkpoint, the one its job
+trained from). The two have to be the same kind of model, with tensors named the
+same way, or extracting is refused. Add the finetune's trigger words if it
 has any: they're saved in the LoRA, as a trained LoRA's are.
 
 ## How it works

@@ -4,7 +4,8 @@
   4x-UltraSharp, DAT, HAT, SwinIR, ...): ``upscalers/pixel.py``. A fixed integer scale, run tiled, frame by frame.
 * SeedVR2 (ByteDance's one-step diffusion video restorer, the 3B release as ComfyUI's single file beside its
   VAE): ``upscalers/seedvr2/``. Any output size; a clip's frames go through together, in passes of as many as fit
-  (41 at 1080p), so they stay consistent.
+  (41 at 1080p), so they stay consistent, neighbouring passes sharing a few frames that are crossfaded
+  (``crossfade``) so the join doesn't show.
 
 Every upscaler takes frames as a float tensor (T, 3, H, W) in [0, 1] on the CPU and gives frames the same way at
 the asked size (``Upscaler.upscale``). The Sandbox worker (``engine.sandbox``) runs them: on a run's output, an
@@ -48,7 +49,13 @@ class Info:
 
 
 class Upscaler(Protocol):
-    """A loaded upscaler. ``scale`` is 0 when it makes any size (SeedVR2), else its fixed factor."""
+    """A loaded upscaler. ``scale`` is 0 when it makes any size (SeedVR2), else its fixed factor.
+
+    One that takes clips as clips (``info.video``) may say how, for a caller that has to cut a long clip into
+    pieces (the Sandbox worker): ``frames_per_pass(size, options)``, the frames it takes together;
+    ``overlap_frames(size, options)``, the frames neighbouring passes share (pieces share as many, and are
+    ``crossfade``d); ``check_options(options)``, its options checked once (out-of-range values clamped, unknown
+    ones dropped, each change logged)."""
     info: Info
     scale: int
 
@@ -165,6 +172,15 @@ def fit(frames: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
         return frames
     import torch.nn.functional as F
     return F.interpolate(frames, size=(h, w), mode="bicubic", antialias=True, align_corners=False).clamp(0, 1)
+
+
+def crossfade(before: torch.Tensor, after: torch.Tensor) -> torch.Tensor:
+    """The frames two overlapping passes both made, (n, ...) each, going linearly from the earlier pass's
+    (``before``) to the later one's (``after``) so the join doesn't show: frame i weighs (i + 0.5) / n of
+    ``after``. In fp32."""
+    n = before.shape[0]
+    w = ((torch.arange(n, dtype=torch.float32, device=before.device) + 0.5) / max(n, 1))
+    return torch.lerp(before.float(), after.float(), w.view(-1, *[1] * (before.dim() - 1)))
 
 
 def target_size(width: int, height: int, factor: float, multiple: int = 1) -> tuple[int, int]:

@@ -1,41 +1,60 @@
 import { useEffect, useState } from "react";
 import { go } from "../App";
-import { api, fmtDuration, fmtTime, q, type Checkpoint, type DiskUse, type ExtractMade, type Job, type JobDetail, type JobDiskUse, type MergeMade, type RefModMade } from "../api";
+import {
+  api, fmtDuration, fmtLeft, fmtSpeed, fmtTime, type Checkpoint, type DiskUse, type ExtractMade, type Family, type Job, type JobDetail, type JobDiskUse,
+  type MergeMade, type Profile, type RefModMade,
+} from "../api";
 import { EvalPanel } from "../components/EvalPanel";
 import { EvaluateDialog } from "../components/EvalSettings";
-import { HardwareCards } from "../components/Hardware";
+import { ExtractLora } from "../components/ExtractLora";
 import { LossChart, Spark, useMetrics } from "../components/LossChart";
 import { IconCamera, IconCheck, IconCopy, IconDatabase, IconDown, IconDownload, IconDrive, IconEdit, IconFile, IconImages, IconLayers, IconPlay, IconPlus, IconRefresh, IconRight, IconSave, IconServer, IconStop, IconTarget, IconTrash, IconUp } from "../components/icons";
-import { AudioCard, ConfirmDialog, Empty, Lightbox, Modal, SelectBar, StatusPill, fmtSize, someNames, usePoll, useSelection, useToast, type Selection } from "../components/ui";
+import { AudioCard, ConfirmDialog, Empty, Lightbox, LoadError, Modal, SelectBar, StatusPill, fmtSize, someNames, usePoll, useSelection, useToast, type Selection } from "../components/ui";
 import { SamplesPanel } from "../components/Samples";
 import { Terminal } from "../components/Terminal";
 import { CLONE_KEY, formOf } from "./CreateJob";
 
 export const PHASES: Record<string, string> = {
   starting: "Starting", preparing: "Scanning datasets", caching_text: "Encoding captions", caching_latents: "Encoding training files",
-  loading: "Loading model", rendering: "Rendering training images", training: "Training", sampling: "Sampling", evaluating: "Evaluating checkpoint", completed: "Completed", stopped: "Stopped", failed: "Failed",
+  loading: "Loading model", rendering: "Rendering training images", training: "Training", sampling: "Sampling", evaluating: "Evaluating checkpoints", completed: "Completed", stopped: "Stopped", failed: "Failed",
   encoding: "Making the RefMod", extracting: "Extracting the LoRA", merging: "Merging the LoRAs",
 };
 
-function useJobAction() {
+type Acting = { id: string; name: string; status?: string; evaluating?: boolean; refmod?: boolean; extract?: boolean; merge?: boolean };
+
+/** A job's actions (stop, resume, restart, sample, save, up, down), each toasted, and the dialog that confirms a
+ * restart, which deletes what the job made: render ``dialog`` beside the buttons. A RefMod job (``refmod``), an
+ * extracted LoRA's (``extract``) or a merged one's (``merge``) is made again from the start by "restart". */
+function useJobAction(): [(job: Acting, action: string, after?: () => void) => void, React.ReactNode] {
   const toast = useToast();
-  // a RefMod job (``refmod``), an extracted LoRA's (``extract``) or a merged one's (``merge``) is made again from the
-  // start: "restart" asks about the file it made
-  return async (job: { id: string; name: string; evaluating?: boolean; refmod?: boolean; extract?: boolean; merge?: boolean }, action: string, after?: () => void) => {
-    if (action === "restart" && !confirm(job.refmod ? `Make "${job.name}" again? The RefMod it made and its preview will be deleted.`
-      : job.extract ? `Extract "${job.name}" again? The LoRA it made will be deleted.`
-      : job.merge ? `Merge "${job.name}" again? The LoRA it made will be deleted.`
-      : `Restart "${job.name}" from step 0? Its checkpoints and samples will be deleted.`)) return;
+  const [asking, setAsking] = useState<{ job: Acting; after?: () => void } | null>(null);
+  const send = async (job: Acting, action: string, after?: () => void) => {
     try {
       await api.post(`/api/jobs/${job.id}/action`, { action });
       const again = job.refmod ? "Queued to be made again" : job.extract ? "Queued to be extracted again" : job.merge ? "Queued to be merged again" : "";
-      const msg: Record<string, string> = { stop: job.evaluating ? "Stopping the checkpoint evaluation" : again ? "Stopping" : "Stopping — saving state…", sample: "Sampling requested", save: "Checkpoint requested", resume: again || "Re-queued (resumes from last save)", restart: again || "Restarted" };
+      const msg: Record<string, string> = {
+        stop: job.evaluating ? (job.status === "queued" ? "Checkpoint evaluation cancelled" : "Stopping the checkpoint evaluation")
+          : job.status === "queued" ? "Cancelled" : job.status === "stopping" ? "Forcing it to stop" : again ? "Stopping" : "Stopping: saving its state first",
+        sample: "Sample requested", save: "Save requested", resume: again || "Queued to resume from its last save",
+        restart: again || "Queued to train again from step 0",
+      };
       if (msg[action]) toast(msg[action]);
       after?.();
     } catch (e: any) {
       toast(e.message, true);
     }
   };
+  const act = (job: Acting, action: string, after?: () => void) => (action === "restart" ? setAsking({ job, after }) : send(job, action, after));
+  const j = asking?.job;
+  const dialog = j && (
+    <ConfirmDialog danger onClose={() => setAsking(null)} onConfirm={() => send(j, "restart", asking!.after)}
+      title={j.refmod ? "Make the RefMod again" : j.extract ? "Extract the LoRA again" : j.merge ? "Merge the LoRAs again" : "Restart from step 0"}
+      confirmLabel={j.refmod ? "Make again" : j.extract ? "Extract again" : j.merge ? "Merge again" : "Restart"}
+      message={<><strong style={{ color: "var(--text)" }}>{j.name}</strong>{j.refmod ? "'s RefMod and its preview are deleted, and it's made again from the start."
+        : j.extract || j.merge ? "'s LoRA is deleted, and it's made again from the start."
+        : "'s checkpoints and samples are deleted, and it trains again from step 0."}</>} />
+  );
+  return [act, dialog];
 }
 
 async function cloneJob(id: string) {
@@ -103,11 +122,12 @@ function DiskCard({ job }: { job: JobDetail }) {
 }
 
 function JobRow({ j, reload, queuedIndex, queuedCount, size, sel }: { j: Job; reload: () => void; queuedIndex: number; queuedCount: number; size?: number; sel: Selection }) {
-  const act = useJobAction();
+  const [act, confirmRestart] = useJobAction();
   const toast = useToast();
   const p = j.progress;
   const pct = p.total_steps ? (100 * (p.step || 0)) / p.total_steps : 0;
   const active = j.status === "running" || j.status === "stopping";
+  const once = j.refmod || j.extract || j.merge; // makes one file: made again from the start, not resumed
   const [confirmDel, setConfirmDel] = useState(false);
   const remove = async (files: boolean) => {
     try { await api.del(`/api/jobs/${j.id}?delete_files=${files}`); reload(); } catch (e: any) { toast(e.message, true); }
@@ -158,8 +178,8 @@ function JobRow({ j, reload, queuedIndex, queuedCount, size, sel }: { j: Job; re
               <span className="spacer" />
               <Spark values={j.loss_curve} className="job-spark" />
               {p.avg_loss != null && <span className="muted">loss {p.avg_loss.toFixed(4)}</span>}
-              {active && p.it_per_sec != null && <span className="muted">{(1 / p.it_per_sec).toFixed(1)} s/it</span>}
-              {active && p.eta_seconds != null && p.phase === "training" && <span className="muted">ETA {fmtDuration(p.eta_seconds)}</span>}
+              {active && p.it_per_sec != null && <span className="muted">{fmtSpeed(1 / p.it_per_sec)}</span>}
+              {active && p.eta_seconds != null && p.phase === "training" && <span className="muted">{fmtLeft(p.eta_seconds)}</span>}
             </div>
             <div className="progress"><div style={{ width: `${pct}%` }} /></div>
             {active && p.phase !== "training" && p.message && <div className="faint small" style={{ marginTop: 4 }}>{p.message}</div>}
@@ -174,7 +194,10 @@ function JobRow({ j, reload, queuedIndex, queuedCount, size, sel }: { j: Job; re
         </>}
         {(j.status === "running" || j.status === "queued") && <button className="btn" onClick={() => act(j, "stop", reload)}><IconStop /> {j.status === "queued" ? "Cancel" : "Stop"}</button>}
         {j.status === "stopping" && <button className="btn danger" onClick={() => act(j, "stop", reload)}>Force stop</button>}
-        {["stopped", "failed", "interrupted"].includes(j.status) && <button className="btn primary" onClick={() => act(j, "resume", reload)}><IconPlay /> {j.refmod ? "Make again" : j.extract ? "Extract again" : j.merge ? "Merge again" : "Resume"}</button>}
+        {["stopped", "failed", "interrupted"].includes(j.status) && (once
+          ? <button className="btn primary" onClick={() => act(j, "restart", reload)}><IconRefresh /> {j.refmod ? "Make again" : j.extract ? "Extract again" : "Merge again"}</button>
+          : j.resumable ? <button className="btn primary" onClick={() => act(j, "resume", reload)}><IconPlay /> Resume</button>
+          : <button className="btn primary" title="It saved no training state to resume from" onClick={() => act(j, "restart", reload)}><IconRefresh /> Restart</button>)}
         {!active && j.status !== "queued" && !j.extract && !j.merge && <button className="btn icon" title="Duplicate settings into a new job" onClick={() => cloneJob(j.id)}><IconCopy /></button>}
         {!active && <button className="btn icon danger" title="Delete" onClick={() => setConfirmDel(true)}><IconTrash /></button>}
       </div>}
@@ -185,6 +208,7 @@ function JobRow({ j, reload, queuedIndex, queuedCount, size, sel }: { j: Job; re
             : j.network === "full" ? "Also delete its finetuned models and samples from disk"
             : "Also delete its LoRA checkpoints and samples from disk"} />
       )}
+      {confirmRestart}
     </div>
   );
 }
@@ -229,7 +253,7 @@ function ContinueDialog({ job, onClose, onQueued }: { job: JobDetail; onClose: (
           <span className="help">{steps > done ? `${steps - done} more steps, ` : ""}from step {done} with the same settings, optimizer state and cached captions and images. Samples, saves and any checkpoint picker carry on at the same intervals.</span>
         </label>
         {final && (
-          <div className="muted small">The current final {job.config?.settings?.finetune_enabled ? "model" : "LoRA"} is kept as <span className="mono">{kept}</span>, and "keep last N" never deletes it. The new end saves as <span className="mono">{final.file}</span>.</div>
+          <div className="muted small">The current final {job.config?.settings?.finetune_enabled ? "model" : "LoRA"} is kept as <span className="mono">{kept}</span>, and "Keep last N saves" never deletes it. The new end saves as <span className="mono">{final.file}</span>.</div>
         )}
         {schedule && (
           <div className="validation warning">The {schedule} learning-rate schedule stretches to the new length, so the learning rate picks up a little from where it ended before decaying again.</div>
@@ -305,65 +329,8 @@ function RefModCard({ job, made, onOpen }: { job: JobDetail; made?: RefModMade; 
   );
 }
 
-const EXTRACT_RANKS = [16, 32, 64, 128, 256, 512];
 const pct = (x: number) => `${(100 * x).toFixed(x >= 0.9995 ? 0 : 1)}%`;
 const basename = (p: string) => String(p || "").split(/[\\/]/).pop() || "";
-
-/** Extract a LoRA from one of a finetune's checkpoints: a job of its own, queued, so its LoRA is listed with it. */
-function ExtractDialog({ job, checkpoint, onClose }: { job: JobDetail; checkpoint: Checkpoint; onClose: () => void }) {
-  const toast = useToast();
-  const [rank, setRank] = useState(128);
-  const [name, setName] = useState("");
-  const [busy, setBusy] = useState(false);
-  type Plan = { sizes: Record<string, number>; base: string; base_found: boolean };
-  const [plan, , err] = usePoll<Plan>(`/api/jobs/${job.id}/extract?file=${q(checkpoint.file)}`, 0, [checkpoint.file]);
-  const auto = `${checkpoint.file.replace(/\.safetensors$/, "")}_r${rank}`;
-  const start = async () => {
-    setBusy(true);
-    try {
-      const made = await api.post<Job>(`/api/jobs/${job.id}/extract`, { file: checkpoint.file, rank, name: name.trim() });
-      toast("Queued to extract the LoRA");
-      onClose();
-      go("queue", made.id);
-    } catch (e: any) {
-      toast(e.message, true);
-    } finally {
-      setBusy(false);
-    }
-  };
-  return (
-    <Modal title="Extract a LoRA" onClose={onClose} footer={
-      <>
-        <button className="btn ghost" onClick={onClose}>Cancel</button>
-        <button className="btn primary" disabled={busy || (!!plan && !plan.base_found)} onClick={start}><IconLayers /> Extract</button>
-      </>
-    }>
-      <div className="stack" style={{ gap: 12 }}>
-        <div className="muted small">
-          What <span className="mono">{checkpoint.file}</span> (step {checkpoint.step}) changed from the model it was finetuned
-          from, <span className="mono">{plan ? basename(plan.base) : "…"}</span>, saved as a LoRA to use on that model.
-        </div>
-        {err && <div className="error-box small">{err}</div>}
-        {plan && !plan.base_found && <div className="error-box small">{plan.base || "Its profile's diffusion model"} isn't there any more, and the LoRA is the change from it.</div>}
-        <label className="field">
-          <span>Rank</span>
-          <select value={rank} onChange={(e) => setRank(Number(e.target.value))}>
-            {EXTRACT_RANKS.map((r) => <option key={r} value={r}>{r}{plan ? ` · about ${fmtSize(plan.sizes[r])}` : ""}</option>)}
-          </select>
-          <span className="help">Each weight matrix's change is kept at this rank: its largest part. A higher rank keeps more of
-            what the finetune learned, in a bigger file. Changes to norms and biases are kept whole at any rank (they're small).
-            The job's page says how much of the change the LoRA keeps.</span>
-        </label>
-        <label className="field">
-          <span>Name</span>
-          <input value={name} placeholder={auto} onChange={(e) => setName(e.target.value)} />
-        </label>
-        <div className="help">It runs in the queue and needs little VRAM: the two models are compared a block at a time, which
-          takes a few minutes when a model is on a slow disk.</div>
-      </div>
-    </Modal>
-  );
-}
 
 /** What an extract job made: its LoRA, the finetune checkpoint and original model it's the difference of, and how
  * much of that change it keeps. */
@@ -449,8 +416,10 @@ type View = "samples" | "loss" | "checkpoints" | "log";
 const VIEWS: [View, string][] = [["samples", "Samples"], ["loss", "Loss"], ["checkpoints", "Checkpoints"], ["log", "Log"]];
 const isView = (v?: string): v is View => VIEWS.some(([k]) => k === v);
 
-function JobDetailView({ id, view }: { id: string; view?: string }) {
-  const act = useJobAction();
+function JobDetailView({ id, view, families }: { id: string; view?: string; families: Family[] }) {
+  const toast = useToast();
+  const [act, confirmRestart] = useJobAction();
+  const [deleting, setDeleting] = useState(false);
   const [picked, setPicked] = useState<View | null>(isView(view) ? view : null);
   useEffect(() => { if (isView(view)) setPicked(view); }, [view]);
   const [job, reload] = usePoll<JobDetail>(`/api/jobs/${id}`, 2500);
@@ -459,6 +428,8 @@ function JobDetailView({ id, view }: { id: string; view?: string }) {
   const [evaluate, setEvaluate] = useState(false);
   const [extend, setExtend] = useState(false);
   const [extractFrom, setExtractFrom] = useState<Checkpoint | null>(null);
+  // the profile the job trained with, for Extract LoRA's other files (gone: only its checkpoints)
+  const [profiles, , profilesErr] = usePoll<Profile[]>(extractFrom ? "/api/profiles" : null, 0);
   const isVideoFile = (f: string) => f.endsWith(".mp4");
 
   if (!job) return <div className="page"><div className="muted">Loading…</div></div>;
@@ -483,6 +454,17 @@ function JobDetailView({ id, view }: { id: string; view?: string }) {
     // in place: Back still leaves the job page rather than stepping through its tabs
     history.replaceState(null, "", `#/queue/${encodeURIComponent(id)}/${v}`);
   };
+  const active = running || job.status === "stopping";
+  const remove = async (files: boolean) => {
+    try {
+      await api.del(`/api/jobs/${job.id}?delete_files=${files}`);
+      toast(`Deleted ${job.name}`);
+      go("queue");
+    } catch (e: any) {
+      toast(e.message, true);
+    }
+  };
+  const family = families.find((f) => f.id === job.family);
 
   return (
     <div className="page">
@@ -504,10 +486,14 @@ function JobDetailView({ id, view }: { id: string; view?: string }) {
             </>}
             <button className="btn" onClick={() => act({ ...job, refmod, extract, merge }, "stop", reload)}><IconStop /> Stop</button>
           </>}
+          {job.status === "queued" && !evaluating && <button className="btn" onClick={() => act(job, "stop", reload)}><IconStop /> Cancel</button>}
+          {job.status === "stopping" && <button className="btn danger" title="Stop it now, without waiting for it to save" onClick={() => act(job, "stop", reload)}>Force stop</button>}
           {evaluating && ["queued", "running"].includes(job.status) && (
             <button className="btn" onClick={() => act({ ...job, evaluating }, "stop", reload)}><IconStop /> {job.status === "queued" ? "Cancel evaluation" : "Stop evaluation"}</button>
           )}
-          {!once && ["stopped", "failed", "interrupted"].includes(job.status) && <button className="btn primary" onClick={() => act(job, "resume", reload)}><IconPlay /> Resume</button>}
+          {!once && ["stopped", "failed", "interrupted"].includes(job.status) && job.resumable && (
+            <button className="btn primary" onClick={() => act(job, "resume", reload)}><IconPlay /> Resume</button>
+          )}
           {!once && job.status === "completed" && !evaluating && job.resumable && (
             <button className="btn" title="Train this job on for more steps, from where it finished" onClick={() => setExtend(true)}><IconPlay /> Continue training</button>
           )}
@@ -516,11 +502,13 @@ function JobDetailView({ id, view }: { id: string; view?: string }) {
           )}
           {!running && job.status !== "queued" && job.status !== "stopping" && (once
             ? <button className={`btn${job.status === "completed" ? "" : " primary"}`} onClick={() => act({ ...job, refmod, extract, merge }, "restart", reload)}><IconRefresh /> {refmod ? "Make again" : extract ? "Extract again" : "Merge again"}</button>
-            : <button className="btn" onClick={() => act(job, "restart", reload)}><IconRefresh /> Restart</button>)}
+            // nothing saved to resume from: Restart is what's left
+            : <button className={`btn${job.status !== "completed" && !job.resumable ? " primary" : ""}`} onClick={() => act(job, "restart", reload)}><IconRefresh /> Restart</button>)}
           {!running && job.status !== "stopping" && !evaluating && !extract && !merge && (
             <button className="btn" title="Change this job's settings" onClick={() => go("edit", job.id)}><IconEdit /> Edit</button>
           )}
           {!running && !extract && !merge && <button className="btn" onClick={() => cloneJob(job.id)}><IconCopy /> Duplicate</button>}
+          {!active && <button className="btn icon danger" title="Delete" aria-label="Delete job" onClick={() => setDeleting(true)}><IconTrash /></button>}
         </div>
       </div>
 
@@ -574,8 +562,8 @@ function JobDetailView({ id, view }: { id: string; view?: string }) {
         <div className="stat"><div className="k">Phase</div><div className="v" style={{ fontSize: 15 }}>{PHASES[st.phase || ""] || st.phase || "Queued"}</div></div>
         <div className="stat"><div className="k">Step</div><div className="v">{st.step ?? 0}<span className="faint" style={{ fontSize: 13 }}> / {total}</span></div></div>
         <div className="stat"><div className="k">Avg loss</div><div className="v">{st.avg_loss?.toFixed(4) ?? "—"}</div></div>
-        <div className="stat"><div className="k">Speed</div><div className="v">{st.it_per_sec ? `${(1 / st.it_per_sec).toFixed(2)}s` : "—"}<span className="faint" style={{ fontSize: 13 }}> /it</span></div></div>
-        <div className="stat"><div className="k">ETA</div><div className="v">{running ? fmtDuration(st.eta_seconds) : "—"}</div></div>
+        <div className="stat"><div className="k">Speed</div><div className="v">{st.it_per_sec ? fmtSpeed(1 / st.it_per_sec) : "—"}</div></div>
+        <div className="stat"><div className="k">Time left</div><div className="v">{running ? fmtDuration(st.eta_seconds) : "—"}</div></div>
         <div className="stat"><div className="k">Peak VRAM</div><div className="v">{st.vram_gb ? `${st.vram_gb} GB` : "—"}</div></div>
         <div className="stat"><div className="k">LR</div><div className="v" style={{ fontSize: 15 }}>{st.lr?.toExponential(2) ?? "—"}</div></div>
       </div>
@@ -631,7 +619,7 @@ function JobDetailView({ id, view }: { id: string; view?: string }) {
               it in the Sandbox (Finetuned model). Extract LoRA saves what a checkpoint changed as a LoRA, a much smaller file
               to use on the original model.</div>
           ) : (
-            <div className="help" style={{ marginTop: 10 }}>Saved in <span className="mono">{jobPath}</span> — ComfyUI-compatible; copy into <span className="mono">models/loras</span>.</div>
+            <div className="help" style={{ marginTop: 10 }}>Saved in <span className="mono">{jobPath}</span>, in ComfyUI's format: copy them into <span className="mono">models/loras</span>.</div>
           )}
         </div>
 
@@ -645,15 +633,25 @@ function JobDetailView({ id, view }: { id: string; view?: string }) {
         audio={light.endsWith(".mp3") ? { poster: light.replace(/\.mp3$/, "_poster.png") } : undefined} />}
       {evaluate && <EvaluateDialog job={job} onClose={() => setEvaluate(false)} onQueued={() => { reload(); pickTab("checkpoints"); }} />}
       {extend && <ContinueDialog job={job} onClose={() => setExtend(false)} onQueued={reload} />}
-      {extractFrom && <ExtractDialog job={job} checkpoint={extractFrom} onClose={() => setExtractFrom(null)} />}
+      {extractFrom && family && (profiles || profilesErr) && (
+        <ExtractLora family={family} profile={profiles?.find((p) => p.name === job.config?.profile_name) || null}
+          start={{ jobId: job.id, file: extractFrom.file }} dialog={{ onClose: () => setExtractFrom(null) }} />
+      )}
+      {deleting && (
+        <ConfirmDialog title="Delete job" danger confirmLabel="Delete job" onClose={() => setDeleting(false)} onConfirm={remove}
+          message={<>Remove <strong style={{ color: "var(--text)" }}>{job.name}</strong> from the queue?</>}
+          checkbox={refmod ? "Also delete its RefMod and preview from disk" : extract || merge ? "Also delete its LoRA from disk"
+            : finetune ? "Also delete its finetuned models and samples from disk" : "Also delete its LoRA checkpoints and samples from disk"} />
+      )}
+      {confirmRestart}
     </div>
   );
 }
 
-export default function Queue({ jobId, view }: { jobId: string; view?: string }) {
-  const [jobs, reload] = usePoll<Job[]>("/api/jobs", 2500);
-  if (jobId) return <JobDetailView key={jobId} id={jobId} view={view} />;
-  return <QueueList jobs={jobs} reload={reload} />;
+export default function Queue({ jobId, view, families }: { jobId: string; view?: string; families: Family[] }) {
+  const [jobs, reload, err] = usePoll<Job[]>(jobId ? null : "/api/jobs", 2500, [jobId]);
+  if (jobId) return <JobDetailView key={jobId} id={jobId} view={view} families={families} />;
+  return <QueueList jobs={jobs} reload={reload} error={err} />;
 }
 
 type SharedCache = { total: number; in_use: number };
@@ -709,7 +707,7 @@ function CacheDialog({ disk, jobs, onClose, onCleared }: { disk: QueueDisk; jobs
   );
 }
 
-function QueueList({ jobs, reload }: { jobs: Job[] | null; reload: () => void }) {
+function QueueList({ jobs, reload, error }: { jobs: Job[] | null; reload: () => void; error: string | null }) {
   const toast = useToast();
   const [disk, reloadDisk] = usePoll<QueueDisk>("/api/disk", 0, [jobs?.length]);
   const [manage, setManage] = useState(false);
@@ -746,20 +744,17 @@ function QueueList({ jobs, reload }: { jobs: Job[] | null; reload: () => void })
     <div className="page">
       <div className="page-head">
         <div>
-          <h1>Queue</h1>
-          <p>Manage your training jobs.</p>
+          <h1>Queue{!!jobs?.length && <span className="count-pill">{jobs.length}</span>}</h1>
+          <p>Training, RefMods, merges and extracted LoRAs, run one at a time per GPU in this order.</p>
+        </div>
+        <div className="row">
+          {!!jobs?.length && !sel.on && <button className="btn lg" onClick={sel.start}><IconCheck /> Select</button>}
         </div>
       </div>
-      <HardwareCards />
-      <div className="section-head">
-        <h2>Training jobs</h2>
-        {jobs && <span className="count-pill">{jobs.length}</span>}
-        <span className="spacer" />
-        {!!jobs?.length && !sel.on && <button className="btn" onClick={sel.start}><IconCheck /> Select</button>}
-      </div>
+      {error && !jobs && <LoadError what="the jobs" error={error} onRetry={reload} />}
       {jobs && jobs.length === 0 && (
-        <Empty icon={<IconServer />} title="No training jobs yet" action={<a className="btn primary lg" href="#/create"><IconPlus /> New job</a>}>
-          Create a training job to get started.
+        <Empty icon={<IconServer />} title="No jobs yet" action={<a className="btn primary lg" href="#/create"><IconPlus /> New job</a>}>
+          Start one with New job: it waits here for a free GPU, and its samples, loss and log show on its page.
         </Empty>
       )}
       {sel.on && (
@@ -793,8 +788,8 @@ function QueueList({ jobs, reload }: { jobs: Job[] | null; reload: () => void })
           <span className="disk-item" title="Encoded captions and latents, shared between jobs that encode the same files the same way">
             <IconDatabase /><span>Cache</span><b>{fmtSize(disk.total.cache + shared.total)}</b>
           </span>
-          <span className="disk-item" title="The LoRAs, finetuned models and RefMods the jobs made">
-            <IconFile /><span>LoRAs</span><b>{fmtSize(disk.total.output)}</b>
+          <span className="disk-item" title="What the jobs made: LoRAs, finetuned models and RefMods">
+            <IconFile /><span>Outputs</span><b>{fmtSize(disk.total.output)}</b>
           </span>
           <span className="spacer" />
           <button className="btn" onClick={() => setManage(true)}>Manage cache <IconRight /></button>

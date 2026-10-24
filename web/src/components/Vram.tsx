@@ -212,7 +212,7 @@ export function OffloadControl(props: OffloadProps & { compact?: boolean }) {
           <div className="vram-summary">
             <span className={"vram-peak " + o.state}>
               ≈ {o.peak.total.toFixed(1)} GB peak{o.total ? ` of ${o.total.toFixed(1)} GB` : ""}
-              {o.state === "over" ? " — won't fit" : o.state === "tight" ? " — tight" : ""}
+              {o.state === "over" ? " · won't fit" : o.state === "tight" ? " · tight" : ""}
             </span>
             {o.total > 0 && <button className="btn sm" type="button" onClick={o.fit} title="Lowest offload that fits, with a little headroom">Fit to GPU</button>}
           </div>

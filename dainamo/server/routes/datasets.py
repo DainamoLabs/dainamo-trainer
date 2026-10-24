@@ -480,7 +480,7 @@ def autocaption(did: str, body: AutoCaptionIn):
         raise HTTPException(400, f"Unknown Whisper model {speech!r}")
     options = {"style": style["id"], "clip_frames": clip_frames, "speech": speech}
     db.execute("UPDATE datasets SET caption_options=? WHERE id=?", (json.dumps(options), did))  # for next time
-    cfg = {**settings["captioner"], "prompt": style["prompt"]}
+    cfg = captioner.style_config(settings["captioner"], style)  # its prompt, and its own settings if any
     captioner.caption_jobs[did] = captioner.CaptionJob(d, cfg, body.overwrite, trigger, clip_frames, speech,
                                                        settings["speech"]["device"], settings)
     return {**captioner.caption_jobs[did].to_json(), **options}
@@ -630,6 +630,42 @@ def download_cancel(did: str):
     if j:
         j.cancel()
     return {"ok": True}
+
+
+@router.get("/tasks")
+def background_tasks():
+    """The dataset tasks going now, for the top bar, so leaving a dataset's page doesn't hide one: captioning, Split
+    into clips (and the clip editor's cuts), Add from URL and Upscale small images. Each is {kind, label,
+    dataset_id, dataset, done, total}: the dataset its page shows it on, and how far it is (total 0: not counted)."""
+    from .. import sandbox as sbx
+
+    names = {d["id"]: d["name"] for d in db.query("SELECT id, name FROM datasets")}
+    out = []
+
+    def add(kind: str, label: str, did: str, done: int = 0, total: int = 0):
+        out.append({"kind": kind, "label": label, "dataset_id": did, "dataset": names.get(did, ""),
+                    "done": int(done or 0), "total": int(total or 0)})
+
+    for did, j in list(captioner.caption_jobs.items()):
+        s = j.to_json()
+        if s["running"]:
+            if s["phase"] == "transcribing":
+                add("caption", "Transcribing speech", did, s["heard"], s["to_hear"])
+            else:
+                add("caption", "Captioning", did, s["done"], s["total"] if s["phase"] != "starting" else 0)
+    for did, j in list(clip_split.split_jobs.items()):
+        s = j.to_json()
+        if s["running"]:
+            add("split", "Cutting clips" if s["mode"] == "cut" else "Planning clips", did, s["done"], s["total"])
+    for did, j in list(media_download.download_jobs.items()):
+        s = j.to_json()
+        if s["running"]:
+            add("download", "Downloading", did, s["item"] if (s["items"] or 0) > 1 else 0, s["items"] if (s["items"] or 0) > 1 else 0)
+    up = sbx.sandbox.upscale
+    if up and up["state"] in ("queued", "running"):
+        add("upscale", "Upscaling" if up["state"] == "running" else "Upscale waiting", up["dataset_id"], up.get("done", 0),
+            up.get("total", 0) if up["state"] == "running" else 0)
+    return out
 
 
 @router.get("/ytdlp")

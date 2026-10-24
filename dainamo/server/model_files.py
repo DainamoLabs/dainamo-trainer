@@ -1,7 +1,7 @@
-"""The model manager: the files each family's profiles need (each driver's ``downloads``), which of them are in the
-ComfyUI models folder (Settings), and downloading the missing ones from Hugging Face into the folder ComfyUI reads
-each kind from (``diffusion_models``, ``text_encoders``…) instead of the Hugging Face cache, where ComfyUI never
-looks.
+"""The model manager: the files each family's profiles need (each driver's ``downloads``), which of them are on this
+machine (in the ComfyUI models folder set on Model files, or in the Hugging Face cache), and downloading the missing
+ones from Hugging Face into the folder ComfyUI reads each kind from (``diffusion_models``, ``text_encoders``…)
+instead of the Hugging Face cache, where ComfyUI never looks.
 
 Downloads run one at a time in a thread, into ``<name>.part`` beside where the file goes, so a half-done file never
 looks finished. One cut short (cancelled, a dropped connection, the server stopping) carries on from where it
@@ -43,8 +43,16 @@ def _gb(n: float) -> str:
 
 
 def models_folder() -> str:
-    """The ComfyUI models folder from Settings ("" when it isn't set)."""
+    """The ComfyUI models folder from the settings ("" when it isn't set)."""
     return (db.get_settings().get("models") or {}).get("folder", "")
+
+
+def hf_cache_folder() -> str:
+    """The Hugging Face cache huggingface_hub reads and downloads into: HF_HUB_CACHE, else HF_HOME's ``hub``, else
+    ~/.cache/huggingface/hub (as read when the server started)."""
+    from huggingface_hub import constants
+
+    return constants.HF_HUB_CACHE
 
 
 def resolve_models_folder(path: str) -> str:
@@ -147,35 +155,150 @@ def _candidates(base: str) -> list[str]:
     return list(dict.fromkeys(paths + _profile_files()))[:MAX_FILES]
 
 
+# What each repo's main snapshot in the Hugging Face cache holds: repo folder -> (its folders and when each last
+# changed, its models). A download adds files to a folder, which changes its mtime, so an unchanged cache is listed
+# without reading anything but its folders.
+_hf_repos: dict[str, tuple[tuple, list[dict]]] = {}
+
+
+def _repo_id(folder: str) -> str:
+    """"owner/repo" of a cache folder named ``models--owner--repo``."""
+    return "/".join(folder.split("--")[1:])
+
+
+def _hf_repo_id(path: str, cache: str) -> str | None:
+    """"owner/repo" of a path in the Hugging Face cache (in its ``models--owner--repo`` folder), else None."""
+    if not cache:
+        return None
+    rel = os.path.relpath(path, cache)
+    top = rel.split(os.sep, 1)[0]
+    return _repo_id(top) if not rel.startswith("..") and top.startswith("models--") else None
+
+
+def _hf_models(repo_dir: str, repo: str) -> list[dict]:
+    """The models in a cached repo's main snapshot (the one ``refs/main`` names): {path, name, repo, size, mtime,
+    file: a single file's (device, inode)}, named as on the hub ("owner/repo", "owner/repo/text_encoder",
+    "owner/repo/vae/ae.safetensors"). A folder whose shards an index lists, all of them downloaded, is one model: at
+    the top of the repo its path is the repo folder, which ``comfy_io.shard_files`` reads at refs/main, so it follows
+    the repo; in a subfolder (a diffusers pipeline's ``text_encoder/``) the subfolder. Any other .safetensors file is
+    a model by itself, by its path in the snapshot, since some loaders read one file only (a diffusion model's)."""
+    from ..engine.comfy_io import INDEX_NAME
+
+    try:
+        with open(os.path.join(repo_dir, "refs", "main")) as f:
+            snap = os.path.join(repo_dir, "snapshots", f.read().strip())
+        if not os.path.isdir(snap):
+            return []
+        tree, key = [], []
+        for top, dirs, files in os.walk(snap):
+            dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+            tree.append((top, sorted(files)))
+            key.append((top, os.stat(top).st_mtime_ns))
+    except (OSError, ValueError):
+        return []
+    key = tuple(key)
+    if repo_dir in _hf_repos and _hf_repos[repo_dir][0] == key:
+        return _hf_repos[repo_dir][1]
+    models = []
+    for top, names in tree:
+        sub = os.path.relpath(top, snap).replace(os.sep, "/")
+        sub = "" if sub == "." else sub
+        weights = [n for n in names if n.endswith(".safetensors")]
+        units, claimed = [], set()
+        for index in (n for n in names if n.endswith(".safetensors.index.json")):
+            try:
+                with open(os.path.join(top, index)) as f:
+                    shards = sorted(set(json.load(f)["weight_map"].values()))
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                continue
+            claimed |= set(shards)  # a shard is never a model by itself
+            if not shards or not set(shards) <= set(weights):  # still downloading, or only partly
+                continue
+            path = (top if sub else repo_dir) if index == INDEX_NAME else os.path.join(top, index)
+            units.append((path, "/".join(filter(None, (repo, sub))), shards))
+        units += [(os.path.join(top, n), "/".join(filter(None, (repo, sub, n))), [n])
+                  for n in weights if n not in claimed]
+        for path, name, files in units:
+            try:
+                stats = [os.stat(os.path.join(top, n)) for n in files]  # the blobs the snapshot links to
+            except OSError:
+                continue
+            models.append({"path": path, "name": name, "repo": repo, "size": sum(s.st_size for s in stats),
+                           "mtime": max(s.st_mtime_ns for s in stats),
+                           "file": (stats[0].st_dev, stats[0].st_ino) if len(files) == 1 else None})
+    _hf_repos[repo_dir] = (key, models)
+    return models
+
+
+def _hf_candidates(cache: str) -> list[dict]:
+    """The models in the Hugging Face cache (``_hf_models`` of each ``models--owner--repo`` folder)."""
+    out, seen = [], set()
+    try:
+        names = sorted(n for n in os.listdir(cache) if n.startswith("models--")) if cache else []
+    except OSError:
+        names = []
+    for name in names:
+        repo_dir = os.path.join(cache, name)
+        seen.add(repo_dir)
+        out += _hf_models(repo_dir, _repo_id(name))
+        if len(out) >= MAX_FILES:
+            break
+    for gone in set(_hf_repos) - seen:
+        del _hf_repos[gone]
+    return out[:MAX_FILES]
+
+
 def scan() -> list[dict]:
-    """Model files on this machine: {path, name, size, fields, quant, unsupported, error}. Only headers are read,
-    once per file (until it changes)."""
+    """Model files on this machine: {path, name, size, source, repo, fields, quant, unsupported, error}. ``source``
+    is "models" for the models folder's files and the ones profiles use, listed first, then "hf_cache" for the
+    Hugging Face cache's models (``_hf_models``: a folder of shards is one, named "owner/repo"), with their
+    "owner/repo". Only headers are read, once per file (until it changes)."""
     out = []
     with _scan_lock:
         seen = set()
+        cache = hf_cache_folder()
+        hf = _hf_candidates(cache)
+        in_cache = {m["path"] for m in hf}
+
+        def add(entry: dict, mtime: int):
+            key = (entry["path"], entry["size"], mtime)
+            seen.add(key)
+            if key not in _scanned:
+                _scanned[key] = _identify(entry["path"])
+            out.append({**entry, **_scanned[key]})
+
+        listed = set()  # (device, inode) of the files listed: one linked into the models folder is listed once
         for path in _candidates(models_folder()):
+            if path in in_cache:  # a profile's file in the cache: listed with the cache's
+                continue
             try:
                 st = os.stat(path)
             except OSError:
                 continue
-            key = (path, st.st_size, st.st_mtime_ns)
-            seen.add(key)
-            if key not in _scanned:
-                _scanned[key] = _identify(path)
-            out.append({"path": path, "name": os.path.basename(path), "size": st.st_size, **_scanned[key]})
+            listed.add((st.st_dev, st.st_ino))
+            repo = _hf_repo_id(path, cache)  # a profile's file in another snapshot
+            add({"path": path, "name": os.path.basename(path), "size": st.st_size,
+                 "source": "hf_cache" if repo else "models", "repo": repo or ""}, st.st_mtime_ns)
+        for m in hf:
+            if m["file"] not in listed:
+                add({"path": m["path"], "name": m["name"], "size": m["size"], "source": "hf_cache",
+                     "repo": m["repo"]}, m["mtime"])
         for key in set(_scanned) - seen:
             del _scanned[key]
     return out
 
 
 def overview() -> dict:
-    """What the Model files page shows: the models folder, each family's path fields with the files found for them
-    and the ones to download, and the downloads."""
+    """What the Model files page shows: the models folder and the Hugging Face cache, each family's path fields with
+    the files found for them (models folder's first) and the ones to download, and the downloads. A family's
+    ``extra_fields`` come last, optional and marked ``profile: false``: no profile uses them."""
     base = models_folder()
     files = scan()
-    have = {}  # (name, size) -> path: a catalog file is the file of that name and size, wherever it is
+    # (file name, size) -> path: a catalog file is the file of that name and size, wherever it is; the models
+    # folder's copy, which ComfyUI sees too, before the cache's
+    have = {}
     for f in files:
-        have.setdefault((f["name"], f["size"]), f["path"])
+        have.setdefault((os.path.basename(f["path"]), f["size"]), f["path"])
     tasks = downloads.list()
     pending = {t["download"]: t["id"] for t in tasks if t["state"] != "done"}
 
@@ -183,24 +306,33 @@ def overview() -> dict:
         rel = os.path.relpath(path, base) if base else ""
         return rel if base and not rel.startswith("..") else path
 
+    # the catalog files of rows that are no profile's field (FLUX 3's prompt upsampler, a Qwen3.5-9B with MOSS
+    # Image's encoder's tensors): a profile shouldn't pick one up for a field of its own
+    extra = {have.get((d.name, d.size)) for F in FAMILIES.values() for d in F.downloads if d.field in F.extra_fields}
     families = []
     for F in FAMILIES.values():
         fields = []
-        for pf in F.info.profile_fields:
-            if pf.kind != "path":
-                continue
+        rows = [(pf.key, pf.label, pf.hint, pf.required) for pf in F.info.profile_fields if pf.kind == "path"]
+        rows += [(key, label, hint, False) for key, (label, hint) in F.extra_fields.items()]
+        for key, label, hint, required in rows:
             options = [{**d.to_json(), "have": have.get((d.name, d.size)), "task": pending.get(d.id)}
-                       for d in F.downloads if d.field == pf.key]
+                       for d in F.downloads if d.field == key]
             known = {o["have"]: o["id"] for o in options if o["have"]}
             found = [{"path": f["path"], "name": f["name"], "size": f["size"], "where": where(f["path"]),
-                      "quant": f["quant"], "unsupported": f["unsupported"], "download": known.get(f["path"])}
-                     for f in files if [F.info.id, pf.key] in f["fields"] or f["path"] in known]
-            found.sort(key=lambda f: (bool(f["unsupported"]), f["download"] is None, f["name"].lower()))
-            fields.append({"key": pf.key, "label": pf.label, "hint": pf.hint, "required": pf.required,
-                           "downloads": options, "found": found})
+                      "source": f["source"], "repo": f["repo"], "quant": f["quant"], "unsupported": f["unsupported"],
+                      "download": known.get(f["path"])}
+                     for f in files
+                     if f["path"] in known or ([F.info.id, key] in f["fields"] and f["path"] not in extra)]
+            # the first usable one is what Create profile picks: the models folder's before the cache's
+            found.sort(key=lambda f: (bool(f["unsupported"]), f["source"] != "models", f["download"] is None,
+                                      f["name"].lower()))
+            fields.append({"key": key, "label": label, "hint": hint, "required": required, "downloads": options,
+                           "found": found, **({"profile": False} if key in F.extra_fields else {})})
         families.append({"id": F.info.id, "label": F.info.label, "fields": fields})
+    cache = hf_cache_folder()
     return {"folder": base, "folder_ok": bool(base) and os.path.isdir(base),
             "folders": {k: os.path.join(base, k) if base else "" for k in (*KIND_FOLDERS, upscale.FOLDER)},
+            "hf_cache": cache, "hf_cache_ok": bool(cache) and os.path.isdir(cache),
             "token": bool(hf_token()), "families": families, "upscalers": _upscalers_overview(base, pending, where),
             "tasks": tasks}
 

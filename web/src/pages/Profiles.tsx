@@ -3,7 +3,7 @@ import { api, byFamily, type Family, type ModelsOverview, type Profile, type Pro
 import { go } from "../App";
 import { IconCopy, IconDownload, IconEdit, IconLayers, IconPlus, IconSearch, IconTrash } from "../components/icons";
 import { DownloadDialog } from "../components/ModelDownload";
-import { ConfirmDialog, Empty, Menu, Modal, PathInput, familyBadge, usePoll, useToast } from "../components/ui";
+import { ConfirmDialog, Empty, LoadError, Menu, Modal, PathInput, familyBadge, usePoll, useToast } from "../components/ui";
 import MergeExtract from "./MergeExtract";
 import ModelFiles from "./ModelFiles";
 
@@ -84,7 +84,7 @@ function ProfileEditor(props: { families: Family[]; initial: Partial<Profile> | 
       onClose={props.onClose}
       footer={
         <>
-          {errors > 0 && <span className="validation error" style={{ marginRight: "auto" }}>{errors} problem{errors > 1 ? "s" : ""} — you can still save</span>}
+          {errors > 0 && <span className="validation error" style={{ marginRight: "auto" }}>{errors} problem{errors > 1 ? "s" : ""}: you can still save</span>}
           <button className="btn ghost" onClick={props.onClose}>Cancel</button>
           <button className="btn primary" disabled={!name.trim() || busy} onClick={save}>Save profile</button>
         </>
@@ -132,8 +132,11 @@ function ProfileEditor(props: { families: Family[]; initial: Partial<Profile> | 
                 <div className="row wrap" style={{ gap: 6 }}>
                   <span className="help">On this machine:</span>
                   {found.map((x) => (
-                    <button key={x.path} type="button" className="chip" title={x.path} onClick={() => set(f.key, x.path)}>
-                      {x.name.replace(/\.safetensors$/, "")}
+                    <button key={x.path} type="button" className="chip" title={x.source === "hf_cache" ? `${x.path}\nIn the Hugging Face cache, from ${x.repo}` : x.path}
+                      onClick={() => set(f.key, x.path)}>
+                      {/* the cache's are named as on the hub: a file by its own name, a folder of shards as "owner/repo" */}
+                      {(x.source === "hf_cache" && x.name.endsWith(".safetensors") ? x.name.split("/").pop()! : x.name).replace(/\.safetensors$/, "")}
+                      {x.source === "hf_cache" && <span className="pill chip-tag">HF cache</span>}
                     </button>
                   ))}
                 </div>
@@ -196,7 +199,7 @@ function ProfileCard({ p, fam, onEdit, onDuplicate, onDelete }: {
 export default function Profiles({ families, view }: { families: Family[]; view: string }) {
   view = ["files", "merge"].includes(view) ? view : "";
   const toast = useToast();
-  const [profiles, reload] = usePoll<Profile[]>("/api/profiles", 0);
+  const [profiles, reload, loadError] = usePoll<Profile[]>("/api/profiles", 0);
   const [editing, setEditing] = useState<Partial<Profile> | null | undefined>(undefined);
   const [deleting, setDeleting] = useState<Profile | null>(null);
   const [search, setSearch] = useState("");
@@ -236,16 +239,16 @@ export default function Profiles({ families, view }: { families: Family[]; view:
   });
 
   return (
-    <div className="page profiles">
+    <div className="page">
       <div className="page-head">
         <div>
-          <h1>Profiles</h1>
-          <p>Manage the model files and components used for training.</p>
+          <h1>Models</h1>
+          <p>Profiles are the model files a job trains with. Model files finds and downloads them; Merge &amp; extract makes LoRAs from LoRAs and finetunes.</p>
         </div>
-        <button className="btn primary lg" onClick={() => setEditing(null)} disabled={!families.length}><IconPlus /> New profile</button>
+        {view === "" && <button className="btn primary lg" onClick={() => setEditing(null)} disabled={!families.length}><IconPlus /> New profile</button>}
       </div>
 
-      <div className="view-tabs" role="tablist" aria-label="Profiles">
+      <div className="view-tabs" role="tablist" aria-label="Models">
         {([["", "Profiles"], ["files", "Model files"], ["merge", "Merge & extract"]] as const).map(([v, label]) => (
           <button key={v} role="tab" aria-selected={view === v} className={view === v ? "on" : ""} onClick={() => go("profiles", v)}>
             {label}
@@ -257,6 +260,7 @@ export default function Profiles({ families, view }: { families: Family[]; view:
       {view === "files" && <ModelFiles families={families} onCreate={setEditing} />}
       {view === "merge" && <MergeExtract families={families} />}
 
+      {view === "" && loadError && !profiles && <LoadError what="the profiles" error={loadError} onRetry={reload} />}
       {view === "" && profiles && profiles.length === 0 && (
         <Empty icon={<IconLayers width={44} height={44} />} title="No profiles yet" action={
           <div className="row" style={{ justifyContent: "center" }}>

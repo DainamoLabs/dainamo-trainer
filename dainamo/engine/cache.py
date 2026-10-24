@@ -25,17 +25,18 @@ SLICES, SLICE_BYTES = 64, 16 * 1024
 def fingerprint(path: str | None) -> str:
     """A model file's identity from its size, its first MB (and the rest of a safetensors header, which lists
     every tensor's name, dtype and shape) and 64 slices of 16 KB spread through it: a couple of MB read, not
-    the whole file. A copy of the file matches; another precision or a fine-tune of it doesn't. A folder is
-    the fingerprints of its files."""
+    the whole file. A copy of the file matches; another precision or a fine-tune of it doesn't. A sharded
+    checkpoint (a folder, an index file, or a Hugging Face cache folder) is the fingerprints of the shards it's made
+    of (``comfy_io.shard_files``), so another revision arriving in the same cache folder doesn't change it."""
     if not path:
         return "none"
     path = os.path.expanduser(path)
-    if os.path.isdir(path):
+    if os.path.isdir(path) or path.endswith(".index.json"):
+        from .comfy_io import shard_files
+
         h = hashlib.sha1()
-        for root, _, files in sorted(os.walk(path)):
-            for name in sorted(files):
-                p = os.path.join(root, name)
-                h.update(f"{os.path.relpath(p, path)}:{fingerprint(p)}".encode())
+        for p in shard_files(path):
+            h.update(f"{os.path.basename(p)}:{fingerprint(p)}".encode())
         return h.hexdigest()
     size = os.path.getsize(path)
     h = hashlib.sha1(str(size).encode())

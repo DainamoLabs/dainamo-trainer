@@ -17,6 +17,84 @@ export const REFMOD_INFO = {
   sheet: "Puts the images side by side in one picture, each whole, with a grey gap between them, and encodes that as one reference. Otherwise full encoding crops every reference to the first one's shape, and a merge averages them. The images share the sheet's size, so raise the size for more detail in each. The model wasn't trained on sheets: compare it with the same images as separate references.",
 };
 
+// MiniMax H3 (the family that makes RefMods) takes clips of its frame rule, 17n + 5 frames, as 5n + 2 latent
+// frames; fewer than 5 frames is the first frame alone
+export const refLatentFrames = (frames: number) => (frames < 5 ? 1 : Math.floor((frames - 5) / 17) * 5 + 2);
+
+/** A RefMod's encoding settings, as Create Job's RefMod and the Sandbox's Make a RefMod both name them. */
+export type RefModEncodingValues = { mode: "full" | "compressed"; size: number; frames: number; grid: number; refine: number; merge: boolean; max_tokens: number };
+
+/** How a RefMod's pictures are encoded: Compressed or Full, the size, the frames of each clip (``clips``; its frame
+ * rule, ``frameRule``, from the family), the token cap and, compressed, the grid, refinement and (``mergeable``)
+ * Merge. The one set of fields for Create Job's RefMod and the Sandbox's Make a RefMod. ``perFrame``: the tokens a
+ * square frame takes, said under the grid. ``sheet``: the references are one sheet of images. */
+export function RefModEncoding({ v, set, frameRule, clips = true, mergeable = true, sheet = false, perFrame }: {
+  v: RefModEncodingValues; set: (patch: Partial<RefModEncodingValues>) => void; frameRule?: string; clips?: boolean;
+  mergeable?: boolean; sheet?: boolean; perFrame?: number;
+}) {
+  const compressed = v.mode === "compressed";
+  const latents = refLatentFrames(Number(v.frames) || 1);
+  return <>
+    <div className="field">
+      <span>Encoding<Info text={REFMOD_INFO.mode} /></span>
+      <div className="seg" role="group" aria-label="How the references are encoded">
+        {([["compressed", "Compressed"], ["full", "Full"]] as const).map(([m, label]) => (
+          <button key={m} type="button" className={v.mode === m ? "on" : ""} aria-pressed={v.mode === m} onClick={() => set({ mode: m })}>{label}</button>
+        ))}
+      </div>
+      <span className="help">{compressed
+        ? "Each reference as a small grid, refined to match its full encode: few tokens, less detail."
+        : sheet ? "The sheet's encode as it is: the most detail, and the most tokens." : "Each reference's encode as it is: the most detail, and the most tokens."}</span>
+    </div>
+    <div className="grid cols-3">
+      <Num label="Size (short edge, px)" v={v.size} on={(n) => set({ size: n })} step={32} min={256}
+        help={sheet ? "The sheet's short edge; the images share it." : compressed ? "What each reference is encoded at before it's compressed; scaled down to it, never up."
+          : "Scaled down to it, never up, in multiples of 32."} />
+      {clips && <Num label="Frames per clip" v={v.frames} on={(n) => set({ frames: n })} min={1}
+        help={`A clip's first frames at 24 fps, snapped down to ${frameRule || "a length the model takes"}: ${latents} latent frame${latents === 1 ? "" : "s"}. Images are one.`} />}
+      <Num label="Token cap" info={REFMOD_INFO.tokens} v={v.max_tokens} on={(n) => set({ max_tokens: n })} step={512} min={0} />
+      {compressed && <>
+        <Num label="Grid (cells, long edge)" v={v.grid} on={(n) => set({ grid: n })} step={2} min={2}
+          help={`Even; the short edge keeps the first reference's shape.${perFrame ? ` ${v.grid} is ${perFrame} tokens per square frame.` : ""}`} />
+        <Num label="Refinement steps" v={v.refine} on={(n) => set({ refine: n })} step={50} min={0}
+          help="How long each grid is refined to match its full encode. 0: the plain average." />
+        {mergeable && (
+          <label className="check" style={{ alignSelf: "end", paddingBottom: 8 }}>
+            <input type="checkbox" checked={!!v.merge} onChange={(e) => set({ merge: e.target.checked })} /> Merge into one reference<Info text={REFMOD_INFO.merge} />
+          </label>
+        )}
+      </>}
+    </div>
+  </>;
+}
+
+/** What a RefMod is of (from ``concepts``), the folder a copy goes to, and its description: the rest of the shared
+ * RefMod fields. */
+export function RefModAbout({ concept, copyTo, description, set, concepts = REFMOD_CONCEPTS }: {
+  concept: string; copyTo: string; description: string; concepts?: [string, string][];
+  set: (patch: { concept?: string; copy_to?: string; description?: string }) => void;
+}) {
+  return <>
+    <div className="grid cols-2">
+      <label className="field">
+        <span>Concept<Info text={REFMOD_INFO.concept} /></span>
+        <select value={concept} onChange={(e) => set({ concept: e.target.value })}>
+          {concepts.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+        </select>
+      </label>
+      <label className="field">
+        <span>Save a copy to <span className="faint">· optional</span></span>
+        <input value={copyTo} onChange={(e) => set({ copy_to: e.target.value })} placeholder="/path/to/ComfyUI/models/refmods" />
+        <span className="help">A folder the finished file is copied to, such as ComfyUI's models/refmods.</span>
+      </label>
+    </div>
+    <label className="field">
+      <span>Description <span className="faint">· optional</span></span>
+      <textarea rows={2} value={description} onChange={(e) => set({ description: e.target.value })} placeholder="Who or what it is, and how it was made" />
+    </label>
+  </>;
+}
+
 const IMAGE_EXTS = [".png", ".jpg", ".jpeg", ".webp", ".bmp"];
 const VIDEO_EXTS = [".mp4", ".webm", ".mov", ".mkv", ".avi"];
 const SHEET_MAX = 9;
@@ -35,9 +113,10 @@ export const NEW_REFMOD: RefModDraft = {
 /** Make a RefMod in the Sandbox, of images and clips or of a sheet of images, with the VAE the Sandbox has loaded.
  * ``making`` is the Sandbox's RefMod when it's the one this dialog asked for: it shows its progress, then what was
  * made; ``onBack`` returns to the settings. */
-export function MakeRefModDialog({ draft, setDraft, profileId, gpu, making, onMake, onBack, onClose }: {
+export function MakeRefModDialog({ draft, setDraft, profileId, gpu, making, onMake, onBack, onClose, frameRule }: {
   draft: RefModDraft; setDraft: (d: RefModDraft) => void; profileId: string; gpu: number | null;
   making: SandboxRefMod | null; onMake: (id: string) => void; onBack: () => void; onClose: () => void;
+  frameRule?: string; // the clip lengths the profile's family takes
 }) {
   const [check, setCheck] = useState<RefModCheck | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -85,17 +164,18 @@ export function MakeRefModDialog({ draft, setDraft, profileId, gpu, making, onMa
       setBusy(false);
     }
   };
-  const cancelMake = () => api.post("/api/sandbox/refmod/cancel").catch(() => undefined);
+  const cancelMake = () => api.post("/api/sandbox/refmod/cancel").catch((e) => setErr(e.message));
 
   if (making && (making.state === "queued" || making.state === "running"))
     return (
       <Modal title="Making a RefMod" onClose={onClose} footer={<>
-        <button className="btn" onClick={cancelMake}>Cancel making</button>
+        <button className="btn" onClick={cancelMake}>Cancel</button>
         <button className="btn primary" onClick={onClose}>Close</button>
       </>}>
         <div className="stack">
           <div className="progress busy"><div /></div>
           <div className="muted">{making.state === "queued" ? "Waiting for the generations queued before it" : making.message || "Starting"}</div>
+          {err && <div className="validation error">{err}</div>}
           <p className="help">It keeps going if you close this, and is added to RefMods when it's done.</p>
         </div>
       </Modal>
@@ -165,56 +245,15 @@ export function MakeRefModDialog({ draft, setDraft, profileId, gpu, making, onMa
         </div>
         {sheet && <img className="rm-sheet" src={sheetUrl} alt="The sheet" />}
 
-        <div className="field">
-          <span>Encoding<Info text={REFMOD_INFO.mode} /></span>
-          <div className="seg" role="group" aria-label="How the references are encoded">
-            {([["compressed", "Compressed"], ["full", "Full"]] as const).map(([m, label]) => (
-              <button key={m} type="button" className={draft.mode === m ? "on" : ""} aria-pressed={draft.mode === m} onClick={() => set({ mode: m })}>{label}</button>
-            ))}
+        <RefModEncoding v={draft} set={set} frameRule={frameRule} clips={clips > 0} mergeable={paths.length > 1 && !sheet} sheet={sheet} />
+        <label className="field">
+          <span>Name <span className="faint">· optional</span></span>
+          <div className="input-suffix">
+            <input value={draft.name} onChange={(e) => set({ name: e.target.value })} placeholder={check?.name || "refmod"} />
+            <span>.safetensors</span>
           </div>
-          <span className="help">{compressed
-            ? "Each reference as a small grid, refined to match its full encode: few tokens, less detail."
-            : sheet ? "The sheet's encode as it is: the most detail, and the most tokens." : "Each reference's encode as it is: the most detail, and the most tokens."}</span>
-        </div>
-        <div className="grid cols-3">
-          <Num label="Size (short edge, px)" v={draft.size} on={(v) => set({ size: v })} step={64} min={256}
-            help={sheet ? "The sheet's short edge; the images share it." : "Scaled down to it, never up."} />
-          {clips > 0 && <Num label="Frames per clip" v={draft.frames} on={(v) => set({ frames: v })} step={17} min={1}
-            help="A clip's first frames at 24 fps, snapped down to 17n + 5." />}
-          <Num label="Token cap" v={draft.max_tokens} on={(v) => set({ max_tokens: v })} step={512} min={0} info={REFMOD_INFO.tokens} />
-          {compressed && <>
-            <Num label="Grid (cells, long edge)" v={draft.grid} on={(v) => set({ grid: v })} step={2} min={2} help="Even." />
-            <Num label="Refinement steps" v={draft.refine} on={(v) => set({ refine: v })} step={50} min={0} help="0: the plain average." />
-            {paths.length > 1 && !sheet && (
-              <label className="check" style={{ alignSelf: "end", paddingBottom: 8 }}>
-                <input type="checkbox" checked={draft.merge} onChange={(e) => set({ merge: e.target.checked })} /> Merge into one reference<Info text={REFMOD_INFO.merge} />
-              </label>
-            )}
-          </>}
-        </div>
-        <div className="grid cols-2">
-          <label className="field">
-            <span>Concept<Info text={REFMOD_INFO.concept} /></span>
-            <select value={draft.concept} onChange={(e) => set({ concept: e.target.value })}>
-              {REFMOD_CONCEPTS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
-            </select>
-          </label>
-          <label className="field">
-            <span>Name <span className="faint">· optional</span></span>
-            <div className="input-suffix">
-              <input value={draft.name} onChange={(e) => set({ name: e.target.value })} placeholder={check?.name || "refmod"} />
-              <span>.safetensors</span>
-            </div>
-          </label>
-        </div>
-        <label className="field">
-          <span>Save a copy to <span className="faint">· optional</span></span>
-          <input value={draft.copy_to} onChange={(e) => set({ copy_to: e.target.value })} placeholder="/path/to/ComfyUI/models/refmods" />
         </label>
-        <label className="field">
-          <span>Description <span className="faint">· optional</span></span>
-          <textarea rows={2} value={draft.description} onChange={(e) => set({ description: e.target.value })} placeholder="Who or what it is, and how it was made" />
-        </label>
+        <RefModAbout concept={draft.concept} copyTo={draft.copy_to} description={draft.description} set={set} />
 
         {check && !problem && (
           <div className="muted small">

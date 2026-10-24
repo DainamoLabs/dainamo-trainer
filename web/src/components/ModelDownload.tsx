@@ -1,7 +1,7 @@
 import { useState } from "react";
-import { api, fmtDuration, q, type ModelDownloadOption, type ModelsOverview, type ModelTask } from "../api";
+import { api, fmtLeft, q, type ModelDownloadOption, type ModelsOverview, type ModelTask } from "../api";
 import { IconDownload } from "./icons";
-import { fmtSize, Modal, PathInput, usePoll, useToast } from "./ui";
+import { ConfirmDialog, fmtSize, Modal, PathInput, TaskProgress, usePoll, useToast } from "./ui";
 
 export const ACTIVE: ModelTask["state"][] = ["queued", "checking", "downloading", "verifying"];
 const SPARE = 2 * 1024 ** 3; // what the server leaves free on a disk
@@ -9,7 +9,7 @@ const SPARE = 2 * 1024 ** 3; // what the server leaves free on a disk
 type Space = { free: number | null; exists: boolean; in_models: boolean };
 
 /** Pick one of the files a family's field can use and download it from Hugging Face, into the models folder's
- *  subfolder for its kind (from Settings) or a folder chosen here. ``onUse`` offers the copy already on this machine. */
+ *  subfolder for its kind (set in Model files) or a folder chosen here. ``onUse`` offers the copy already on this machine. */
 export function DownloadDialog(props: {
   family: string; field: string; variant?: string; onClose: () => void;
   onStarted?: (t: ModelTask) => void; onUse?: (path: string) => void;
@@ -79,7 +79,7 @@ export function DownloadDialog(props: {
                   <span className="small">{fmtSize(o.size)}</span>
                   {o.have ? <span className="pill completed">On this machine</span>
                     : o.task ? <span className="pill queued">Downloading</span>
-                    : o.recommended ? <span className="pill running">Recommended</span> : null}
+                    : o.recommended ? <span className="pill accent">Recommended</span> : null}
                 </div>
               </label>
             ))}
@@ -93,7 +93,7 @@ export function DownloadDialog(props: {
               <span className="help">
                 {space?.free != null && <span className={short ? "validation error" : ""}>{fmtSize(space.free)} free on that disk{short ? `: not enough for ${fmtSize(cur.size)} (Dainamo leaves 2 GB spare)` : ""}. </span>}
                 {!ov.folder
-                  ? <>Set your ComfyUI models folder in <a href="#/settings">Settings</a> and this is filled in with the right subfolder. </>
+                  ? <>Set your ComfyUI models folder in <a href="#/profiles/files">Model files</a> and this is filled in with the right subfolder. </>
                   : space && !space.in_models
                     ? <span className="validation warning">Outside your models folder: ComfyUI won't see the file there unless its extra_model_paths.yaml lists it. </span>
                     : null}
@@ -120,14 +120,12 @@ const STATE_LABEL: Partial<Record<ModelTask["state"], string>> = {
   verifying: "Checking the file", done: "Downloaded",
 };
 
-/** A download: its progress, and Pause / Resume / Remove. */
+/** A download: its progress, and Pause (it resumes from where it stopped) / Resume / Remove. */
 export function TaskRow({ t, onChange }: { t: ModelTask; onChange: () => void }) {
   const toast = useToast();
+  const [asking, setAsking] = useState(false);
   const active = ACTIVE.includes(t.state);
-  const pct = t.size ? (100 * t.done) / t.size : 0;
   const act = async (what: "cancel" | "resume" | "remove") => {
-    if (what === "remove" && t.state !== "done" && t.done > 0
-        && !confirm(`Delete the ${fmtSize(t.done)} of ${t.name} downloaded so far?`)) return;
     try {
       if (what === "remove") await api.del(`/api/models/downloads/${t.id}`);
       else await api.post(`/api/models/downloads/${t.id}/${what}`);
@@ -136,31 +134,29 @@ export function TaskRow({ t, onChange }: { t: ModelTask; onChange: () => void })
     }
     onChange();
   };
-  const left = t.speed > 0 ? (t.size - t.done) / t.speed : null;
+  // a partial download is deleted by Remove: asked first
+  const remove = () => (t.state !== "done" && t.done > 0 ? setAsking(true) : act("remove"));
+  const left = t.speed > 0 ? fmtLeft((t.size - t.done) / t.speed) : "";
   const status = t.state === "downloading"
-    ? `${fmtSize(t.done)} of ${fmtSize(t.size)}${t.speed > 0 ? ` · ${fmtSize(t.speed)}/s · ${fmtDuration(left)} left` : ""}`
+    ? `${fmtSize(t.done)} of ${fmtSize(t.size)}${t.speed > 0 ? ` · ${fmtSize(t.speed)}/s · ${left}` : ""}`
     : t.state === "failed" ? t.error
     : t.state === "cancelled" || t.state === "interrupted"
       ? `Paused at ${fmtSize(t.done)} of ${fmtSize(t.size)}${t.state === "interrupted" ? " when the server stopped" : ""}`
       : STATE_LABEL[t.state];
   return (
     <div className="mf-task">
-      <div className="row" style={{ gap: 8, minWidth: 0 }}>
-        <div style={{ minWidth: 0, flex: 1 }}>
-          <div className="ellipsis" style={{ fontWeight: 600 }} title={t.dest}>{t.name}</div>
-          <div className={"small " + (t.state === "failed" ? "validation error" : "muted")} style={{ display: "block" }}>
-            {t.family_label.replace(/ \(.*\)$/, "")} · {t.label} · {status}
-          </div>
-        </div>
-        {active
-          ? <button className="btn sm" onClick={() => act("cancel")}>Pause</button>
-          : t.state !== "done" && <button className="btn sm" onClick={() => act("resume")}>Resume</button>}
-        {!active && <button className="btn sm ghost" onClick={() => act("remove")}>{t.state === "done" ? "Clear" : "Remove"}</button>}
-      </div>
-      {t.state !== "done" && (
-        <div className={"progress" + (t.state === "queued" || t.state === "verifying" ? " busy" : "")} style={{ marginTop: 8 }}>
-          <div style={{ width: `${pct}%` }} />
-        </div>
+      <TaskProgress running={active} bar={t.state !== "done" && t.state !== "failed"}
+        pct={t.state === "queued" || t.state === "verifying" || t.state === "checking" ? null : t.size ? (100 * t.done) / t.size : 0}
+        label={<span className="mf-task-name" title={t.dest}>{t.name}</span>}
+        detail={<span className={t.state === "failed" ? "validation error" : undefined}>{t.family_label.replace(/ \(.*\)$/, "")} · {t.label} · {status}</span>}
+        onCancel={() => act("cancel")} cancelLabel="Pause"
+        actions={!active && <>
+          {t.state !== "done" && <button className="btn sm" onClick={() => act("resume")}>Resume</button>}
+          <button className="btn sm ghost" onClick={remove}>{t.state === "done" ? "Clear" : "Remove"}</button>
+        </>} />
+      {asking && (
+        <ConfirmDialog title="Remove the download" danger confirmLabel="Remove" onClose={() => setAsking(false)} onConfirm={() => act("remove")}
+          message={`The ${fmtSize(t.done)} of ${t.name} downloaded so far is deleted, and the download starts over if you download it again.`} />
       )}
     </div>
   );

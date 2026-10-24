@@ -644,11 +644,20 @@ def test_comfy_attention_hints_are_dropped():
 
 
 def test_downloads_are_pinned():
+    from dainamo.engine.families.flux3_klein.driver import HF_REV
+
     seen = set()
     for dl in Flux3KleinDriver.downloads:
         assert dl.size > 0 and len(dl.sha256) == 64 and len(dl.revision) == 40
         seen.add(dl.field)
-    assert seen == {"diffusion_model", "text_encoder", "vae"}
+    assert seen == {"diffusion_model", "text_encoder", "vae", "prompt_upsampler"}
+    # the prompt upsampler, for captions: no profile field takes it, and it goes in text_encoders
+    pup = {dl.label: dl for dl in Flux3KleinDriver.downloads if dl.field == "prompt_upsampler"}
+    assert set(pup) == {"int8 convrot", "bf16"} and pup["int8 convrot"].recommended
+    assert all(dl.kind_folder == "text_encoders" and dl.revision == HF_REV and dl.gated for dl in pup.values())
+    assert (pup["int8 convrot"].size, pup["bf16"].size) == (9_748_113_996, 18_819_722_392)
+    assert Flux3KleinDriver.extra_fields == {"prompt_upsampler": ("Prompt upsampler", "for captions")}
+    assert "prompt_upsampler" not in {f.key for f in Flux3KleinDriver.info.profile_fields}
 
 
 @pytest.mark.parametrize("field", list(REAL))

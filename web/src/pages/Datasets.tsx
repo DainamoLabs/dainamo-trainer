@@ -1,15 +1,22 @@
 import { useEffect, useRef, useState } from "react";
 import { go } from "../App";
-import { api, byFamily, fmtTime, q, type Dataset, type DatasetUpscale, type Family, type Gpu, type Job, type MediaItem, type Profile, type Settings, type WhisperModel } from "../api";
+import {
+  api, byFamily, fmtClock, fmtTime, q, type Dataset, type DatasetUpscale, type Family, type Gpu, type Job, type MediaItem, type Profile, type Settings,
+  type SystemRam, type WhisperModel,
+} from "../api";
 import { CheckIssues, PairSummary, useDatasetCheck } from "../components/DatasetCheck";
 import { PairsDialog } from "../components/Pairs";
 import { DatasetUpscaleModal, DatasetUpscaleTask } from "../components/Upscale";
 import {
-  IconAlert, IconArrowRight, IconCheck, IconCheckCircle, IconCheckSquare, IconCopy, IconDown, IconDownload, IconEdit, IconFile, IconFilm, IconFolder, IconGrid,
+  IconAlert, IconArrowRight, IconCheck, IconCheckCircle, IconCopy, IconDown, IconDownload, IconEdit, IconFile, IconFilm, IconFolder, IconGrid,
   IconImages, IconInfo, IconLayers, IconLeft, IconLink, IconList, IconPause, IconPlayFill, IconPlus, IconRight, IconScissors, IconSearch, IconSparkle, IconTarget,
-  IconTrash, IconUpload, IconUpscale, IconWave, IconX,
+  IconTools, IconTrash, IconUpload, IconUpscale, IconWave,
 } from "../components/icons";
-import { ConfirmDialog, Empty, Info, Lightbox, Menu, Modal, PathInput, ProfileOptions, SelectBar, fmtSize, someNames, usePoll, useSelection, useToast, type Selection } from "../components/ui";
+import {
+  ConfirmDialog, Empty, Info, Lightbox, LoadError, Menu, Modal, PathInput, ProfileOptions, SelectBar, TaskProgress, fmtSize, someNames, usePoll, useSelection,
+  useToast, useToastErrors, type Selection,
+} from "../components/ui";
+import { OffloadControl, gpuTarget, useVramProjection } from "../components/Vram";
 import ClipEditor from "./ClipEditor";
 
 type SplitStatus = {
@@ -110,7 +117,7 @@ function CaptionCell({ item, onSaved, grid }: {
     );
   return (
     <div className={(grid ? "file-cap" : "media-cap") + (item.caption ? "" : " none")} onClick={() => setEditing(true)} title="Click to edit">
-      {item.caption || "No caption — click to write one"}
+      {item.caption || "No caption: click to write one"}
     </div>
   );
 }
@@ -343,7 +350,8 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
     if (dl?.count) loadItems(); // a playlist's files show as they arrive
   }, [dl?.running, dl?.count]);
 
-  const loadItems = () => api.get<MediaItem[]>(`/api/datasets/${id}/items`).then(setItems);
+  const [itemsError, setItemsError] = useState<string | null>(null);
+  const loadItems = () => api.get<MediaItem[]>(`/api/datasets/${id}/items`).then((x) => { setItems(x); setItemsError(null); }, (e) => setItemsError(e.message));
   useEffect(() => { loadItems(); }, [id]);
   useEffect(() => { if (d) setTrigger(d.trigger); }, [d?.trigger]);
   useEffect(() => {
@@ -404,14 +412,6 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
   };
 
   const [confirmRemove, setConfirmRemove] = useState(false);
-  const removeDataset = async (files: boolean) => {
-    try {
-      await api.del(`/api/datasets/${id}?delete_files=${files}`);
-      go("datasets");
-    } catch (e: any) {
-      toast(e.message, true);
-    }
-  };
 
   const setLayout = (l: Layout) => {
     setLayoutState(l);
@@ -461,7 +461,7 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
   const canDelete = !!d?.managed; // a linked folder's files are only deleted in the folder itself
 
   return (
-    <div className="page dataset"
+    <div className="page wide"
       onDragOver={(e) => { e.preventDefault(); setOver(true); }}
       onDragLeave={(e) => { if (e.currentTarget === e.target) setOver(false); }}
       onDrop={(e) => { e.preventDefault(); setOver(false); upload(e.dataTransfer.files); }}>
@@ -479,23 +479,21 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
           <button className="btn lg" onClick={() => setDlOpen(true)} disabled={dl?.running}
             title="Download a video, or only its sound, from a web page into this dataset (experimental)"><IconLink /> Add from URL</button>
           <button className="btn lg" onClick={() => setEditOpen(true)} disabled={!items?.length} title="Find and replace, add or remove words in every caption"><IconEdit /> Edit captions</button>
-          {d?.split && (
-            <button className="btn lg" onClick={() => go("datasets", id, "clips")} title={`Move, resize, crop, add or remove the clips cut from ${d.split.source.name}'s videos`}>
-              <IconScissors /> Edit clips</button>
-          )}
-          <button className="btn primary lg" onClick={() => setCapOpen(true)} disabled={!items?.length || onlyAudio}
-            title={onlyAudio ? "Auto-Caption describes images and clips; write each song's style tags yourself (lyrics go after a [Lyrics] line)" : undefined}>
-            <IconSparkle /> Auto-Caption</button>
-          <Menu label="More" boxed items={[
+          <Menu label="Tools" text="Tools" icon={<IconTools />} items={[
             ...(items?.some((i) => i.kind === "video") && !d?.split ? [{ label: "Split into clips", icon: <IconScissors />, onClick: () => setSplitOpen(true),
               disabled: !!split?.running, title: "Make a copy of this dataset with each video cut into clips a video model trains on whole" }] : []),
+            ...(d?.split ? [{ label: "Edit clips", icon: <IconScissors />, onClick: () => go("datasets", id, "clips"),
+              title: `Move, resize, crop, add or remove the clips cut from ${d.split.source.name}'s videos` }] : []),
             ...(items?.some((i) => i.kind === "image") ? [{ label: "Upscale small images", icon: <IconUpscale />, onClick: () => setUpOpen(true),
               disabled: upActive || !!up?.elsewhere,
               title: up?.elsewhere ? `${up.elsewhere.name} is being upscaled: one dataset at a time`
                 : "Make the images smaller than the training resolution bigger, keeping the originals in _originals" }] : []),
             { label: "Export", icon: <IconDownload />, onClick: () => setExporting(true), disabled: !items?.length, title: "Download it as a .zip" },
-            { label: "Remove dataset", icon: <IconTrash />, onClick: () => setConfirmRemove(true), danger: true },
+            { label: "Delete dataset", icon: <IconTrash />, onClick: () => setConfirmRemove(true), danger: true, sep: true },
           ]} />
+          <button className="btn primary lg" onClick={() => setCapOpen(true)} disabled={!items?.length || onlyAudio}
+            title={onlyAudio ? "Auto-Caption describes images and clips; write each song's style tags yourself (lyrics go after a [Lyrics] line)" : undefined}>
+            <IconSparkle /> Auto-Caption</button>
           <input ref={fileRef} type="file" multiple hidden accept="image/*,video/*,audio/*,.txt" onChange={(e) => e.target.files && upload(e.target.files)} />
         </div>
       </div>
@@ -526,20 +524,13 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
           </div>
         </div>
         {cap && (cap.running || cap.errors.length > 0) && (
-          <div className="dd-task">
-            <div className="row small" style={{ marginBottom: 6 }}>
-              <IconSparkle width={14} style={{ color: "var(--accent)" }} />
-              {!cap.running ? <span>Captioning finished</span> : cap.phase === "transcribing"
-                ? <span>Transcribing speech {cap.heard} / {cap.to_hear} <span className="faint">{cap.message}</span></span>
-                : cap.phase === "starting" ? <span>{cap.message || "Starting the caption model"}</span>
-                : <span>Captioning {cap.done} / {cap.total} <span className="faint">{cap.current}</span></span>}
-              <span className="spacer" />
-              {cap.running && <button className="btn sm" onClick={() => api.del(`/api/datasets/${id}/autocaption`)}><IconX /> Cancel</button>}
-            </div>
-            {cap.running && <div className="progress"><div style={{ width: `${cap.phase === "transcribing"
-              ? (100 * (cap.heard || 0)) / Math.max(1, cap.to_hear || 0) : (100 * cap.done) / Math.max(1, cap.total)}%` }} /></div>}
-            {cap.errors.length > 0 && <div className="error-box" style={{ marginTop: 8 }}>{cap.errors.slice(-3).map((e) => <div key={e}>{e}</div>)}</div>}
-          </div>
+          <TaskProgress className="dd-task" icon={<IconSparkle />} running={cap.running} errors={cap.errors.slice(-3)}
+            label={!cap.running ? "Captioning finished" : cap.phase === "transcribing" ? "Transcribing speech"
+              : cap.phase === "starting" ? cap.message || "Starting the caption model" : "Captioning"}
+            done={cap.phase === "transcribing" ? cap.heard : cap.phase === "starting" ? undefined : cap.done}
+            total={cap.phase === "transcribing" ? cap.to_hear : cap.phase === "starting" ? undefined : cap.total}
+            detail={cap.running && cap.phase !== "starting" ? (cap.phase === "transcribing" ? cap.message : cap.current) : undefined}
+            onCancel={() => api.del(`/api/datasets/${id}/autocaption`)} />
         )}
         {d?.split && d.split.changes > 0 && (
           <div className="validation warning dd-task">
@@ -548,47 +539,30 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
           </div>
         )}
         {split?.target && (split.running || split.done > 0) && (
-          <div className="dd-task">
-            <div className="row small" style={{ marginBottom: 6 }}>
-              <IconScissors width={14} style={{ color: "var(--accent)" }} />
-              {split.running
-                ? <span>{split.mode === "plan" ? "Planning clips in" : "Splitting"} {split.done} / {split.total} files{split.mode === "plan" ? "" : ` · ${split.clips} clips`}{" "}
-                  <span className="faint">{split.current}{split.message ? ` · ${split.message}` : ""}</span>
-                  {split.mode === "plan" && <> · <a href={`#/datasets/${split.target.id}/clips`}>open the clip editor</a></>}</span>
-                : split.mode === "plan" ? <span>Clips planned for <a href={`#/datasets/${split.target.id}/clips`}>{split.target.name}</a>: review them in the clip editor, then cut them</span>
-                : split.cancelled ? <span>{split.fresh ? "Split cancelled; the partial copy was removed" : "Stopped; the clips cut so far stay"}</span>
-                : <span>Split finished: {split.clips} clip{split.clips === 1 ? "" : "s"} cut{split.removed ? `, ${split.removed} removed` : ""} in <a href={`#/datasets/${split.target.id}`}>{split.target.name}</a></span>}
-              <span className="spacer" />
-              {split.running && <button className="btn sm" onClick={() => api.del(`/api/datasets/${id}/split`).then(reloadSplit)}><IconX /> Cancel</button>}
-            </div>
-            {split.running && <div className="progress"><div style={{ width: `${(100 * split.done) / Math.max(1, split.total)}%` }} /></div>}
-            {split.errors.length > 0 && <div className="error-box" style={{ marginTop: 8 }}>{split.errors.slice(-5).map((e) => <div key={e}>{e}</div>)}</div>}
-          </div>
+          <TaskProgress className="dd-task" icon={<IconScissors />} running={split.running} errors={split.errors}
+            label={split.running ? (split.mode === "plan" ? "Planning clips in" : "Splitting")
+              : split.mode === "plan" ? <>Clips planned for <a href={`#/datasets/${split.target.id}/clips`}>{split.target.name}</a>: review them in the clip editor, then cut them</>
+              : split.cancelled ? (split.fresh ? "Split cancelled; the partial copy was removed" : "Stopped; the clips cut so far stay")
+              : <>Split finished: {split.clips} clip{split.clips === 1 ? "" : "s"} cut{split.removed ? `, ${split.removed} removed` : ""} in <a href={`#/datasets/${split.target.id}`}>{split.target.name}</a></>}
+            done={split.done} total={split.total}
+            detail={split.running && <>{split.mode === "plan" ? "files" : `files · ${split.clips} clips`} {split.current}{split.message ? ` · ${split.message}` : ""}
+              {split.mode === "plan" && <> · <a href={`#/datasets/${split.target.id}/clips`}>open the clip editor</a></>}</>}
+            onCancel={() => api.del(`/api/datasets/${id}/split`).then(reloadSplit)} />
         )}
         {up && up.state !== "none" && up.id !== upHidden && (
           <DatasetUpscaleTask up={up} onCancel={() => api.post(`/api/datasets/${id}/upscale/cancel`).then(reloadUp)}
             onDismiss={() => setUpHidden(up.id || null)} />
         )}
         {dl && (dl.running || dl.count > 0 || dl.errors.length > 0 || dl.cancelled) && (
-          <div className="dd-task">
-            <div className="row small" style={{ marginBottom: 6 }}>
-              <IconDownload width={14} style={{ color: "var(--accent)" }} />
-              {dl.running ? (
-                <span>{dl.phase === "processing" ? dl.step : dl.phase === "downloading" ? "Downloading" : "Starting the download"}
-                  {(dl.items || 0) > 1 ? ` ${dl.item} / ${dl.items}` : ""}{" "}
-                  <span className="faint">{dl.title}{dl.phase === "downloading" && dl.done_bytes
-                    ? ` · ${mb(dl.done_bytes)}${dl.total_bytes ? ` / ${mb(dl.total_bytes)}` : ""}` : ""}</span></span>
-              ) : dl.cancelled ? <span>Download cancelled{dl.count ? `; the ${dl.count} file${dl.count === 1 ? "" : "s"} already added stay` : ""}</span>
-                : <span>{dl.count ? `Added ${dl.count} file${dl.count === 1 ? "" : "s"} from the web` : "Nothing was downloaded"}
-                  {dl.count === 1 && <span className="faint"> · {dl.saved[0]}</span>}</span>}
-              <span className="spacer" />
-              {dl.running && <button className="btn sm" onClick={() => api.del(`/api/datasets/${id}/download`).then(reloadDl)}><IconX /> Cancel</button>}
-            </div>
-            {dl.running && (dl.total_bytes
-              ? <div className="progress"><div style={{ width: `${(100 * ((dl.item || 1) - 1 + (dl.done_bytes || 0) / dl.total_bytes)) / Math.max(1, dl.items || 1)}%` }} /></div>
-              : <div className="progress busy"><div /></div>)}
-            {dl.errors.length > 0 && <div className="error-box" style={{ marginTop: 8 }}>{dl.errors.slice(-5).map((e) => <div key={e}>{e}</div>)}</div>}
-          </div>
+          <TaskProgress className="dd-task" icon={<IconDownload />} running={dl.running} errors={dl.errors}
+            label={dl.running ? (dl.phase === "processing" ? dl.step : dl.phase === "downloading" ? "Downloading" : "Starting the download")
+              : dl.cancelled ? `Download cancelled${dl.count ? `; the ${dl.count} file${dl.count === 1 ? "" : "s"} already added stay` : ""}`
+              : <>{dl.count ? `Added ${dl.count} file${dl.count === 1 ? "" : "s"} from the web` : "Nothing was downloaded"}
+                {dl.count === 1 && <span className="faint"> · {dl.saved[0]}</span>}</>}
+            done={(dl.items || 0) > 1 ? dl.item : undefined} total={(dl.items || 0) > 1 ? dl.items : undefined}
+            pct={dl.total_bytes ? (100 * ((dl.item || 1) - 1 + (dl.done_bytes || 0) / dl.total_bytes)) / Math.max(1, dl.items || 1) : null}
+            detail={dl.running && `${dl.title || ""}${dl.phase === "downloading" && dl.done_bytes ? ` · ${fmtSize(dl.done_bytes)}${dl.total_bytes ? ` of ${fmtSize(dl.total_bytes)}` : ""}` : ""}`}
+            onCancel={() => api.del(`/api/datasets/${id}/download`).then(reloadDl)} />
         )}
       </div>
 
@@ -598,6 +572,7 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
         <div className={"dropzone over"} style={{ marginBottom: 16 }}>{uploading || "Drop images, videos or audio to upload"}</div>
       )}
 
+      {itemsError && !items && <LoadError what="the dataset's files" error={itemsError} onRetry={loadItems} />}
       {items && items.length === 0 && (
         <div className="dropzone" onClick={() => fileRef.current?.click()}>
           <IconUpload width={28} height={28} /><br />
@@ -623,7 +598,7 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
             <button aria-pressed={layout === "grid"} title="Grid: bigger cards, a page at a time" onClick={() => setLayout("grid")}><IconGrid /></button>
             <button aria-pressed={layout === "list"} title="List: every file on one page" onClick={() => setLayout("list")}><IconList /></button>
           </div>
-          {canDelete && !sel.on && <button className="btn lg" onClick={sel.start}><IconCheckSquare /> Select files</button>}
+          {canDelete && !sel.on && <button className="btn lg" onClick={sel.start} title="Pick files to delete together"><IconCheck /> Select</button>}
         </div>
       )}
       {sel.on && (
@@ -697,12 +672,7 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
             and {deleting.length === 1 ? "its caption" : "their captions"} from disk? This can't be undone.</>} />
       )}
       {exporting && d && <ExportDialog datasets={[d]} onClose={() => setExporting(false)} />}
-      {confirmRemove && d && (
-        <ConfirmDialog title="Remove dataset" danger confirmLabel="Remove" onClose={() => setConfirmRemove(false)} onConfirm={removeDataset}
-          message={d.managed ? <>Remove <strong style={{ color: "var(--text)" }}>{d.name}</strong> from Dainamo?</>
-            : <>Remove <strong style={{ color: "var(--text)" }}>{d.name}</strong> from Dainamo? The folder <span className="mono">{d.path}</span> and its files are left untouched.</>}
-          checkbox={d.managed ? "Also delete the uploaded files and captions" : undefined} />
-      )}
+      {confirmRemove && d && <DeleteDatasets datasets={[d]} onClose={() => setConfirmRemove(false)} onDeleted={() => go("datasets")} />}
       {capOpen && d && <AutoCaptionModal dataset={d} missing={missing} hasVideo={!!items?.some((i) => i.kind === "video")}
         onClose={() => { setCapOpen(false); reloadDs(); }} />}
       {editOpen && d && <EditCaptionsModal dataset={d} onClose={() => setEditOpen(false)} onChanged={() => { loadItems(); reloadDs(); }} />}
@@ -714,8 +684,45 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
   );
 }
 
-const fmtClock = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, "0")}`;
-const mb = (bytes: number) => `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+/** Delete datasets (one, from its page or its card, or those picked with Select): from Dainamo, and with the box
+ * ticked their uploaded files too. A queued or running job that uses one is named, since deleting its files makes it
+ * fail. The one dialog for it. */
+function DeleteDatasets({ datasets, onClose, onDeleted }: { datasets: Dataset[]; onClose: () => void; onDeleted: () => void }) {
+  const toast = useToast();
+  const [jobs] = usePoll<Job[]>("/api/jobs", 0);
+  const uploaded = datasets.filter((d) => d.managed);
+  const names = new Set(datasets.map((d) => d.name));
+  const using = (jobs || []).filter((j) => ["queued", "running", "stopping"].includes(j.status) && j.datasets.some((n) => names.has(n)));
+  const remove = async (files: boolean) => {
+    let removed = 0;
+    const failed: string[] = [];
+    for (const d of datasets) {
+      try {
+        await api.del(`/api/datasets/${d.id}?delete_files=${files}`);
+        removed++;
+      } catch (e: any) {
+        failed.push(datasets.length > 1 ? `${d.name}: ${e.message}` : e.message);
+      }
+    }
+    toast(failed.length ? `${removed ? `Deleted ${removed}; c` : "C"}ouldn't delete ${failed.join("; ")}`
+      : `Deleted ${datasets.length === 1 ? datasets[0].name : `${removed} datasets`}`, failed.length > 0);
+    if (removed) onDeleted();
+  };
+  const one = datasets.length === 1;
+  return (
+    <ConfirmDialog title={one ? "Delete dataset" : `Delete ${datasets.length} datasets`} danger confirmLabel="Delete" onClose={onClose} onConfirm={remove}
+      message={<>
+        Remove <strong style={{ color: "var(--text)" }}>{someNames(datasets.map((d) => d.name))}</strong> from Dainamo?
+        {uploaded.length < datasets.length && (one
+          ? <> The folder <span className="mono">{datasets[0].path}</span> and its files are left as they are.</>
+          : " Linked folders and their files are left as they are.")}
+        {using.length > 0 && <div className="validation warning" style={{ marginTop: 10 }}>
+          {someNames(using.map((j) => j.name))} {using.length === 1 ? "is" : "are"} queued or running with {one ? "it" : "some of them"}:
+          deleting the files makes {using.length === 1 ? "that job" : "those jobs"} fail.</div>}
+      </>}
+      checkbox={uploaded.length ? `Also delete the uploaded files and captions${uploaded.length < datasets.length ? ` of ${someNames(uploaded.map((d) => d.name))}` : ""}` : undefined} />
+  );
+}
 
 const HEIGHTS: [number, string][] = [[360, "360p"], [480, "480p"], [720, "720p"], [1080, "1080p"], [1440, "1440p"], [2160, "2160p (4K)"], [0, "The best there is"]];
 // the formats a download can come as (media_download.VIDEO_FORMATS and AUDIO_FORMATS); the first is the default
@@ -871,8 +878,10 @@ const SPLIT_SIZES = [256, 320, 384, 448, 512, 576, 640, 768, 1024];
 function SplitModal({ dataset, families, onClose, onStarted }: { dataset: Dataset; families: Family[]; onClose: () => void; onStarted: () => void }) {
   const toast = useToast();
   const videoFamilies = families.filter((f) => f.media.includes("video"));
+  const attempt = useToastErrors();
   const [profiles, setProfiles] = useState<Profile[] | null>(null);
   const [gpus, setGpus] = useState<Gpu[]>([]);
+  const [ram, setRam] = useState<SystemRam | null>(null);
   const [profileId, setProfileId] = useState("");
   const [gpu, setGpu] = useState(-1);
   const [resolution, setResolution] = useState(384);
@@ -895,13 +904,16 @@ function SplitModal({ dataset, families, onClose, onStarted }: { dataset: Datase
     setOffload(Number(fam?.training_defaults.offload) || 0);
   };
   useEffect(() => {
-    api.get<Profile[]>("/api/profiles").then((ps) => {
+    attempt(api.get<Profile[]>("/api/profiles"), "Couldn't load the profiles").then((ps) => {
+      if (!ps) return;
       const video = ps.filter((p) => videoFamilies.some((f) => f.id === p.family));
       setProfiles(video);
       if (video[0]) pickProfile(byFamily(video, videoFamilies)[0].profiles[0]);
     });
-    api.get<{ gpus: Gpu[] }>("/api/system").then((sys) => {
+    attempt(api.get<{ gpus: Gpu[]; ram?: SystemRam }>("/api/system"), "Couldn't load the GPUs").then((sys) => {
+      if (!sys) return;
       setGpus(sys.gpus);
+      setRam(sys.ram || null);
       if (sys.gpus.length) setGpu(sys.gpus.reduce((a, b) => (b.mem_total < a.mem_total ? b : a)).index);
     });
   }, []);
@@ -920,6 +932,11 @@ function SplitModal({ dataset, families, onClose, onStarted }: { dataset: Datase
     return () => { live = false; };
   }, [profileId, resolution, offload, lowVram, gpuGb]);
   const chosen = fit?.lengths.find((l) => l.frames === frames);
+  // the job's projection at the chosen clip length, for the shared offload control (as the split's fit is reckoned)
+  const proj = useVramProjection(profileId || undefined, {
+    ...(family?.training_defaults || {}), resolution, offload, low_vram: lowVram, num_frames: frames || 1,
+    datasets: [{ resolution, video: true }],
+  }, "train");
   const start = async (review: boolean) => {
     try {
       const job = await api.post<SplitStatus>(`/api/datasets/${dataset.id}/split`, {
@@ -974,17 +991,9 @@ function SplitModal({ dataset, families, onClose, onStarted }: { dataset: Datase
               {[...new Set([...SPLIT_SIZES, resolution])].sort((a, b) => a - b).map((r) => <option key={r} value={r}>{r}</option>)}
             </select>
           </label>
-          <label className="field">
-            <span>Offload <span className="faint">· % of blocks in RAM</span></span>
-            <input type="number" min={0} max={100} step={5} value={offload} onChange={(e) => setOffload(Math.min(100, Math.max(0, Number(e.target.value) || 0)))} />
-          </label>
         </div>
-        {family?.streams_text_encoder && (
-          <label className="switch-row">
-            <span className="switch"><input type="checkbox" role="switch" checked={lowVram} onChange={(e) => setLowVram(e.target.checked)} /><i /></span>
-            <span>Low VRAM <span className="muted">· the job streams its text encoder and saved activations from system RAM too</span></span>
-          </label>
-        )}
+        <OffloadControl proj={proj} value={offload} onChange={setOffload} gpu={gpuTarget(gpus, gpu)} ram={ram} compact
+          lowVram={family?.streams_text_encoder ? { on: lowVram, onChange: setLowVram } : null} />
         <label className="field">
           <span>Clip length</span>
           {fit?.error || (fit && !fit.lengths.length) ? (
@@ -1171,6 +1180,7 @@ const FPS = 24; // clips are trained at 24 fps
 
 function AutoCaptionModal({ dataset, missing, hasVideo, onClose }: { dataset: Dataset; missing: number; hasVideo: boolean; onClose: () => void }) {
   const toast = useToast();
+  const attempt = useToastErrors();
   const last = dataset.caption_options; // what this dataset used last time
   const [overwrite, setOverwrite] = useState(false);
   const [trigger, setTrigger] = useState(dataset.trigger);
@@ -1183,14 +1193,15 @@ function AutoCaptionModal({ dataset, missing, hasVideo, onClose }: { dataset: Da
   const [speech, setSpeech] = useState(last?.speech || "");
   const [whisper, setWhisper] = useState<WhisperModel[]>([]);
   useEffect(() => {
-    api.post<typeof test>("/api/captioner/test", {}).then(setTest);
-    api.get<Settings>("/api/settings").then((st) => {
+    api.post<typeof test>("/api/captioner/test", {}).then(setTest, (e) => setTest({ ok: false, error: e.message }));
+    attempt(api.get<Settings>("/api/settings"), "Couldn't load the caption styles").then((st) => {
+      if (!st) return;
       setStyles(st.caption_styles);
       const known = st.caption_styles.styles.some((x) => x.id === last?.style);
       setStyle(known ? last!.style : st.caption_styles.default);
       setSpeech((m) => m || st.speech.model);
     });
-    if (hasVideo) api.get<{ whisper_models: WhisperModel[] }>("/api/system").then((sys) => setWhisper(sys.whisper_models));
+    if (hasVideo) attempt(api.get<{ whisper_models: WhisperModel[] }>("/api/system"), "Couldn't load the Whisper models").then((sys) => sys && setWhisper(sys.whisper_models));
   }, []);
   const chosen = styles?.styles.find((x) => x.id === style);
   const start = async () => {
@@ -1226,9 +1237,13 @@ function AutoCaptionModal({ dataset, missing, hasVideo, onClose }: { dataset: Da
           <select value={style} onChange={(e) => setStyle(e.target.value)} disabled={!styles}>
             {styles?.styles.map((x) => <option key={x.id} value={x.id}>{x.name}{x.id === styles.default ? " (default)" : ""}</option>)}
           </select>
-          {chosen && <span className="caption-prompt">{chosen.prompt}</span>}
+          {/* a system prompt (FLUX 3's style) is the style's substance: it shows first, the prompt after it */}
+          {chosen && <span className="caption-prompt" style={{ whiteSpace: "pre-wrap" }}>{chosen.system ? `${chosen.system}\n\n${chosen.prompt}` : chosen.prompt}</span>}
           <span className="help">
             {last && chosen?.id === last.style ? "The style this dataset was captioned with last time. " : ""}
+            {chosen && (chosen.temperature != null || chosen.max_tokens != null) ? `It has its own settings (${[
+              chosen.temperature != null && `temperature ${chosen.temperature}`, chosen.max_tokens != null && `${chosen.max_tokens} tokens at most`,
+            ].filter(Boolean).join(", ")}). ` : ""}
             Add or edit styles in <a href="#/settings">Settings</a>.
           </span>
         </label>
@@ -1264,16 +1279,17 @@ function AutoCaptionModal({ dataset, missing, hasVideo, onClose }: { dataset: Da
           Overwrite existing captions <span className="faint">({overwrite ? dataset.count : missing} file{(overwrite ? dataset.count : missing) === 1 ? "" : "s"} will be captioned)</span>
         </label>
         <label className="field">
-          <span>Trigger word <span className="faint">· optional</span></span>
-          <input value={trigger} onChange={(e) => setTrigger(e.target.value)} placeholder="none" />
-          <span className="help">Prepended as "trigger, caption…" when not already present.</span>
+          <span>Add to each caption <span className="faint">· optional</span></span>
+          <input value={trigger} onChange={(e) => setTrigger(e.target.value)} placeholder="nothing" />
+          <span className="help">Written at the start of each caption made now, as "words, caption…", unless it's there already. It starts
+            as the dataset's trigger word; changing it here doesn't change that.</span>
         </label>
       </div>
     </Modal>
   );
 }
 
-/** Several datasets as one .zip (``/api/export/datasets``): a folder each, with captions and reference images. */
+/** Several datasets as one .zip (``/api/export/datasets``): a folder each, with captions, reference images and masks. */
 function ExportDialog({ datasets, onClose }: { datasets: Dataset[]; onClose: () => void }) {
   const toast = useToast();
   const triggers = datasets.filter((d) => d.trigger);
@@ -1300,7 +1316,7 @@ function ExportDialog({ datasets, onClose }: { datasets: Dataset[]; onClose: () 
         <p className="muted" style={{ margin: 0 }}>
           A .zip with {datasets.length === 1 ? "the dataset's folder" : "a folder for each dataset"}: its {files} file{files === 1 ? "" : "s"}{" "}
           ({fmtSize(datasets.reduce((n, d) => n + d.bytes, 0))}) in their subfolders, each with its caption .txt beside it, plus
-          reference images and a split's clip list. Nothing is compressed again, so the download starts right away.
+          reference images, loss masks and a split's clip list. Nothing is compressed again, so the download starts right away.
         </p>
         {triggers.length > 0 && (
           <div className="field">
@@ -1391,8 +1407,7 @@ function DatasetCard({ d, sel, onExport, onDelete }: { d: Dataset; sel: Selectio
 }
 
 export default function Datasets({ datasetId, view, families }: { datasetId: string; view: string; families: Family[] }) {
-  const toast = useToast();
-  const [datasets, reload] = usePoll<Dataset[]>("/api/datasets", 0, [datasetId]);
+  const [datasets, reload, loadError] = usePoll<Dataset[]>(datasetId ? null : "/api/datasets", 0, [datasetId]);
   const [creating, setCreating] = useState(false);
   const [search, setSearch] = useState("");
   const [media, setMediaState] = useState<Media>(() => {
@@ -1412,8 +1427,6 @@ export default function Datasets({ datasetId, view, families }: { datasetId: str
   // Select (or ⋯ on one): exported or deleted together
   const sel = useSelection();
   const [dialog, setDialog] = useState<{ kind: "export" | "delete"; ids: string[] } | null>(null);
-  const [deleting, setDeleting] = useState(false);
-  const [jobs] = usePoll<Job[]>(dialog?.kind === "delete" ? "/api/jobs" : null, 0);
   if (datasetId && view === "clips") return <ClipEditor key={datasetId} id={datasetId} />;
   if (datasetId) return <DatasetDetail key={datasetId} id={datasetId} families={families} />; // fresh state per dataset
   const words = search.toLowerCase().split(/\s+/).filter(Boolean);
@@ -1421,29 +1434,9 @@ export default function Datasets({ datasetId, view, families }: { datasetId: str
     && words.every((w) => `${d.name} ${d.trigger} ${d.managed ? "" : d.path}`.toLowerCase().includes(w)));
   const picked = shown.filter((d) => sel.picked.has(d.id)); // what Select acts on: only those in view
   const chosen = (datasets || []).filter((d) => dialog?.ids.includes(d.id));
-  const uploaded = chosen.filter((d) => d.managed);
-  const names = new Set(chosen.map((d) => d.name));
-  const using = (jobs || []).filter((j) => ["queued", "running", "stopping"].includes(j.status) && j.datasets.some((n) => names.has(n)));
-  const removeMany = async (files: boolean) => {
-    setDeleting(true);
-    let removed = 0;
-    const failed: string[] = [];
-    for (const d of chosen) {
-      try {
-        await api.del(`/api/datasets/${d.id}?delete_files=${files}`);
-        removed++;
-      } catch (e: any) {
-        failed.push(`${d.name}: ${e.message}`);
-      }
-    }
-    toast(`Deleted ${removed} dataset${removed === 1 ? "" : "s"}${failed.length ? `; couldn't delete ${failed.join("; ")}` : ""}`, failed.length > 0);
-    setDeleting(false);
-    sel.stop();
-    reload();
-  };
   const filtered = !!words.length || media !== "all";
   return (
-    <div className="page narrow">
+    <div className="page">
       <div className="page-head">
         <div>
           <h1>Datasets{!!datasets?.length && <span className="count-pill">{datasets.length}</span>}</h1>
@@ -1471,22 +1464,12 @@ export default function Datasets({ datasetId, view, families }: { datasetId: str
           info={<span className="muted small">{fmtSize(picked.reduce((n, d) => n + d.bytes, 0))}</span>}>
           <button className="btn" onClick={() => setDialog({ kind: "export", ids: picked.map((d) => d.id) })} disabled={!picked.length || picked.some((d) => !d.exists)}
             title={picked.some((d) => !d.exists) ? "A selected dataset's folder is missing" : "Download them as a .zip"}><IconDownload /> Export</button>
-          <button className="btn danger" onClick={() => setDialog({ kind: "delete", ids: picked.map((d) => d.id) })} disabled={!picked.length || deleting}><IconTrash /> {deleting ? "Deleting…" : "Delete"}</button>
+          <button className="btn danger" onClick={() => setDialog({ kind: "delete", ids: picked.map((d) => d.id) })} disabled={!picked.length}><IconTrash /> Delete</button>
         </SelectBar>
       )}
       {dialog?.kind === "export" && <ExportDialog datasets={chosen} onClose={() => setDialog(null)} />}
-      {dialog?.kind === "delete" && (
-        <ConfirmDialog title={chosen.length === 1 ? `Delete ${chosen[0].name}` : `Delete ${chosen.length} datasets`} danger confirmLabel="Delete"
-          onClose={() => setDialog(null)} onConfirm={removeMany}
-          message={<>
-            Remove <strong style={{ color: "var(--text)" }}>{someNames(chosen.map((d) => d.name))}</strong> from Dainamo?
-            {uploaded.length < chosen.length && ` ${chosen.length === 1 ? "The linked folder and its files are" : "Linked folders and their files are"} left as they are.`}
-            {using.length > 0 && <div className="validation warning" style={{ marginTop: 10 }}>
-              {someNames(using.map((j) => j.name))} {using.length === 1 ? "is" : "are"} queued or running with {chosen.length === 1 ? "it" : "some of them"}:
-              deleting the files makes {using.length === 1 ? "that job" : "those jobs"} fail.</div>}
-          </>}
-          checkbox={uploaded.length ? `Also delete the uploaded files and captions${uploaded.length < chosen.length ? ` of ${someNames(uploaded.map((d) => d.name))}` : ""}` : undefined} />
-      )}
+      {dialog?.kind === "delete" && <DeleteDatasets datasets={chosen} onClose={() => setDialog(null)} onDeleted={() => { sel.stop(); reload(); }} />}
+      {loadError && !datasets && <LoadError what="the datasets" error={loadError} onRetry={reload} />}
       {datasets && datasets.length === 0 && (
         <Empty icon={<IconImages />} title="No datasets yet" action={<button className="btn primary lg" onClick={() => setCreating(true)}><IconPlus /> New dataset</button>}>
           Upload images, videos or music, or link a folder you already have.

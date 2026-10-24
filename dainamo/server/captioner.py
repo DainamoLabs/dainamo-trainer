@@ -140,13 +140,24 @@ def chat(llm: dict, client: httpx.Client, messages: list[dict], max_tokens: int,
                        + ": raise Max tokens in Settings")
 
 
+def style_config(captioner: dict, style: dict) -> dict:
+    """The caption provider's settings (Settings → captioner) with a caption style's prompt, and its system prompt,
+    temperature and max_tokens where it has its own."""
+    return {**captioner, "prompt": style["prompt"], "system": style.get("system") or "",
+            **{k: style[k] for k in ("temperature", "max_tokens") if style.get(k) is not None}}
+
+
 def _ask(cfg: dict, client: httpx.Client, prompt: str, images: list[Image.Image], max_side: int = 1024) -> str:
-    content = [{"type": "text", "text": prompt}] + [
-        {"type": "image_url", "image_url": {"url": _encode_image(im, max_side)}} for im in images
-    ]
-    text = chat(cfg, client, [{"role": "user", "content": content}], int(cfg.get("max_tokens", 600)),
-                float(cfg.get("temperature", 0.2)))
-    return " ".join(text.split())
+    """The reply to ``prompt`` with ``images``. With a system prompt (``cfg["system"]``) the images come before the
+    text, as FLUX 3's prompt upsampler gets them; without one, the text comes first."""
+    text = [{"type": "text", "text": prompt}]
+    pictures = [{"type": "image_url", "image_url": {"url": _encode_image(im, max_side)}} for im in images]
+    if cfg.get("system"):
+        messages = [{"role": "system", "content": cfg["system"]}, {"role": "user", "content": pictures + text}]
+    else:
+        messages = [{"role": "user", "content": text + pictures}]
+    reply = chat(cfg, client, messages, int(cfg.get("max_tokens", 600)), float(cfg.get("temperature", 0.2)))
+    return " ".join(reply.split())
 
 
 def caption_file(path: str, cfg: dict, client: httpx.Client, span: float | None = None,

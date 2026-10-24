@@ -1,12 +1,14 @@
 """Pixel upscalers (``engine.upscalers.pixel``): tiles that add up to a whole-image pass, overlaps blended without
 seams, odd sizes, greyscale and alpha, fitting to another factor, fp16 overflow, cancelling between tiles, and
 telling files apart. A stand-in for spandrel's model descriptor takes the model's place; with a GPU and
-RealESRGAN_x4plus in the models folder, the real thing.
+RealESRGAN_x4plus in the models folder, the real thing. And the video writer upscaled clips stream into
+(``media.VideoWriter``): chunks the same as a whole clip, the sound from another file, nothing left on failure.
 
     .venv/bin/python -m pytest tests/test_upscale.py -v
 """
 
 import os
+import time
 
 import pytest
 import torch
@@ -217,3 +219,124 @@ def test_real_esrgan_on_the_gpu():
     up.tile, up.overlap = 48, 16
     assert (up.upscale(x, (512, 384)) - out).abs().mean() < 0.01  # tiled, much the same
     up.unload()
+
+
+# --- the streaming video writer (media.VideoWriter), which upscaled clips are written with -----------------------
+def _decode(path, w, h):
+    """Every frame of a video as (n, h, w, 3) uint8, decoded by ffmpeg."""
+    import subprocess
+
+    import numpy as np
+
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:v:0", "-fps_mode", "passthrough",
+                          "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True, check=True).stdout
+    return np.frombuffer(raw, np.uint8).reshape(-1, h, w, 3)
+
+
+def _streams(path):
+    import json
+    import subprocess
+
+    out = subprocess.run(["ffprobe", "-v", "error", "-count_frames", "-show_entries",
+                          "stream=codec_type,codec_name,width,height,avg_frame_rate,nb_read_frames,duration",
+                          "-of", "json", str(path)], capture_output=True, text=True, check=True)
+    return {s["codec_type"]: s for s in json.loads(out.stdout)["streams"]}
+
+
+def _frames(t, h=48, w=64, seed=0):
+    """Frames with something to encode: a gradient that moves, and some noise."""
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:h, 0:w]
+    base = np.stack([(xx * 4 + i * 9) % 256 for i in range(t)])[..., None] * np.array([1.0, 0.6, 0.3])
+    return np.clip(base + yy[None, :, :, None] + rng.normal(0, 4, (t, h, w, 3)), 0, 255).astype(np.uint8)
+
+
+def _sound_clip(path, seconds):
+    import subprocess
+
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=32x24:rate=10", "-f", "lavfi",
+                    "-i", "sine=frequency=440:sample_rate=44100", "-t", str(seconds), "-pix_fmt", "yuv420p",
+                    str(path)], check=True)
+    return str(path)
+
+
+def test_the_video_writer_streams_a_playable_mp4_with_the_clips_sound(tmp_path):
+    """Frames written a few at a time make one MP4 at the frame rate as given (30000/1001 stays that), every frame
+    there, with a poster of the first; the sound comes from another file, cut or padded to the video's length."""
+    from PIL import Image
+
+    from dainamo.engine.media import VideoWriter
+
+    frames = _frames(13)
+    for source_seconds in (5.0, 0.2):  # sound longer than the video, and shorter
+        source = _sound_clip(tmp_path / f"src{source_seconds}.mp4", source_seconds)
+        with VideoWriter(str(tmp_path), f"v{source_seconds}", "30000/1001", audio=source) as video:
+            for a, b in ((0, 5), (5, 6), (6, 13)):
+                video.write(frames[a:b])
+            video.write(frames[:0])  # nothing: fine
+            saved = video.close()
+            assert video.close() == saved and video.frames == 13
+        assert saved == {"file": f"v{source_seconds}.mp4", "poster": f"v{source_seconds}_poster.png",
+                         "kind": "video"}
+        streams = _streams(tmp_path / saved["file"])
+        v, a = streams["video"], streams["audio"]
+        assert (v["codec_name"], v["width"], v["height"], v["nb_read_frames"], v["avg_frame_rate"]) == \
+            ("h264", 64, 48, "13", "30000/1001")
+        assert a["codec_name"] == "aac" and abs(float(a["duration"]) - 13 * 1001 / 30000) < 0.1
+        poster = Image.open(tmp_path / saved["poster"])
+        assert poster.size == (64, 48) and poster.tobytes() == frames[0].tobytes()
+    with VideoWriter(str(tmp_path), "silent", 24) as video:  # no sound
+        video.write(frames)
+    assert "audio" not in _streams(tmp_path / "silent.mp4") and _streams(tmp_path / "silent.mp4")["video"][
+        "avg_frame_rate"] == "24/1"
+
+
+def test_chunked_writes_are_a_one_shot_save_media_frame_for_frame(tmp_path):
+    import numpy as np
+
+    from dainamo.engine.media import VideoWriter, save_media
+
+    frames = _frames(21, seed=1)
+    whole = save_media({"frames": frames, "fps": 12, "audio": None, "sample_rate": 48000}, str(tmp_path), "whole")
+    with VideoWriter(str(tmp_path), "chunked", 12) as video:
+        for a in range(0, 21, 4):
+            video.write(frames[a:a + 4])
+    chunked = video.close()
+    a = _decode(tmp_path / whole["file"], 64, 48).astype(int)
+    b = _decode(tmp_path / chunked["file"], 64, 48).astype(int)
+    assert a.shape == b.shape == frames.shape
+    assert np.abs(a - b).max() <= 2  # the same frames (x264 gives the same stream for the same input)
+    assert np.abs(a - frames.astype(int)).mean() < 6  # in order, and close to what went in
+
+
+def test_a_failed_video_leaves_nothing_behind(tmp_path):
+    """An error while writing (cancelling, a frame of another size, ffmpeg stopping) removes the partial MP4 and
+    its poster."""
+    from dainamo.engine.media import VideoWriter
+    from dainamo.engine.sampling import Cancelled
+
+    frames = _frames(6)
+    with pytest.raises(Cancelled):
+        with VideoWriter(str(tmp_path), "cancelled", 24) as video:
+            video.write(frames)
+            video._proc.stdin.flush()
+            for _ in range(100):  # ffmpeg opens the MP4 once it has read a frame
+                if (tmp_path / "cancelled.mp4").exists():
+                    break
+                time.sleep(0.05)
+            assert (tmp_path / "cancelled.mp4").exists() and (tmp_path / "cancelled_poster.png").exists()
+            raise Cancelled()
+    with pytest.raises(ValueError, match="64×48"):
+        with VideoWriter(str(tmp_path), "resized", 24) as video:
+            video.write(frames[:3])
+            video.write(_frames(2, h=24, w=32))
+    with pytest.raises(ValueError, match="ffmpeg couldn't write"):  # the sound file isn't there: ffmpeg stops
+        with VideoWriter(str(tmp_path), "nosound", 24, audio=str(tmp_path / "gone.mp4")) as video:
+            for _ in range(50):
+                video.write(frames)
+            video.close()
+    with pytest.raises(ValueError, match="no frames"):
+        VideoWriter(str(tmp_path), "empty", 24).close()
+    assert os.listdir(tmp_path) == []
