@@ -10,9 +10,11 @@ from dainamo.engine import hf_assets
 
 
 @pytest.fixture
-def hub(monkeypatch):
-    """A stand-in hub: ``cached`` says what the local cache holds; ``online`` whether downloads work."""
+def hub(monkeypatch, tmp_path):
+    """A stand-in hub: ``cached`` says what the local cache holds; ``online`` whether downloads work. Nothing is
+    bundled, so every load goes to the hub."""
     state = {"cached": set(), "online": True, "calls": []}
+    monkeypatch.setattr(hf_assets, "ASSETS_DIR", str(tmp_path / "no-assets"))
 
     def snapshot_download(repo, revision=None, allow_patterns=None, local_files_only=False, token=None):
         state["calls"].append(("snapshot", repo, revision, local_files_only))
@@ -39,6 +41,43 @@ def hub(monkeypatch):
     monkeypatch.setattr(hf_assets, "snapshot_download", snapshot_download)
     monkeypatch.setattr(hf_assets, "hf_hub_download", hf_hub_download)
     return state
+
+
+def test_bundled_files_come_first_and_need_no_hub(hub, monkeypatch, tmp_path):
+    folder = tmp_path / "OpenMOSS-Team--MOSS-Image-SFT"
+    (folder / "tokenizer").mkdir(parents=True)
+    monkeypatch.setattr(hf_assets, "ASSETS_DIR", str(tmp_path))
+    hub["online"] = False
+    assert hf_assets.bundled(hf_assets.MOSS_REPO) == str(folder)
+    assert hf_assets.bundled(hf_assets.MINIMAX_REPO) is None  # not bundled: its license excludes territories
+    assert hf_assets.load_assets(hf_assets.MOSS_REPO, ["tokenizer/*"], lambda p: p, "x") == str(folder)
+    assert hub["calls"] == []
+    # a bundled folder that can't be loaded (a file missing) falls back to the cache, then the hub
+    hub["cached"].add(hf_assets.MOSS_REPO)
+    tries = []
+
+    def load(path):
+        tries.append(path)
+        if path == str(folder):
+            raise OSError("tokenizer.json not found")
+        return "loaded"
+
+    assert hf_assets.load_assets(hf_assets.MOSS_REPO, ["tokenizer/*"], load, "x") == "loaded"
+    assert tries == [str(folder), "/cache/" + hf_assets.MOSS_REPO]
+
+
+def test_the_shipped_assets_match_the_pinned_repos():
+    """The folders in dainamo/assets are there for the repos the loaders bundle, laid out as they read them."""
+    import os
+    for repo, files in {hf_assets.QWEN3VL_REPO: ["tokenizer.json", "config.json"],
+                        hf_assets.MOSS_REPO: ["tokenizer/tokenizer.json", "text_encoder/config.json"],
+                        hf_assets.QWEN_IMAGE_2_REPO: ["processor/tokenizer.json", "text_encoder/config.json",
+                                                      "vae/config.json"]}.items():
+        folder = hf_assets.bundled(repo)
+        assert folder is not None, repo
+        for f in files:
+            assert os.path.getsize(os.path.join(folder, f)) > 0, f"{repo}: {f}"
+    assert hf_assets.bundled(hf_assets.MINIMAX_REPO) is None
 
 
 def test_cached_files_need_no_network(hub):

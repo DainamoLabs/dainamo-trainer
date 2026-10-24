@@ -52,9 +52,20 @@ https://github.com/OpenMOSS/MOSS-Image. Copyright 2026 OpenMOSS.
   `MOSSImageScheduler`, and the latent packing and batch-norm normalisation follow
   `MOSSImagePipeline`. The training sigma distribution implements eq. (4) of the
   MOSS-Image Technical Report.
+- `dainamo/assets/OpenMOSS-Team--MOSS-Image-SFT/`: the release's tokenizer, chat
+  template and text-encoder config, copied unchanged (see `dainamo/assets/README.md`).
 
 Licensed under the Apache License, Version 2.0:
 http://www.apache.org/licenses/LICENSE-2.0
+
+## Qwen3-VL-4B-Instruct (Qwen) — Apache License 2.0
+
+Upstream: https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct. Copyright 2025 The Qwen Team.
+
+- `dainamo/assets/Qwen--Qwen3-VL-4B-Instruct/`: the release's tokenizer and configs,
+  copied unchanged (see `dainamo/assets/README.md`). Krea 2 reads captions with them.
+
+Licensed under the Apache License, Version 2.0 (`dainamo/assets/LICENSE-Apache-2.0.txt`).
 
 ## Qwen-Image 2.1 (Qwen-Image Team, Hugging Face) — Apache License 2.0; weights under the Qwen Research License
 
@@ -77,6 +88,11 @@ The Qwen-Image 2.1 **model weights** are under the Qwen Research License Agreeme
 (research or evaluation) without a separate commercial license from Alibaba's Tongyi Lab. A model
 trained or fine-tuned with Qwen that you distribute must say "Built with Qwen" or "Improved using
 Qwen" in its documentation. Dainamo ships no weights.
+
+`dainamo/assets/Qwen--Qwen-Image-2.1/` holds the release's processor files and its text-encoder and VAE
+configs, copied unchanged and redistributed under section 3 of the Qwen Research License Agreement, with
+its attribution notice in `NOTICE`. Of these, `tokenizer.json`, `vocab.json` and `merges.txt` are byte for
+byte the files of `Qwen/Qwen3-8B` (Apache License 2.0).
 
 ## MiniMax H3 (MiniMax) — MiniMax H3 Community License Agreement
 

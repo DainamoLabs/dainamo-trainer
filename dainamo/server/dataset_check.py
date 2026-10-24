@@ -116,15 +116,16 @@ def _duplicate_groups(hashes: list[tuple[str, int]]) -> list[list[str]]:
 
 @lru_cache(maxsize=1)
 def _tokenizer():
-    """The Qwen3-VL tokenizer, if it's been downloaded already (the families with a caption limit read
+    """The Qwen3-VL tokenizer, bundled with the app or downloaded already (the families with a caption limit read
     captions with Qwen tokenizers); else None, and lengths are estimated."""
     try:
         from huggingface_hub import snapshot_download
         from transformers import AutoTokenizer
 
-        from ..engine.hf_assets import _TOKENIZER_FILES, QWEN3VL_REPO, REVISIONS
-        return AutoTokenizer.from_pretrained(snapshot_download(
-            QWEN3VL_REPO, revision=REVISIONS[QWEN3VL_REPO], allow_patterns=_TOKENIZER_FILES, local_files_only=True))
+        from ..engine.hf_assets import _TOKENIZER_FILES, QWEN3VL_REPO, REVISIONS, bundled
+        folder = bundled(QWEN3VL_REPO) or snapshot_download(
+            QWEN3VL_REPO, revision=REVISIONS[QWEN3VL_REPO], allow_patterns=_TOKENIZER_FILES, local_files_only=True)
+        return AutoTokenizer.from_pretrained(folder)
     except Exception:
         return None
 

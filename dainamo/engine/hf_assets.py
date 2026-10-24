@@ -1,7 +1,9 @@
 """Small Hugging Face assets that ComfyUI single-file models don't carry (tokenizers, chat templates, configs),
 hub-hosted adapters, and the models some features use (DINOv2, Whisper).
 
-Everything is read from the local Hugging Face cache when it's there; Hugging Face is only contacted to
+The families' tokenizers and configs whose licenses allow it ship with the app, in ``dainamo/assets/<owner>--<repo>/``
+at the pinned commit (``ASSETS_DIR``; see its README), so those families run without a network from the start.
+Everything else is read from the local Hugging Face cache when it's there; Hugging Face is only contacted to
 download what isn't cached yet, once, so a job with its files cached runs without a network. The model
 families' repos are pinned to a commit, so their files can't change under a project when a repo is updated."""
 
@@ -11,6 +13,11 @@ import os
 from functools import lru_cache
 
 from huggingface_hub import hf_hub_download, snapshot_download
+
+# the bundled copies of some repos' small files, laid out like the repos: Qwen3-VL-4B and MOSS-Image (Apache 2.0),
+# Qwen-Image 2.1 (redistributable under the Qwen Research License, with the notice in NOTICE). MiniMax H3's aren't:
+# its license excludes several territories outright
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")
 
 QWEN3VL_REPO = "Qwen/Qwen3-VL-4B-Instruct"
 MOSS_REPO = "OpenMOSS-Team/MOSS-Image-SFT"
@@ -33,10 +40,23 @@ def _download_failed(what: str, repo: str, error: Exception) -> RuntimeError:
                         "then start again; they're kept after that.")
 
 
+def bundled(repo: str) -> str | None:
+    """The folder of ``repo``'s files that ship with the app (``ASSETS_DIR``), or None when they don't."""
+    path = os.path.join(ASSETS_DIR, repo.replace("/", "--"))
+    return path if os.path.isdir(path) else None
+
+
 def load_assets(repo: str, patterns: list[str], load, what: str):
-    """``load(folder)`` on the files of ``repo`` matching ``patterns`` at its pinned commit: from the cache
-    when they're all there (``load`` fails on a missing one), else downloaded first."""
+    """``load(folder)`` on the files of ``repo`` matching ``patterns`` at its pinned commit: the bundled copies
+    (``bundled``), else from the cache when they're all there (``load`` fails on a missing one), else downloaded
+    first."""
     revision = REVISIONS[repo]
+    folder = bundled(repo)
+    if folder is not None:
+        try:
+            return load(folder)
+        except OSError:  # a bundled file is missing or damaged: the hub has the same ones
+            pass
     try:
         return load(snapshot_download(repo, revision=revision, allow_patterns=patterns, local_files_only=True))
     except OSError:  # not cached, or only partly

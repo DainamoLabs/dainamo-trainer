@@ -20,6 +20,7 @@ dainamo/
     transcribe.py         Whisper speech-to-text for Auto-Caption (a subprocess)
     textgen.py            text encoders that write captions, and their OpenAI-style server
     hf_assets.py          tokenizers and configs from Hugging Face, pinned to a commit
+  assets/                 bundled copies of those for the families whose licenses allow it (see its README)
     families/             one driver per model family
       base.py             driver interface
       krea2/              Krea 2 model + driver

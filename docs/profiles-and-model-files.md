@@ -64,13 +64,16 @@ subfolder for its kind, so ComfyUI sees it too. You can choose another folder.
 New releases appear only once they're added to the family's driver
 (`downloads`).
 
-## Files fetched on first use
+## Files bundled, and files fetched on first use
 
 Most families also need a tokenizer, chat template and configs from their
-Hugging Face repo. They're downloaded the first time a job or the Sandbox uses
-the family, then read from the Hugging Face cache, so jobs run offline. The same
-goes for DINOv2 (concept bleed), Whisper, and a training adapter given as
-`owner/repo/file`. LTX 2.5 and YuE2 need none.
+Hugging Face repo. Krea 2's, MOSS-Image's and Qwen-Image 2.1's ship with the
+app (`dainamo/assets/`, about 45 MB), so those families run without a network
+from the first job. MiniMax H3's are downloaded the first time a job or the
+Sandbox uses it, then read from the Hugging Face cache, so later jobs run
+offline: its license doesn't allow bundling them. The same goes for DINOv2
+(concept bleed), Whisper, and a training adapter given as `owner/repo/file`.
+LTX 2.5 and YuE2 need none.
 
 Each repo is pinned to a commit (`REVISIONS` in `dainamo/engine/hf_assets.py`),
 so an update can't change how captions are read partway through a project.
