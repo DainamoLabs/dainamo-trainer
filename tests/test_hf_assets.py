@@ -72,12 +72,27 @@ def test_the_shipped_assets_match_the_pinned_repos():
     for repo, files in {hf_assets.QWEN3VL_REPO: ["tokenizer.json", "config.json"],
                         hf_assets.MOSS_REPO: ["tokenizer/tokenizer.json", "text_encoder/config.json"],
                         hf_assets.QWEN_IMAGE_2_REPO: ["processor/tokenizer.json", "text_encoder/config.json",
-                                                      "vae/config.json"]}.items():
+                                                      "vae/config.json"],
+                        hf_assets.QWEN3_REPOS["4B"]: ["tokenizer.json", "tokenizer_config.json", "config.json"],
+                        hf_assets.QWEN3_REPOS["8B"]: ["tokenizer.json", "tokenizer_config.json", "config.json"]}.items():
         folder = hf_assets.bundled(repo)
         assert folder is not None, repo
         for f in files:
             assert os.path.getsize(os.path.join(folder, f)) > 0, f"{repo}: {f}"
     assert hf_assets.bundled(hf_assets.MINIMAX_REPO) is None
+
+
+def test_the_bundled_qwen3_text_encoders_are_the_ones_flux2_klein_reads():
+    """FLUX.2 Klein's two text encoders: the configs are the sizes the DiTs take (3 x 2560 and 3 x 4096 wide), and
+    the chat template turns thinking off as the reference prompts it."""
+    tok4, cfg4 = hf_assets.qwen3_tokenizer_and_config("4B")
+    tok8, cfg8 = hf_assets.qwen3_tokenizer_and_config("8B")
+    assert (cfg4.model_type, cfg4.hidden_size, cfg4.num_hidden_layers) == ("qwen3", 2560, 36)
+    assert (cfg8.model_type, cfg8.hidden_size, cfg8.num_hidden_layers) == ("qwen3", 4096, 36)
+    text = tok4.apply_chat_template([{"role": "user", "content": "a cat"}], tokenize=False,
+                                    add_generation_prompt=True, enable_thinking=False)
+    assert text == "<|im_start|>user\na cat<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    assert tok8(text)["input_ids"] == tok4(text)["input_ids"]
 
 
 def test_cached_files_need_no_network(hub):

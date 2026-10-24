@@ -235,6 +235,71 @@ def test_real_unquantized_tensors_identical():
         assert rel_err(a, b) < 0.05, n
 
 
+# ---------------------------------------------------------- sharded files ---
+def _shard(tiny_file, folder, header_meta: bool = False):
+    """The tiny file split as Hugging Face shards it: two files and a model.safetensors.index.json. With
+    ``header_meta``, each shard declares its quantized layers in its header instead of comfy_quant markers."""
+    from safetensors.torch import load_file
+
+    path, _ = tiny_file
+    sd = load_file(path)
+    if header_meta:
+        layers = {k[: -len(".comfy_quant")]: json.loads(bytes(v.tolist())) for k, v in sd.items()
+                  if k.endswith(".comfy_quant")}
+        sd = {k: v for k, v in sd.items() if not k.endswith(".comfy_quant")}
+    first = {k: v for k, v in sd.items() if k.startswith(("a.", "emb."))}
+    parts = {"model-00001-of-00002.safetensors": first,
+             "model-00002-of-00002.safetensors": {k: v for k, v in sd.items() if k not in first}}
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, part in parts.items():
+        meta = None
+        if header_meta:
+            mine = {p: c for p, c in layers.items() if f"{p}.weight" in part}
+            meta = {"_quantization_metadata": json.dumps({"format_version": "1.0", "layers": mine})}
+        save_file(part, str(folder / name), metadata=meta)
+    index = {"metadata": {"total_size": 0}, "weight_map": {k: n for n, part in parts.items() for k in part}}
+    (folder / comfy_io.INDEX_NAME).write_text(json.dumps(index))
+    return sd
+
+
+@pytest.mark.parametrize("header_meta", [False, True])
+def test_a_sharded_checkpoint_loads_as_one_file(tiny_file, tmp_path, header_meta):
+    """A Hugging Face folder of shards, its index, or a cache folder's main snapshot: the same tensors and quantized
+    layers as the single file, from either shard."""
+    path, _ = tiny_file
+    snap = tmp_path / "models--owner--repo" / "snapshots" / "abc123"
+    _shard(tiny_file, snap, header_meta)
+    (tmp_path / "models--owner--repo" / "refs").mkdir()
+    (tmp_path / "models--owner--repo" / "refs" / "main").write_text("abc123")
+    single = load_state_dict(path)
+    for where in (snap, snap / comfy_io.INDEX_NAME, tmp_path / "models--owner--repo"):
+        assert comfy_io.is_sharded(str(where))
+        assert [os.path.basename(p) for p in comfy_io.shard_files(str(where))] == [
+            "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+        loaded = load_state_dict(str(where))
+        assert loaded.tensors.keys() == single.tensors.keys()
+        assert all(torch.equal(loaded.tensors[k], single.tensors[k]) for k in single.tensors)
+        assert {k: (q.format, q.rot_size) for k, q in loaded.quant.items()} == \
+            {k: (q.format, q.rot_size) for k, q in single.quant.items()}
+        assert sorted(comfy_io.read_header(str(where))[0]) == sorted(
+            k for k in comfy_io.read_header(path)[0] if not (header_meta and k.endswith(".comfy_quant")))
+        assert comfy_io.describe_quant(str(where)) == comfy_io.describe_quant(path)
+        part = load_state_dict(str(where), include=("c.",))  # from the second shard only
+        assert set(part.tensors) == {"c.weight"} and set(part.quant) == {"c"}
+    assert not comfy_io.is_sharded(path) and comfy_io.shard_files(path) == [path]
+
+
+def test_a_folder_of_one_unindexed_file(tmp_path):
+    folder = tmp_path / "repo"
+    folder.mkdir()
+    save_file({"x.weight": torch.ones(2, 2)}, str(folder / "model.safetensors"))
+    assert comfy_io.shard_files(str(folder)) == [str(folder / "model.safetensors")]
+    assert torch.equal(load_state_dict(str(folder)).tensors["x.weight"], torch.ones(2, 2))
+    (tmp_path / "empty").mkdir()
+    with pytest.raises(FileNotFoundError, match="no .safetensors"):
+        comfy_io.shard_files(str(tmp_path / "empty"))
+
+
 # ------------------------------------------------------- format edge cases ---
 def test_legacy_fp8_scaled_names(tmp_path):
     """Older ComfyUI fp8_scaled files: ``scale_weight`` + a root ``scaled_fp8`` marker."""

@@ -498,7 +498,9 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
   const triggers = chosen.map((c) => c.d.trigger).filter(Boolean);
   // blank seeds walk: Seed + the card's position among the cards that have a prompt (as the trainer does)
   const seedFor = (i: number) => s.sample_seed + cards.slice(0, i).filter((c) => c.prompt.trim()).length;
-  const sampler = profile ? `${profile.data.sample_steps ?? "?"} steps at CFG ${profile.data.sample_cfg ?? "?"}` : "";
+  // a blank steps or CFG field means the family's own default for the profile (e.g. FLUX.2 Klein's variant)
+  const sampler = profile ? [profile.data.sample_steps ? `${profile.data.sample_steps} steps` : "the default steps",
+    profile.data.sample_cfg ? `CFG ${profile.data.sample_cfg}` : "the default CFG"].join(" at ") : "";
   // the profile's variant (its field's default when blank), which decides the workflows it has
   const variant = String(profile?.data?.variant || family?.profile_fields.find((f) => f.key === "variant")?.default || "");
   const forVariant = (w: { variants: string[] | null }) => !w.variants || w.variants.includes(variant);

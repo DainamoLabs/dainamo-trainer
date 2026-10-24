@@ -82,9 +82,14 @@ def _header(path: str, mtime: float) -> dict[str, tuple[str, tuple[int, ...]]]:
 
 
 def tensors(path: str) -> dict[str, tuple[str, tuple[int, ...]]]:
-    """{key: (safetensors dtype, shape)} from a .safetensors header."""
-    path = os.path.expanduser(path)
-    return _header(path, os.path.getmtime(path))
+    """{key: (safetensors dtype, shape)} from a .safetensors header, or the headers of every shard of a sharded
+    checkpoint (a folder or an index file, ``comfy_io.shard_files``)."""
+    from .comfy_io import shard_files
+
+    out: dict[str, tuple[str, tuple[int, ...]]] = {}
+    for p in shard_files(os.path.expanduser(path)):
+        out.update(_header(p, os.path.getmtime(p)))
+    return out
 
 
 def _numel(shape) -> int:
@@ -247,8 +252,10 @@ def _vae_work(spec: tuple[float, float], pixels: int, cap: int | None = None) ->
 
 
 def vae_bytes(driver_cls, profile: dict) -> int:
-    """The VAE(s) on the GPU, including one bundled in the diffusion-model file."""
-    total = sum(file_gpu_bytes(profile.get(f, "")) for f in ("vae", "audio_vae"))
+    """The VAE(s) on the GPU, including one bundled in the diffusion-model file; in fp32 for a family that runs it
+    so (``vae_fp32``)."""
+    fp32 = ("",) if getattr(driver_cls, "vae_fp32", False) else ()  # "" is in every key
+    total = sum(file_gpu_bytes(profile.get(f, ""), fp32=fp32) for f in ("vae", "audio_vae"))
     if "vae" in driver_cls.bundled:
         total += bundled_bytes(profile["diffusion_model"], *driver_cls.bundled["vae"])
     return total

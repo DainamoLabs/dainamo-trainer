@@ -19,14 +19,14 @@ reference pipeline (``pipeline_moss_image.py``, Apache-2.0) and the MOSS-Image t
 
 from __future__ import annotations
 
-import gc
-
 import torch
 
 from ... import comfy_io
 from ...fp8_linear import assert_materialized, materialize
 from ...hf_assets import moss_tokenizer_and_config
+from .. import flux2_vae
 from ..base import Download, FamilyDriver, FamilyInfo, MemoryProfile, ProfileField, count_blocks
+from ..flux2_vae import Flux2VAE, pack_latents, unpack_latents  # noqa: F401  (the packing is MOSS's too)
 from .model import MossConfig, MossImageDiT
 
 # where the model manager downloads the files from, at the commit they were checked against
@@ -73,26 +73,6 @@ def sampling_sigmas(steps: int, shift: float) -> torch.Tensor:
     return torch.cat([torch.unique_consecutive(training[nearest]), torch.zeros(1)])
 
 
-def pack_latents(z: torch.Tensor) -> torch.Tensor:
-    """(B, 32, 2h, 2w) -> (B, 128, h, w), channel = c * 4 + 2 * dy + dx."""
-    b, c, h, w = z.shape
-    return z.view(b, c, h // 2, 2, w // 2, 2).permute(0, 1, 3, 5, 2, 4).reshape(b, c * 4, h // 2, w // 2)
-
-
-def unpack_latents(z: torch.Tensor) -> torch.Tensor:
-    b, c, h, w = z.shape
-    return z.reshape(b, c // 4, 2, 2, h, w).permute(0, 1, 4, 2, 5, 3).reshape(b, c // 4, 2 * h, 2 * w)
-
-
-def _decoder_channels(sd: dict[str, torch.Tensor]) -> list[int] | None:
-    """Decoder widths in encoder order, read from the weights (FLUX.2 VAEs ship full or slim decoders)."""
-    bfl = [sd.get(f"decoder.up.{i}.block.0.conv2.weight") for i in range(4)]
-    if all(t is not None for t in bfl):
-        return [int(t.shape[0]) for t in bfl]
-    dif = [sd.get(f"decoder.up_blocks.{i}.resnets.0.conv2.weight") for i in range(4)]
-    if all(t is not None for t in dif):
-        return [int(t.shape[0]) for t in reversed(dif)]
-    return None
 
 
 class MossImageDriver(FamilyDriver):
@@ -129,6 +109,7 @@ class MossImageDriver(FamilyDriver):
         # 5.1B weights: 10.2 GB in bf16, with Adafactor's factored state beside them
         finetune={"learning_rate": 1e-5, "optimizer": "adafactor", "keep_last": 2},
     )
+    vae_fp32 = True  # the FLUX.2 VAE runs in fp32 (``flux2_vae``)
     bucket_divisibility = 16  # VAE /8, then 2x2 packing
     caption_tokens = MAX_TEXT_TOKENS
     block_list = "layers"
@@ -203,46 +184,17 @@ class MossImageDriver(FamilyDriver):
 
     # --- vae --------------------------------------------------------------
     def load_vae(self):
-        from diffusers import AutoencoderKLFlux2
-        from diffusers.loaders.single_file_utils import convert_ldm_vae_checkpoint
+        self.vae = Flux2VAE(self.profile["vae"], self.device, self.log)
 
-        path = self.profile["vae"]
-        self.log(f"Loading VAE {path}")
-        sd = comfy_io.dequantize_all(comfy_io.load_state_dict(path), torch.float32)
-        vae = AutoencoderKLFlux2(decoder_block_out_channels=_decoder_channels(sd))
-        if not any(k.startswith("encoder.down_blocks.") for k in sd):  # BFL layout -> diffusers names
-            conv = convert_ldm_vae_checkpoint(sd, vae.config)
-            for new, old in (("quant_conv", "encoder.quant_conv"), ("post_quant_conv", "decoder.post_quant_conv")):
-                for p in ("weight", "bias"):
-                    if f"{old}.{p}" in sd:
-                        conv[f"{new}.{p}"] = sd[f"{old}.{p}"]
-            conv.update({k: v for k, v in sd.items() if k.startswith("bn.")})
-            sd = conv
-        result = vae.load_state_dict(sd, strict=False)
-        missing = [k for k in result.missing_keys if not k.endswith("num_batches_tracked")]
-        if missing or result.unexpected_keys:
-            raise ValueError(f"{path} isn't a FLUX.2 VAE: missing={missing[:6]} unexpected={result.unexpected_keys[:6]}")
-        # the reference runs the VAE in fp32; it's small
-        self.vae = vae.to(self.device, torch.float32).eval().requires_grad_(False)
-        eps = self.vae.config.batch_norm_eps
-        self._bn_mean = self.vae.bn.running_mean.float().view(1, -1, 1, 1)
-        self._bn_std = (self.vae.bn.running_var.float() + eps).sqrt().view(1, -1, 1, 1)
-
-    @torch.no_grad()
     def encode_image(self, pixels: torch.Tensor) -> torch.Tensor:
-        z = self.vae.encode(pixels.to(self.device, torch.float32)).latent_dist.mode()
-        z = (pack_latents(z) - self._bn_mean) / self._bn_std
-        return z[0].to("cpu", torch.float32)  # (128, H/16, W/16)
+        return self.vae.encode(pixels)  # (128, H/16, W/16): packed and normalised
 
-    @torch.no_grad()
     def decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        z = latents.to(self.device, torch.float32) * self._bn_std + self._bn_mean
-        return self.vae.decode(unpack_latents(z)).sample.float().clamp(-1, 1)
+        return self.vae.decode(latents)
 
     def unload_vae(self):
         self.vae = None
-        gc.collect()
-        torch.cuda.empty_cache()
+        flux2_vae.unload(None)
 
     # --- transformer --------------------------------------------------------
     def build_transformer(self, shapes):

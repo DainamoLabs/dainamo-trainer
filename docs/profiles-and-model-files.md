@@ -64,6 +64,11 @@ subfolder for its kind, so ComfyUI sees it too. You can choose another folder.
 New releases appear only once they're added to the family's driver
 (`downloads`).
 
+A text encoder can also be a Hugging Face folder of shards (one with
+`model.safetensors.index.json`, or a `models--owner--repo` folder of the
+Hugging Face cache): type its path into the profile. FLUX.2 Klein's Qwen3-4B
+and Qwen3-8B load that way straight from `Qwen/Qwen3-4B` and `Qwen/Qwen3-8B`.
+
 ## Files bundled, and files fetched on first use
 
 Most families also need a tokenizer, chat template and configs from their

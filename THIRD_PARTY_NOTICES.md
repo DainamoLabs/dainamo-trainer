@@ -94,6 +94,41 @@ configs, copied unchanged and redistributed under section 3 of the Qwen Research
 its attribution notice in `NOTICE`. Of these, `tokenizer.json`, `vocab.json` and `merges.txt` are byte for
 byte the files of `Qwen/Qwen3-8B` (Apache License 2.0).
 
+## FLUX.2 (Black Forest Labs) — Apache License 2.0; Klein 9B weights under the FLUX Non-Commercial License
+
+Upstream: https://github.com/black-forest-labs/flux2 (the reference inference code, Apache License 2.0,
+Copyright 2025 Black Forest Labs Inc.), at commit `50fe5162777813d869182b139e83b10743caef15`.
+
+- `dainamo/engine/families/flux2_klein/model.py`: the FLUX.2 Klein transformer, ported from `src/flux2/model.py`
+  (the KV-cache inference paths left out; one forward with the reference tokens' own attention).
+- `dainamo/engine/families/flux2_klein/driver.py`: Dainamo's own. The text embedding (Qwen3 layers 9, 18, 27 of a
+  512-token chat prompt), token ids, reference time offsets and the sampling schedule follow `text_encoder.py`
+  and `sampling.py`; diffusers' `Flux2KleinPipeline` (Apache License 2.0) was the second reference.
+- `tests/test_flux2_klein.py` checks the port against small copies of the reference's classes, as its docstring says.
+
+The FLUX.2 Klein 4B **weights** (Base and distilled) are Apache License 2.0. The 9B weights are under the FLUX
+Non-Commercial License v2.1 (copy in `dainamo/engine/families/flux2_klein/FLUX_NON_COMMERCIAL_LICENSE.txt`):
+non-commercial and non-production use only; a LoRA trained on them is a derivative under it. Dainamo ships no weights.
+
+## FLUX 3 Image Klein (Black Forest Labs) — Apache License 2.0; weights under the FLUX Kommunity License
+
+Upstream: https://github.com/black-forest-labs/flux-3-image-klein (the reference inference code, Apache License
+2.0, Copyright 2026 Black Forest Labs, Inc.), at commit `bfc8889a4497f846416f253a3972a1941ac698b9`.
+
+- `dainamo/engine/families/flux3_klein/model.py`: the DiT, ported from `src/flux3/dit.py`. Changes: q/k/v fused
+  into one `qkv` Linear (ComfyUI's checkpoint layout), modulation computed once per sample, per-block gradient
+  checkpointing, empty modes skipped instead of given a placeholder token.
+- `dainamo/engine/families/flux3_klein/driver.py`: Dainamo's own. The text embedding (Qwen3-VL-4B layers 4 to 32,
+  padded to a multiple of 80 tokens), token ids and RoPE scale, reference layout and size caps, and the
+  alpha-16 schedule follow `text_encoder.py`, `pipeline.py`, `sampling.py` and `autoencoder.py`.
+- `tests/test_flux3_klein.py` checks the port against small copies of the reference's DiT, packing and schedule,
+  as its docstring says.
+
+The FLUX 3 Image Klein **weights** are under the FLUX Kommunity License v1.0 (copy in
+`dainamo/engine/families/flux3_klein/FLUX_KOMMUNITY_LICENSE.txt`): non-commercial use, and commercial use of the
+images for Qualifying Users (under US$5M in yearly revenue) with content filtering or review. A LoRA is a
+derivative: it travels with the license and its attribution notice, marked as modified. Dainamo ships no weights.
+
 ## MiniMax H3 (MiniMax) — MiniMax H3 Community License Agreement
 
 Upstream: https://huggingface.co/MiniMaxAI/MiniMax-H3. Architecture code ported via ai-toolkit

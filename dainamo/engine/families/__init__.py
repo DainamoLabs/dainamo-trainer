@@ -1,6 +1,8 @@
 """Registry of model families."""
 
 from .base import FamilyDriver
+from .flux2_klein.driver import Flux2KleinDriver
+from .flux3_klein.driver import Flux3KleinDriver
 from .krea2.driver import Krea2Driver
 from .ltx2.driver import LTX25Driver
 from .minimax_h3.driver import MinimaxH3Driver
@@ -10,6 +12,8 @@ from .yue2.driver import YuE2Driver
 
 FAMILIES: dict[str, type[FamilyDriver]] = {
     Krea2Driver.info.id: Krea2Driver,
+    Flux2KleinDriver.info.id: Flux2KleinDriver,
+    Flux3KleinDriver.info.id: Flux3KleinDriver,
     MossImageDriver.info.id: MossImageDriver,
     MinimaxH3Driver.info.id: MinimaxH3Driver,
     QwenImage2Driver.info.id: QwenImage2Driver,

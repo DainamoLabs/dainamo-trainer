@@ -14,7 +14,8 @@ from functools import lru_cache
 
 from huggingface_hub import hf_hub_download, snapshot_download
 
-# the bundled copies of some repos' small files, laid out like the repos: Qwen3-VL-4B and MOSS-Image (Apache 2.0),
+# the bundled copies of some repos' small files, laid out like the repos: Qwen3-VL-4B, Qwen3-4B, Qwen3-8B and MOSS-Image
+# (Apache 2.0),
 # Qwen-Image 2.1 (redistributable under the Qwen Research License, with the notice in NOTICE). MiniMax H3's aren't:
 # its license excludes several territories outright
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")
@@ -23,12 +24,16 @@ QWEN3VL_REPO = "Qwen/Qwen3-VL-4B-Instruct"
 MOSS_REPO = "OpenMOSS-Team/MOSS-Image-SFT"
 MINIMAX_REPO = "MiniMaxAI/MiniMax-H3"
 QWEN_IMAGE_2_REPO = "Qwen/Qwen-Image-2.1"
+# FLUX.2 Klein's text encoders: Qwen3-4B for the 4B, Qwen3-8B for the 9B
+QWEN3_REPOS = {"4B": "Qwen/Qwen3-4B", "8B": "Qwen/Qwen3-8B"}
 # the commits the families are built against (later ones, so far, only changed READMEs)
 REVISIONS = {
     QWEN3VL_REPO: "ebb281ec70b05090aa6165b016eac8ec08e71b17",
     MOSS_REPO: "2c7954437269461767f533b006823e8f85973a60",
     MINIMAX_REPO: "42ed227ee7df40d41602854ae760620d6eb651fe",
     QWEN_IMAGE_2_REPO: "d26bb61231c349cf6b7896fa83353113880e1ba3",
+    QWEN3_REPOS["4B"]: "1cfa9a7208912126459214e8b04321603b3df60c",
+    QWEN3_REPOS["8B"]: "b968826d9c46dd6066d109eabc6255188de91218",
 }
 _TOKENIZER_FILES = ["config.json", "tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt",
                     "generation_config.json"]
@@ -87,6 +92,17 @@ def qwen3vl_tokenizer_and_config():
     return load_assets(QWEN3VL_REPO, _TOKENIZER_FILES,
                        lambda path: (AutoTokenizer.from_pretrained(path), AutoConfig.from_pretrained(path)),
                        "The Qwen3-VL tokenizer and config")
+
+
+@lru_cache(maxsize=2)
+def qwen3_tokenizer_and_config(size: str):
+    """Qwen3 tokenizer + chat template and the model config of ``size`` ("4B" or "8B")."""
+    from transformers import AutoConfig, AutoTokenizer
+
+    repo = QWEN3_REPOS[size]
+    return load_assets(repo, _TOKENIZER_FILES,
+                       lambda path: (AutoTokenizer.from_pretrained(path), AutoConfig.from_pretrained(path)),
+                       f"The Qwen3-{size} tokenizer and config")
 
 
 @lru_cache(maxsize=1)

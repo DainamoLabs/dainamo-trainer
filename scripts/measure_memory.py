@@ -44,6 +44,10 @@ def dummy(family: str, w: int, h: int, frames: int):
         return {"latent": torch.randn(16, h // 8, w // 8)}, {"text": torch.randn(TEXT, 12, 2560, dtype=bf)}, {}
     if family == "moss_image":
         return {"latent": torch.randn(128, h // 16, w // 16)}, {"text": torch.randn(TEXT, 4096, dtype=bf)}, {}
+    if family == "flux3_klein":  # Qwen3-VL-4B's 8 layers side by side, padded to a multiple of 80 tokens
+        return {"latent": torch.randn(128, h // 16, w // 16)}, {"text": torch.randn(320, 20480, dtype=bf)}, {}
+    if family == "flux2_klein":  # Qwen3's 3 layers side by side (the 4B's width), always 512 tokens
+        return {"latent": torch.randn(128, h // 16, w // 16)}, {"text": torch.randn(512, 7680, dtype=bf)}, {}
     if family == "qwen_image_2":
         cond = {"embeds": torch.randn(TEXT, 4096, dtype=bf), "slots": torch.zeros(TEXT, dtype=torch.bool)}
         return {"latent": torch.randn(64, h // 16, w // 16), "refs": []}, {"text": cond}, {}

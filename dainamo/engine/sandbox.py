@@ -181,7 +181,8 @@ class Session:
             from .memory import streamed_text_encoder
             resident, _, inflight = streamed_text_encoder(self.driver, self.driver.profile["text_encoder"])
             return resident + inflight + 1.5e9
-        return os.path.getsize(self.driver.profile["text_encoder"]) * 1.25 + 1.5e9
+        from .comfy_io import shard_files  # a single file, or a Hugging Face folder of shards
+        return sum(os.path.getsize(p) for p in shard_files(self.driver.profile["text_encoder"])) * 1.25 + 1.5e9
 
     @staticmethod
     def _bytes(module) -> int:

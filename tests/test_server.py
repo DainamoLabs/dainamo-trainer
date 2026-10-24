@@ -174,9 +174,11 @@ def test_profile_check_tells_text_encoders_and_vaes_apart(tmp_path):
 
     krea, qwen = get_family("krea2"), get_family("qwen_image_2")
     key = "model.layers.35.mlp.down_proj.weight"
-    te4 = _header_only(tmp_path / "te4.safetensors", {key: ("I8", (2560, 9728))})
-    te4_nvfp4 = _header_only(tmp_path / "te4fp4.safetensors", {key: ("U8", (2560, 4864))})  # two codes per byte
+    vis = {"model.visual.blocks.0.attn.qkv.weight": ("BF16", (8, 8))}  # Qwen3-VL's vision tower (plain Qwen3 has none)
+    te4 = _header_only(tmp_path / "te4.safetensors", {key: ("I8", (2560, 9728)), **vis})
+    te4_nvfp4 = _header_only(tmp_path / "te4fp4.safetensors", {key: ("U8", (2560, 4864)), **vis})  # two codes per byte
     te8 = _header_only(tmp_path / "te8.safetensors", {key: ("I8", (4096, 12288))})
+    te4_plain = _header_only(tmp_path / "te4plain.safetensors", {key: ("I8", (2560, 9728))})  # Qwen3-4B: the same size
     rgb = _header_only(tmp_path / "rgb.safetensors", {"decoder.head.2.weight": ("BF16", (3, 96, 3, 3, 3))})
 
     def check(F, field, path):
@@ -185,6 +187,9 @@ def test_profile_check_tells_text_encoders_and_vaes_apart(tmp_path):
     assert check(krea, "text_encoder", te4_nvfp4)["level"] == "ok"
     bad = check(krea, "text_encoder", te8)
     assert bad["level"] == "error" and "Qwen3-VL-4B" in bad["message"]
+    assert check(krea, "text_encoder", te4_plain)["level"] == "error"  # FLUX.2 Klein's Qwen3-4B isn't Qwen3-VL-4B
+    assert check(get_family("flux3_klein"), "text_encoder", te4_plain)["level"] == "error"
+    assert check(get_family("flux3_klein"), "text_encoder", te4)["level"] == "ok"
     assert check(qwen, "text_encoder", te8)["level"] == "error"  # no vision tower in this file
     assert check(krea, "vae", rgb)["level"] == "ok"
     rgba = _header_only(tmp_path / "rgba.safetensors", {"decoder.head.2.weight": ("BF16", (4, 144, 1, 3, 3))})

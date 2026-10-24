@@ -64,8 +64,9 @@ def test_files_are_found_by_what_is_in_them(client, tmp_path):
     (models / "loras").mkdir()
     header_only_safetensors(models / "unet" / "my krea.safetensors",
                             {"blocks.27.attn.wq.weight": ("BF16", (8, 8)), "txtfusion.projector.weight": ("BF16", (8, 8))})
-    header_only_safetensors(models / "clip" / "te.safetensors",
-                            {"model.layers.35.mlp.down_proj.weight": ("I8", (2560, 9728))})  # Krea's 4B
+    header_only_safetensors(models / "clip" / "te.safetensors",  # Krea's Qwen3-VL-4B: its size, and a vision tower
+                            {"model.layers.35.mlp.down_proj.weight": ("I8", (2560, 9728)),
+                             "model.visual.blocks.0.attn.qkv.weight": ("BF16", (8, 8))})
     header_only_safetensors(models / "loras" / "style.safetensors", {"lora_A.weight": ("BF16", (4, 8))})
     (models / "loras" / "notes.txt").write_text("not a model")
     client.put("/api/settings", json={"models": {"folder": str(models)}})

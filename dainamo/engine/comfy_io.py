@@ -20,11 +20,17 @@ few simple conventions, which are handled here without any ComfyUI code:
 
 ``load_state_dict`` returns plain tensors plus a ``QuantLayer`` map so callers can
 either dequantize everything or keep weights quantized (see ``fp8_linear``).
+
+A model path can also be a Hugging Face sharded checkpoint: its ``model.safetensors.index.json``, the folder
+holding it (or a folder of .safetensors files), or a Hugging Face cache folder (``models--owner--repo``, read at
+the snapshot ``refs/main`` names). ``shard_files`` lists the files; ``read_header``, ``describe_quant`` and
+``load_state_dict`` read them all as one model.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 
 import torch
@@ -124,13 +130,61 @@ class LoadedWeights:
     metadata: dict[str, str] = field(default_factory=dict)
 
 
+INDEX_NAME = "model.safetensors.index.json"
+
+
+def shard_files(path: str) -> list[str]:
+    """The .safetensors files of a model path: the file itself; the shards a Hugging Face index
+    (``*.safetensors.index.json``) lists; for a folder, the shards of its ``model.safetensors.index.json``, else
+    its .safetensors files. A Hugging Face cache folder (``models--owner--repo``, with ``snapshots/`` and
+    ``refs/main``) means its main snapshot."""
+    path = os.path.expanduser(path)
+    if os.path.isdir(path):
+        ref = os.path.join(path, "refs", "main")
+        if os.path.isfile(ref) and os.path.isdir(os.path.join(path, "snapshots")):
+            with open(ref) as f:
+                path = os.path.join(path, "snapshots", f.read().strip())
+        if not os.path.isfile(os.path.join(path, INDEX_NAME)):
+            files = sorted(n for n in os.listdir(path) if n.endswith(".safetensors"))
+            if not files:
+                raise FileNotFoundError(f"{path} holds no .safetensors files")
+            return [os.path.join(path, n) for n in files]
+        path = os.path.join(path, INDEX_NAME)
+    if path.endswith(".index.json"):
+        with open(path) as f:
+            weight_map = json.load(f)["weight_map"]
+        folder = os.path.dirname(path)
+        return [os.path.join(folder, n) for n in sorted(set(weight_map.values()))]
+    return [path]
+
+
+def is_sharded(path: str) -> bool:
+    """Whether a model path is a folder or an index of shards rather than one .safetensors file."""
+    path = os.path.expanduser(path)
+    return os.path.isdir(path) or path.endswith(".index.json")
+
+
 def read_header(path: str) -> tuple[list[str], dict[str, str]]:
-    with safe_open(path, "pt") as f:
-        return list(f.keys()), dict(f.metadata() or {})
+    """(tensor names, header metadata) of a file, or of every shard of a sharded checkpoint (``shard_files``)."""
+    keys: list[str] = []
+    metadata: dict[str, str] = {}
+    for p in shard_files(path):
+        with safe_open(p, "pt") as f:
+            keys += f.keys()
+            metadata.update(_merged_metadata(metadata, dict(f.metadata() or {})))
+    return keys, metadata
+
+
+def _merged_metadata(seen: dict[str, str], new: dict[str, str]) -> dict[str, str]:
+    """A shard's header metadata to add to ``seen``, with the shards' per-layer quantization info joined."""
+    layers = {**_header_quant(seen), **_header_quant(new)}
+    if layers and "_quantization_metadata" in seen and "_quantization_metadata" in new:
+        new = {**new, "_quantization_metadata": json.dumps({"format_version": "1.0", "layers": layers})}
+    return new
 
 
 def describe_quant(path: str) -> tuple[set[str], set[str]]:
-    """Cheaply list the quantization formats in a file: (supported labels, unsupported formats)."""
+    """Cheaply list the quantization formats in a file (or every shard): (supported labels, unsupported formats)."""
     labels, unsupported = set(), set()
 
     def note(conf: dict):
@@ -140,20 +194,21 @@ def describe_quant(path: str) -> tuple[set[str], set[str]]:
         else:
             labels.add(QuantLayer(fmt, rot_size=256 if conf.get("convrot") else 1).label)
 
-    with safe_open(path, "pt") as f:
-        keys = list(f.keys())
-        markers = [k for k in keys if k.endswith(".comfy_quant")]
-        for k in markers:
-            note(_parse_quant_blob(f.get_tensor(k)))
-        for conf in _header_quant(dict(f.metadata() or {})).values():
-            note(conf)
-        if not markers:
-            for k in keys:
-                if k.endswith((".weight_scale", ".scale_weight")):
-                    w = k.rsplit(".", 1)[0] + ".weight"
-                    dt = f.get_slice(w).get_dtype() if w in keys else ""
-                    labels.add("int8" if dt == "I8" else "fp8 scaled")
-                    break
+    for p in shard_files(path):
+        with safe_open(p, "pt") as f:
+            keys = list(f.keys())
+            markers = [k for k in keys if k.endswith(".comfy_quant")]
+            for k in markers:
+                note(_parse_quant_blob(f.get_tensor(k)))
+            for conf in _header_quant(dict(f.metadata() or {})).values():
+                note(conf)
+            if not markers:
+                for k in keys:
+                    if k.endswith((".weight_scale", ".scale_weight")):
+                        w = k.rsplit(".", 1)[0] + ".weight"
+                        dt = f.get_slice(w).get_dtype() if w in keys else ""
+                        labels.add("int8" if dt == "I8" else "fp8 scaled")
+                        break
     return labels, unsupported
 
 
@@ -171,7 +226,8 @@ def _parse_quant_blob(blob: torch.Tensor) -> dict:
 def load_state_dict(path: str, strip_prefix: str | None = None, skip_prefixes: tuple[str, ...] = (),
                     include: tuple[str, ...] | None = None, only_prefixed: bool = False,
                     device: torch.device | str = "cpu", cast_to=None) -> LoadedWeights:
-    """Load a ComfyUI/plain safetensors file, separating quantization sidecars.
+    """Load a ComfyUI/plain safetensors file (or every shard of a sharded checkpoint, ``shard_files``),
+    separating quantization sidecars.
 
     ``strip_prefix`` removes a leading key prefix (e.g. ``"model."``); with
     ``only_prefixed`` keys without it are skipped. ``skip_prefixes`` drops keys
@@ -187,27 +243,29 @@ def load_state_dict(path: str, strip_prefix: str | None = None, skip_prefixes: t
             if device.type == "cuda" else str(device)
     tensors: dict[str, torch.Tensor] = {}
     sidecars: dict[str, torch.Tensor] = {}
-    with safe_open(path, "pt", device=device) as f:
-        metadata = dict(f.metadata() or {})
-        for key in f.keys():
-            name = key
-            if strip_prefix and name.startswith(strip_prefix):
-                name = name[len(strip_prefix):]
-            elif strip_prefix and only_prefixed:
-                continue
-            if skip_prefixes and name.startswith(skip_prefixes):
-                continue
-            if include is not None and not name.startswith(include):
-                continue
-            if name in LEGACY_MARKERS or name.endswith(METADATA_SUFFIXES):
-                continue
-            if name.endswith(SIDECAR_SUFFIXES):
-                sidecars[name] = f.get_tensor(key)
-            else:
-                t = f.get_tensor(key)
-                if cast_to is not None and t.dtype in WIDE_DTYPES and not name.endswith(".bias"):
-                    t = t.to(cast_to(name))
-                tensors[name] = t
+    metadata: dict[str, str] = {}
+    for shard in shard_files(path):
+        with safe_open(shard, "pt", device=device) as f:
+            metadata.update(_merged_metadata(metadata, dict(f.metadata() or {})))
+            for key in f.keys():
+                name = key
+                if strip_prefix and name.startswith(strip_prefix):
+                    name = name[len(strip_prefix):]
+                elif strip_prefix and only_prefixed:
+                    continue
+                if skip_prefixes and name.startswith(skip_prefixes):
+                    continue
+                if include is not None and not name.startswith(include):
+                    continue
+                if name in LEGACY_MARKERS or name.endswith(METADATA_SUFFIXES):
+                    continue
+                if name.endswith(SIDECAR_SUFFIXES):
+                    sidecars[name] = f.get_tensor(key)
+                else:
+                    t = f.get_tensor(key)
+                    if cast_to is not None and t.dtype in WIDE_DTYPES and not name.endswith(".bias"):
+                        t = t.to(cast_to(name))
+                    tensors[name] = t
 
     header_quant = _header_quant(metadata)
 

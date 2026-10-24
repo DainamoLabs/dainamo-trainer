@@ -14,6 +14,16 @@ The Qwen-Image 2.1 support in dainamo/engine/families/qwen_image_2/ ports the re
 Qwen Research License Agreement is in dainamo/engine/families/qwen_image_2/QWEN_RESEARCH_LICENSE.txt.
 Model weights are not included.
 
+FLUX 3 Image Klein is licensed under the FLUX Kommunity License v1.0, Copyright Black Forest Labs Inc.
+FLUX.2 Klein 9B is licensed under the FLUX Non-Commercial License v2.1, Copyright Black Forest Labs Inc.
+FLUX.2 Klein 4B is licensed under the Apache License 2.0.
+
+The FLUX.2 Klein and FLUX 3 Image Klein support in dainamo/engine/families/flux2_klein/ and
+dainamo/engine/families/flux3_klein/ ports Black Forest Labs' reference inference code (Apache License 2.0,
+https://github.com/black-forest-labs/flux2 and https://github.com/black-forest-labs/flux-3-image-klein); the
+ported files say so in their headers. Copies of the FLUX Non-Commercial License and the FLUX Kommunity License are
+in those folders. Model weights are not included.
+
 LTX-2.x is licensed under the LTX-2.x Community License Agreement; the Licensor is Lightricks Ltd.
 
 The LTX 2.5 support in dainamo/engine/families/ltx2/ uses diffusers' LTX-2 classes (Apache License 2.0,

@@ -222,6 +222,8 @@ class FamilyDriver:
     bundled: dict[str, tuple[str, int]] = {}
     # raised when how the family encodes items or captions changes, so the shared cache encodes them again
     cache_version: int = 1
+    # the VAE runs in fp32 (the FLUX.2 VAE, as its reference runs it), so the projection counts it at 4 bytes a weight
+    vae_fp32: bool = False
 
     def __init__(self, profile: dict, device: torch.device, log=print):
         self.profile = profile

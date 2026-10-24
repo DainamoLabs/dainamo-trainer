@@ -95,7 +95,7 @@ class Krea2Driver(FamilyDriver):
     lora_metadata = {"modelspec.architecture": "krea2/lora", "dainamo.family": "krea2"}
     signature_keys = {
         "diffusion_model": ["blocks.27.attn.wq.weight", "txtfusion.projector.weight"],
-        "text_encoder": ["layers.35.mlp.down_proj.weight"],
+        "text_encoder": ["layers.35.mlp.down_proj.weight", "visual.blocks.0.attn.qkv.weight"],  # Qwen3-VL, not Qwen3
         "vae": ["decoder.head.2.weight"],
     }
     signature_shapes = {
