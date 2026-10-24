@@ -47,7 +47,11 @@ Besides a LoRA, a job can make:
   ([RefMods](refmods.md)).
 
 **Sample prompts** are cards. Width, height, seed and LoRA strength left blank
-use the Sampling defaults.
+use the Sampling defaults. **Likeness score** (on by default for image and
+video models) measures how much each sample looks like the training images,
+from 0% (the base model's render of the card) to 100% (as alike as the training
+images are to each other), and flags a sample that's a near copy of one training
+image. See [Likeness](likeness.md).
 
 **Masked loss**, below the datasets (image models), trains each image where its
 mask is white ([Masks](datasets.md#masks)). **Outside the mask** is how much the
@@ -86,9 +90,11 @@ running job must be stopped first.
 
 The tabs are **Samples**, **Loss**, **Checkpoints** and **Log**. In Samples,
 click a sample to enlarge it; the arrow keys step through training
-(left/right) and prompts (up/down). Checkpoints has the saved checkpoints with
-download links, the checkpoint picker's results and the job's disk use. A
-failed job opens on Log.
+(left/right) and prompts (up/down). Each sample carries its
+[likeness](likeness.md) to the training images, and the enlarged view can
+compare it with any dataset. Loss has the loss curve and, under it, the
+likeness curve. Checkpoints has the saved checkpoints with download links, the
+checkpoint picker's results and the job's disk use. A failed job opens on Log.
 
 A job's files are in `data/jobs/<name>_<id>/`, named when the job is added;
 renaming the job later doesn't move them. Jobs added before folders had names

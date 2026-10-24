@@ -7,6 +7,7 @@ import {
 import { EvalPanel } from "../components/EvalPanel";
 import { EvaluateDialog } from "../components/EvalSettings";
 import { ExtractLora } from "../components/ExtractLora";
+import { LikenessChart } from "../components/Likeness";
 import { LossChart, Spark, useMetrics } from "../components/LossChart";
 import { IconCamera, IconCheck, IconCopy, IconDatabase, IconDown, IconDownload, IconDrive, IconEdit, IconFile, IconImages, IconLayers, IconPlay, IconPlus, IconRefresh, IconRight, IconSave, IconServer, IconStop, IconTarget, IconTrash, IconUp } from "../components/icons";
 import { AudioCard, ConfirmDialog, Empty, Lightbox, LoadError, Modal, SelectBar, StatusPill, fmtSize, someNames, usePoll, useSelection, useToast, type Selection } from "../components/ui";
@@ -582,12 +583,19 @@ function JobDetailView({ id, view, families }: { id: string; view?: string; fami
         ))}
       </div>
 
-      {tab === "samples" && <SamplesPanel jobId={job.id} samples={st.samples || []} slider={slider} />}
+      {tab === "samples" && <SamplesPanel jobId={job.id} samples={st.samples || []} slider={slider} datasets={job.datasets} />}
 
       {tab === "loss" && (
         <div className="card card-pad" style={{ marginBottom: 16 }}>
           <h2>Loss</h2>
           <LossChart points={metrics} totalSteps={total} />
+        </div>
+      )}
+      {tab === "loss" && !!st.likeness?.length && (
+        <div className="card card-pad" style={{ marginBottom: 16 }}>
+          <h2>Likeness</h2>
+          <p className="muted small" style={{ marginTop: -6 }}>How much the samples look like the training images: 0% is the base model's render of the same prompt, 100% as alike as the training images are to each other. The dashed line is the closest any sample came to one training image; in the band at the top it's a near copy.</p>
+          <LikenessChart points={st.likeness} totalSteps={total} />
         </div>
       )}
 

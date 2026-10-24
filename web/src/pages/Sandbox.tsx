@@ -4,7 +4,8 @@ import {
   type SandboxOutput, type SandboxParams, type SandboxProgress, type SandboxRun, type SandboxStatus, type SystemRam,
   type MediaKind, type Upscalers, type Workflow,
 } from "../api";
-import { IconPlayFill, IconPlus, IconRefresh, IconRight, IconSparkle, IconStop, IconTrash, IconUpscale, IconX } from "../components/icons";
+import { IconPlayFill, IconPlus, IconRefresh, IconRight, IconSparkle, IconStop, IconTarget, IconTrash, IconUpscale, IconX } from "../components/icons";
+import { CompareDialog, type CompareTarget } from "../components/Likeness";
 import { MakeRefModDialog, NEW_REFMOD, type RefModDraft } from "../components/MakeRefMod";
 import {
   UpscaleDialog, UpscaleFileCard, UpscaleRunView, UpscalerSelect, pickUpscaler, upscaleMeta, upscaleParams, usableUpscaler,
@@ -228,7 +229,9 @@ function GridView({ run, onOpen }: { run: SandboxRun; onOpen: Open }) {
  * over what made it (``meta``, the run's settings, then its seed and LoRAs). With the hi-res fix, each render's first
  * pass is beside it, with its size (and comparing, the render without LoRAs and its first pass make a row below). An
  * image or video has an Upscale button. */
-function RunView({ run, meta, onOpen, onUpscale }: { run: SandboxRun; meta: string; onOpen: Open; onUpscale: (o: SandboxOutput) => void }) {
+function RunView({ run, meta, onOpen, onUpscale, onCompare }: {
+  run: SandboxRun; meta: string; onOpen: Open; onUpscale: (o: SandboxOutput) => void; onCompare: (o: SandboxOutput) => void;
+}) {
   type Slot = "lora" | "base" | "pass1" | "pass1_base";
   const bySeed = useMemo(() => {
     const m = new Map<number, Partial<Record<Slot, SandboxOutput>>>();
@@ -254,9 +257,11 @@ function RunView({ run, meta, onOpen, onUpscale }: { run: SandboxRun; meta: stri
         <div className="sbx-out-head">
           <strong>{label}</strong>
           {withLoras && <span className="faint ellipsis" title={loras.map((l) => `${base(l.path)} @ ${l.strength}`).join("\n")}>{loras.map((l) => base(l.path)).join(", ")}</span>}
-          {o && (o.kind === "image" || o.kind === "video") && (
+          {o && (o.kind === "image" || o.kind === "video") && (<>
+            <button className="btn ghost sm sbx-out-act" onClick={() => onCompare(o)}
+              title={`How much this ${o.kind} looks like a dataset's images${compare && slot === "lora" ? " (0% is the render without LoRAs)" : ""}`}><IconTarget /> Compare</button>
             <button className="btn ghost sm sbx-out-act" onClick={() => onUpscale(o)} title={`Make this ${o.kind} bigger with an upscaler`}><IconUpscale /> Upscale</button>
-          )}
+          </>)}
         </div>
         {!o ? <div className={"sbx-wait" + (song ? " song" : "")}>{label}…</div>
           : o.kind === "audio" ? <>
@@ -332,6 +337,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
   const [deleting, setDeleting] = useState<SandboxRun | null>(null); // a history run whose Delete is being confirmed
   const attempt = useToastErrors();
   const [upscaling, setUpscaling] = useState<UpscaleTarget | null>(null); // the Upscale dialog's file
+  const [comparing, setComparing] = useState<CompareTarget | null>(null); // the Compare dialog's output
   const [busy, setBusy] = useState(false);
   const [enhancing, setEnhancing] = useState(false);
   const [imgSize, setImgSize] = useState<{ path: string; width: number; height: number } | null>(null);
@@ -573,6 +579,10 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
     setUpscaling({ source: { run_id: r.id, file: o.file }, name: `Run ${runNumber(r)} · ${o.file}`, kind: o.kind === "video" ? "video" : "image",
       width: w, height: h, preview: fileUrl(r, o.poster || o.file) });
   };
+  // an output to compare with a dataset: its likeness, measured from the run's render without LoRAs when there is one
+  const compareOutput = (r: SandboxRun, o: SandboxOutput) => setComparing({
+    source: { run_id: r.id, file: o.file }, label: `Run ${runNumber(r)} · ${o.file} · ${r.params.prompt}`, preview: fileUrl(r, o.poster || o.file),
+  });
   const runMeta = (r: SandboxRun) => {
     const p = r.params;
     const song = p.seconds != null;
@@ -1154,7 +1164,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
                 </div>
               )}
               <RunView run={current} meta={runMeta(current)} onOpen={(src, v, audio) => setLight({ src, video: v, audio })}
-                onUpscale={(o) => upscaleOutput(current, o)} />
+                onUpscale={(o) => upscaleOutput(current, o)} onCompare={(o) => compareOutput(current, o)} />
             </div>
           ) : (
             <Empty icon={<IconSparkle />} title="No generations yet">Pick a profile, write a prompt and press Generate.</Empty>
@@ -1206,6 +1216,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
         <UpscaleDialog target={upscaling} gpu={gpu} onClose={() => setUpscaling(null)}
           onQueued={(run) => { setSelected(run.id); reload(); }} />
       )}
+      {comparing && <CompareDialog target={comparing} onClose={() => setComparing(null)} />}
       {refmodOpen && (
         <MakeRefModDialog draft={refmodDraft} setDraft={setRefmodDraft} profileId={form.profile_id} gpu={gpu} making={making}
           onMake={setMakingId} onBack={() => setMakingId(null)} onClose={() => setRefmodOpen(false)} frameRule={family?.frame_rule} />

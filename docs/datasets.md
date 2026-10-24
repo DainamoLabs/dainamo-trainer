@@ -147,6 +147,13 @@ upscaler (Real-ESRGAN, SeedVR2 or another file in the models folder's
 many images it will upscale. It runs in the Sandbox's worker, and the page
 shows its progress. See [Upscaling](upscaling.md#upscale-small-images).
 
+## Find duplicates
+
+**Find duplicates**, in the **Tools** menu, lists pairs of images (and clips, by
+their first frame) that look alike, from copies and re-encodes to small crops
+and mirrored copies depending on the threshold, each with a delete button. See
+[Likeness](likeness.md#find-duplicates).
+
 ## Edit captions
 
 **Edit captions** changes every caption at once: find and replace (plain or a

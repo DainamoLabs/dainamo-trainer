@@ -28,8 +28,8 @@ import torch.nn.functional as F
 from PIL import Image
 
 from . import dataset as ds
+from .similarity import Embedder
 
-DINO_REPO = "facebook/dinov2-small"
 MAX_CONCEPT_IMAGES = 64  # training images used to describe the concept
 DEFAULT_BLEED_PROMPTS = [
     "a portrait photo of a woman with short dark hair, natural window light",
@@ -126,25 +126,11 @@ class Validator:
         return total / n
 
 
-class DinoEmbedder:
-    """DINOv2-small image features (downloaded once, ~88 MB), loaded only while measuring."""
+class DinoEmbedder(Embedder):
+    """DINOv2-small image features (``similarity.Embedder``), named for the download message."""
 
     def __init__(self, device):
-        self.device = device
-
-    @torch.no_grad()
-    def __call__(self, images: list[Image.Image]) -> torch.Tensor:
-        from transformers import AutoImageProcessor, AutoModel
-
-        from .hf_assets import from_pretrained
-
-        proc = from_pretrained(AutoImageProcessor, DINO_REPO, "DINOv2 (for concept bleed)")
-        model = from_pretrained(AutoModel, DINO_REPO, "DINOv2 (for concept bleed)").to(self.device).eval()
-        inputs = proc(images=[im.convert("RGB") for im in images], return_tensors="pt").to(self.device)
-        emb = F.normalize(model(**inputs).pooler_output.float(), dim=-1).cpu()
-        del model
-        torch.cuda.empty_cache()
-        return emb
+        super().__init__(device, "DINOv2 (for concept bleed)")
 
 
 class BleedProbe:

@@ -6,6 +6,7 @@ import {
 } from "../api";
 import { CheckIssues, PairSummary, useDatasetCheck } from "../components/DatasetCheck";
 import { PairsDialog } from "../components/Pairs";
+import { DuplicatesDialog } from "../components/Likeness";
 import { DatasetUpscaleModal, DatasetUpscaleTask } from "../components/Upscale";
 import {
   IconAlert, IconArrowRight, IconCheck, IconCheckCircle, IconCopy, IconDown, IconDownload, IconEdit, IconFile, IconFilm, IconFolder, IconGrid,
@@ -332,6 +333,7 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
   }, [split?.running]);
   // Upscale small images: the dataset's last upscale, its dialog, and a finished one dismissed
   const [upOpen, setUpOpen] = useState(false);
+  const [dupOpen, setDupOpen] = useState(false); // Find duplicates
   const [up, reloadUp] = usePoll<DatasetUpscale>(`/api/datasets/${id}/upscale`, 1500);
   const [upHidden, setUpHidden] = useState<string | null>(null);
   const wasUpscaling = useRef(false);
@@ -488,6 +490,8 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
               disabled: upActive || !!up?.elsewhere,
               title: up?.elsewhere ? `${up.elsewhere.name} is being upscaled: one dataset at a time`
                 : "Make the images smaller than the training resolution bigger, keeping the originals in _originals" }] : []),
+            ...((items?.filter((i) => i.kind !== "audio").length ?? 0) >= 2 ? [{ label: "Find duplicates", icon: <IconCopy />, onClick: () => setDupOpen(true),
+              title: "Images and clips that look alike (copies, re-encodes, crops), to delete the extras" }] : []),
             { label: "Export", icon: <IconDownload />, onClick: () => setExporting(true), disabled: !items?.length, title: "Download it as a .zip" },
             { label: "Delete dataset", icon: <IconTrash />, onClick: () => setConfirmRemove(true), danger: true, sep: true },
           ]} />
@@ -680,6 +684,7 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
       {dlOpen && d && <DownloadModal dataset={d} onClose={() => setDlOpen(false)} onStarted={reloadDl} />}
       {upOpen && d && <DatasetUpscaleModal dataset={d} last={up?.last ?? null} onClose={() => setUpOpen(false)}
         onStarted={() => { setUpHidden(null); reloadUp(); }} />}
+      {dupOpen && d && <DuplicatesDialog dataset={d} onClose={() => setDupOpen(false)} onChanged={() => { loadItems(); reloadDs(); }} />}
     </div>
   );
 }

@@ -3,6 +3,7 @@ import { go } from "../App";
 import { api, byFamily, type Dataset, type Family, type FamilySources, type Gpu, type JobDetail, type Profile, type SystemRam } from "../api";
 import { type CheckPairs, CheckIssues, PairSummary, useDatasetCheck } from "../components/DatasetCheck";
 import { EVAL_DEFAULTS, EvalSettings, evalCost } from "../components/EvalSettings";
+import { LIKENESS_INFO } from "../components/Likeness";
 import { REFMOD_CONCEPTS, REFMOD_INFO, RefModAbout, RefModEncoding, refLatentFrames, type RefModEncodingValues } from "../components/MakeRefMod";
 import { PairsDialog } from "../components/Pairs";
 import { IconPlay, IconPlus, IconSave, IconX } from "../components/icons";
@@ -16,7 +17,7 @@ const BASE_SETTINGS: S = {
   lr_scheduler: "constant", warmup_steps: 0, steps: 2000, batch_size: 1, grad_accum: 1, max_grad_norm: 1,
   timestep_sampling: "shift", caption_dropout: 0.05, flip: false, seed: 42, weight_decay: 0,
   save_every: 250, keep_last: 4, sample_every: 250, sample_prompts: [], sample_width: 1024, sample_height: 1024,
-  sample_seed: 42, sample_at_start: true, sample_at_end: true, gradient_checkpointing: true,
+  sample_seed: 42, sample_at_start: true, sample_at_end: true, likeness_enabled: true, gradient_checkpointing: true,
   keep_alpha: true, offload: 0,
   low_vram: false, // stream the text encoder's layers from system RAM too
   // the adapter trained: a LoRA (rank, alpha) or a LoKr (lokr_factor); or the whole model (families with info.finetune)
@@ -461,6 +462,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
       ...(slider ? { loss_weighting: "none" } : {}),  // a slider's loss is its own, in the noise range
       ...(finetune ? { bleed_enabled: false, sweep_enabled: false, optimizer: finetuneOptimizer } : {}),
       ...(isAudio ? { bleed_enabled: false } : {}),
+      likeness_enabled: !isAudio && !slider && !refmod && s.likeness_enabled !== false,
       ...(slider ? { picker_enabled: false, ...(keepLayout ? { slider_preserve: [] } : {}) } : {}),
       ...(first ? { resolution: first.resolution, flip: first.flip, caption_dropout: first.caption_dropout }
         : rendered ? { resolution: dsCards[0].resolution } : {}),
@@ -1012,6 +1014,9 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
             <div className="row wrap" style={{ gap: 22, marginTop: 12 }}>
               <label className="check"><input type="checkbox" checked={s.sample_at_start} onChange={(e) => set("sample_at_start")(e.target.checked)} /> Sample before training (step 0)<Info text={INFO.sampleAtStart} /></label>
               <label className="check"><input type="checkbox" checked={s.sample_at_end} onChange={(e) => set("sample_at_end")(e.target.checked)} /> Sample at the end</label>
+              {!isAudio && !slider && !refmod && (
+                <label className="check"><input type="checkbox" checked={s.likeness_enabled !== false} onChange={(e) => set("likeness_enabled")(e.target.checked)} /> Likeness score<Info text={LIKENESS_INFO} /></label>
+              )}
             </div>
             {profile && (
               <div className="help" style={{ marginTop: 10 }}>
@@ -1159,6 +1164,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
             <div className="kv"><span>Keep last N saves<Info text="How many of the step saves stay on disk; the final save is always kept." /></span><span>{Number(s.keep_last) ? s.keep_last : "All"}</span></div>
             {!slider && s.picker_enabled && <div className="kv"><span>Checkpoint picker</span><span>On</span></div>}
             {!isAudio && s.bleed_enabled && <div className="kv"><span>Concept bleed</span><span>On</span></div>}
+            {!isAudio && !slider && !refmod && s.likeness_enabled !== false && <div className="kv"><span>Likeness score</span><span>On</span></div>}
             </>}
             {!slider && !refmod && missingCaps > 0 && <div className="validation warning" style={{ marginTop: 10 }}>{missingCaps} file{missingCaps === 1 ? " has" : "s have"} no caption: {missingCaps === 1 ? "it trains" : "they train"} on the trigger word only.</div>}
           </div>

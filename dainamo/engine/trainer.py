@@ -45,6 +45,7 @@ from . import cache
 from . import dataset as ds
 from . import evaluation
 from . import refmod
+from . import similarity
 from .ema import EMA
 from .families import get_family
 from .hf_assets import resolve_path
@@ -109,9 +110,10 @@ class Trainer:
         self.status = {"phase": "starting", "step": 0, "total_steps": int(self.s["steps"]), "loss": None,
                        "avg_loss": None, "lr": None, "it_per_sec": None, "eta_seconds": None, "message": "",
                        "samples": [], "checkpoints": [], "started_at": time.time(), "vram_gb": None,
-                       "evals": [], "recommended": None, "sweep": None}
+                       "evals": [], "recommended": None, "sweep": None, "likeness": []}
         self.validator: evaluation.Validator | None = None
         self.probe: evaluation.BleedProbe | None = None
+        self.likeness: similarity.LikenessMeter | None = None  # scores the samples against the training images
         self.slider = Slider.from_settings(self.s)
         self.finetune = bool(self.s.get("finetune_enabled"))  # the whole model trains, not a LoRA
         self._last_status_write = 0.0
@@ -501,11 +503,19 @@ class Trainer:
         what = ("song(s)" if self.driver.is_audio
                 else "clip(s)" if any(sp["frames"] > 1 for sp in specs) else "image(s)")
         self.phase("sampling", f"Sampling {len(specs)} {what} at step {step}")
+        made = []
         for i, (sp, media) in enumerate(zip(specs, self.render_media(model, network, specs))):
             saved = self.save_media(media, f"step{step:06d}_{i}")
             entry = {k: v for k, v in sp.items() if k != "cond_key"}
-            self.status["samples"].append({"step": step, "index": i, **saved, **entry})
-        self.phase(prev, f"Samples saved for step {step}")
+            if self.likeness:
+                entry.update(self.likeness.score(sp, media, step))
+            made.append({"step": step, "index": i, **saved, **entry})
+        self.status["samples"] += made
+        note = ""
+        if self.likeness and (summary := similarity.summarise(made)):
+            self.status["likeness"] = [x for x in self.status["likeness"] if x["step"] != step] + [{"step": step, **summary}]
+            note = f": likeness {summary['likeness']:.0f}%" + (" (a near copy of a training image)" if summary["near_copy"] else "")
+        self.phase(prev, f"Samples saved for step {step}{note}")
 
     # --- checkpoint picker / concept bleed --------------------------------
     def evaluate(self, model, network, step: int, file: str | None, of: str = ""):
@@ -799,6 +809,21 @@ class Trainer:
                 self.probe = None
             else:
                 self.probe.setup(model, network, self.device, [it.path for it in items])
+        self.make_likeness(driver, model, network, items)
+
+    def make_likeness(self, driver, model, network, items):
+        """The likeness meter (``similarity.LikenessMeter``), scoring each sample against the training images, as
+        ``likeness_enabled`` asks (on by default): for pictures only, and not for a slider (it has no dataset to look
+        like) or a checkpoint evaluation. A finetune can render the base model only at step 0, before training."""
+        s = self.s
+        if (not s.get("likeness_enabled", True) or self.evaluating or self.slider or driver.is_audio
+                or s.get("refmod_enabled") or not items):
+            return
+        self.likeness = similarity.LikenessMeter(
+            self.device, os.path.join(self.job_dir, "state", "likeness.pt"),
+            lambda spec: self.render_media(model, network, [spec])[0], self.log,
+            can_render_base=not self.finetune)
+        self.likeness.setup([it.path for it in items])
 
     def run_evaluation(self) -> str:
         """Score a finished job's saved checkpoints, as asked from its page (``job["evaluate"]``): the base
@@ -1089,7 +1114,7 @@ class Trainer:
             for g in opt.param_groups:
                 g.update(initial_lr=lr, weight_decay=wd, lr=lr * sched.lr_lambdas[0](sched.last_epoch))
             start = st["step"]
-            for k in ("samples", "checkpoints", "evals"):
+            for k in ("samples", "checkpoints", "evals", "likeness"):
                 self.status[k] = st["status"].get(k, [])
             for k in ("recommended", "sweep"):
                 self.status[k] = st["status"].get(k)
@@ -1128,6 +1153,8 @@ class Trainer:
                 self.evaluate(model, network, 0, None)
                 if s.get("sample_at_start", True):
                     self.make_samples(model, network, 0)
+                elif self.likeness and self.finetune:  # its last chance to render the base model
+                    self.likeness.prime(self.sample_specs())
 
         self.phase("training", "Training")
         model.train()

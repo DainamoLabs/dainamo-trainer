@@ -2,6 +2,7 @@ import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { go } from "../App";
 import { api, type Sample } from "../api";
 import { SANDBOX_PRESET } from "../pages/Sandbox";
+import { CompareDialog, LikenessBadge, likenessText, type CompareTarget } from "./Likeness";
 import { Lightbox, useToast } from "./ui";
 
 type View = "grid" | "steps";
@@ -68,7 +69,8 @@ function useOpenInSandbox(jobId: string) {
 
 /** A sample full size, in the shared lightbox: left and right walk the steps, up and down the prompts. */
 function Viewer(props: { url: (f: string) => string; table: ReturnType<typeof useTable>; at: { index: number; step: number };
-  onMove: (at: { index: number; step: number }) => void; onClose: () => void; onSandbox: (s: Sample) => void; slider: boolean }) {
+  onMove: (at: { index: number; step: number }) => void; onClose: () => void; onSandbox: (s: Sample) => void; onCompare: (s: Sample) => void;
+  slider: boolean }) {
   const { table, at } = props;
   const s = table.at(at.index, at.step);
   const si = table.steps.indexOf(at.step);
@@ -85,23 +87,30 @@ function Viewer(props: { url: (f: string) => string; table: ReturnType<typeof us
       audio={s.kind === "audio" ? { poster: s.poster ? props.url(s.poster) : undefined, score: s.score ? props.url(s.score) : undefined, title: s.lyrics || undefined } : undefined}
       nav={{ at: si, count: table.steps.length, go: (d) => move(0, d), noun: "step" }}
       navY={{ at: ri, count: table.indexes.length, go: (d) => move(d, 0), noun: "prompt" }}
-      info={{ name: stepLabel(s.step), caption: s.prompt, details: [meta(s, props.slider, false)].filter(Boolean),
-        actions: s.width != null && (
+      info={{ name: stepLabel(s.step), caption: s.prompt, details: [meta(s, props.slider, false), likenessText(s)].filter(Boolean),
+        actions: s.width != null && (<>
           <button className="btn sm" title="Re-create this sample in the Sandbox: same prompt, seed, size, sampler and this step's checkpoint"
             onClick={() => props.onSandbox(s)}>Open in Sandbox</button>
-        ) }} />
+          {s.kind !== "audio" && (
+            <button className="btn sm" title="How much this sample looks like a dataset's images, and which it's closest to"
+              onClick={() => props.onCompare(s)}>Compare with a dataset</button>
+          )}
+        </>) }} />
   );
 }
 
 /** A job's samples: a prompt-by-step grid (to see a LoRA develop) or grouped by step. */
-export function SamplesPanel(props: { jobId: string; samples: Sample[]; slider?: boolean }) {
+export function SamplesPanel(props: { jobId: string; samples: Sample[]; slider?: boolean; datasets?: string[] }) {
   const slider = !!props.slider;
+  const [comparing, setComparing] = useState<CompareTarget | null>(null);
   const [view, setView] = useState<View>(() => load("dainamo.samples.view", "grid", ["grid", "steps"] as const));
   const [size, setSize] = useState<Size>(() => load("dainamo.samples.size", "m", ["s", "m", "l"] as const));
   const [open, setOpen] = useState<{ index: number; step: number } | null>(null);
   const table = useTable(props.samples);
   const url = (f: string) => `/api/jobs/${props.jobId}/file/samples/${f}`;
   const openInSandbox = useOpenInSandbox(props.jobId);
+  const compare = (s: Sample) => setComparing({ sample: { job_id: props.jobId, file: s.file }, label: `${stepLabel(s.step)} · ${s.prompt}`,
+    preview: url(s.kind === "video" ? s.poster || s.file : s.file), datasetIds: props.datasets });
   const scroller = useRef<HTMLDivElement>(null);
   const atEnd = useRef(true);
 
@@ -156,7 +165,7 @@ export function SamplesPanel(props: { jobId: string; samples: Sample[]; slider?:
                 </div>,
                 ...table.steps.map((st) => {
                   const s = table.at(index, st);
-                  return <div key={`${index}:${st}`} className="sg-cell">{s ? thumb(s) : <span className="sg-missing" />}</div>;
+                  return <div key={`${index}:${st}`} className="sg-cell">{s ? <>{thumb(s)}<LikenessBadge s={s} /></> : <span className="sg-missing" />}</div>;
                 }),
               ];
             })}
@@ -173,13 +182,15 @@ export function SamplesPanel(props: { jobId: string; samples: Sample[]; slider?:
                 {thumb(s)}
                 <figcaption className="ellipsis" title={s.prompt}>{s.prompt}</figcaption>
                 {s.width != null && <figcaption className="faint">{meta(s, slider)}</figcaption>}
+                {s.likeness != null && <figcaption className="faint">{likenessText(s)}</figcaption>}
               </figure>
             ))}
           </div>
         </div>
       ))}
 
-      {open && <Viewer url={url} table={table} at={open} onMove={setOpen} onClose={() => setOpen(null)} onSandbox={openInSandbox} slider={slider} />}
+      {open && <Viewer url={url} table={table} at={open} onMove={setOpen} onClose={() => setOpen(null)} onSandbox={openInSandbox} onCompare={compare} slider={slider} />}
+      {comparing && <CompareDialog target={comparing} onClose={() => setComparing(null)} />}
     </div>
   );
 }

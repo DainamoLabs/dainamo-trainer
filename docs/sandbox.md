@@ -47,6 +47,11 @@ second pass. History notes such runs as "i2i 0.6" and "hi-res 2×".
 and **Upscale a file**, below History, does the same for a file on this machine
 or one you upload. See [Upscaling](upscaling.md).
 
+**Compare**, on an image or video output, measures how much it looks like a
+dataset's images (a percentage, with the training images it's closest to). With
+**Compare without LoRAs** on, 0% is the same seed rendered without them, so the
+number is the LoRA's doing. See [Likeness](likeness.md).
+
 **Compare without LoRAs** renders each seed again without them. **Compare
 checkpoints** renders one prompt and seed with each of a job's chosen
 checkpoints (up to 12) at each strength (up to 6, from -10 to 10), optionally

@@ -1274,3 +1274,18 @@ input[type="range"].player-seek:focus-visible { outline: 2px solid var(--accent-
 
 /* a dialog's footer: why its button can't be pressed yet */
 .help.modal-why { margin-right: auto; max-width: 60%; }
+
+/* ---- likeness (components/Likeness.tsx) ---- */
+.likeness { display: inline-flex; align-items: center; gap: 4px; padding: 1px 7px; border-radius: 99px; font-size: 11px; font-weight: 700; background: rgba(0, 0, 0, 0.72); color: var(--accent); border: 1px solid var(--accent-line); white-space: nowrap; }
+.likeness.copy { color: var(--danger); border-color: rgba(240, 82, 82, 0.5); }
+.sg-cell { position: relative; }
+.sg-cell .likeness { position: absolute; right: 6px; bottom: 6px; pointer-events: none; }
+.like-big { font-size: 44px; font-weight: 700; letter-spacing: -1px; line-height: 1; color: var(--accent); }
+.like-big.copy { color: var(--danger); }
+.like-near { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
+.like-near img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 8px; border: 1px solid var(--border); display: block; background: var(--panel-2); }
+.like-near figcaption { font-size: 11px; color: var(--muted); margin-top: 3px; }
+.dup-pair { display: grid; grid-template-columns: 1fr 1fr 70px; gap: 10px; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--border); }
+.dup-pair:last-child { border-bottom: 0; }
+.dup-pair img { width: 100%; max-height: 180px; object-fit: contain; border-radius: 8px; background: #000; display: block; border: 1px solid var(--border); }
+@media (max-width: 700px) { .like-near { grid-template-columns: repeat(3, 1fr); } }

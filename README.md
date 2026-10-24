@@ -70,6 +70,7 @@ download from any address, including ones on your local network.
 - [Jobs](docs/jobs.md): New job, the queue, editing and continuing jobs, the checkpoint picker, notifications
 - [Sandbox](docs/sandbox.md)
 - [Upscaling](docs/upscaling.md): Real-ESRGAN and SeedVR2 in the Sandbox, and a dataset's small images
+- [Likeness](docs/likeness.md): how much a sample or an output looks like a dataset, and a dataset's duplicates
 - [LoKr](docs/lokr.md), [Sliders](docs/sliders.md), [Full finetuning](docs/finetuning.md), [RefMods](docs/refmods.md), [Music](docs/music.md)
 - [Memory](docs/memory.md): layer offloading, VRAM projection, Low VRAM
 - [Model families](docs/model-families.md): what each needs, weight formats, speeds, licenses

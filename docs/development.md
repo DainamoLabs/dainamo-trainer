@@ -21,6 +21,7 @@ dainamo/
     textgen.py            text encoders that write captions, and their OpenAI-style server
     hf_assets.py          tokenizers and configs from Hugging Face, pinned to a commit
     upscale.py            upscalers: what each file of upscale_models is, loading one, fitting sizes
+    similarity.py         likeness: DINOv2 features, a dataset's concept, the sample meter, and the server's measuring process
     upscalers/            pixel.py (the spandrel architectures, tiled) and seedvr2/ (the SeedVR2 3B port)
   assets/                 bundled copies of those for the families whose licenses allow it, and FLUX 3's upsampler prompts (see its README)
     families/             one driver per model family
@@ -29,7 +30,7 @@ dainamo/
       ltx2/               LTX 2.5: diffusers' LTX-2 classes loaded from ComfyUI files, and the driver
   server/
     app.py                FastAPI app: middleware, routers, the built web UI
-    routes/               the API, one module per area (system, profiles, models, datasets, clips, jobs, sandbox, refmods, upscale, llm, tools)
+    routes/               the API, one module per area (system, profiles, models, datasets, clips, jobs, sandbox, refmods, upscale, similarity, llm, tools)
     validation.py         job settings checks
     db.py                 SQLite store and its schema migrations
     queue.py              job queue: launches training processes onto GPUs

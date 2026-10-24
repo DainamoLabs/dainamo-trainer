@@ -311,6 +311,9 @@ def check_evaluation(s: dict, div: int, audio: bool = False) -> None:
         if flag("sweep_enabled", True):
             s["sweep_strengths"] = strength_list(s.get("sweep_strengths", [0.6, 0.8, 1.0, 1.2]),
                                                  "Strength sweep values", 8)
+    # likeness: each sample scored against the training images (engine.similarity); on by default, pictures only
+    s["likeness_enabled"] = bool(s.get("likeness_enabled", True)) and not audio and not s.get("slider_enabled") \
+        and not s.get("refmod_enabled")
     if flag("bleed_enabled"):
         if audio:
             raise HTTPException(400, "Concept bleed compares images, so it doesn't apply to music")

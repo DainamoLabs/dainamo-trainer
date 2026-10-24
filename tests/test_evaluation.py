@@ -158,7 +158,7 @@ def test_a_resumed_finetune_never_renders_its_baseline(tmp_path, monkeypatch):
     Image.new("RGB", (8, 8), (255, 255, 0)).save(train)
     rendered, lines = [], []
     t = Trainer.__new__(Trainer)
-    t.s, t.job_dir, t.device, t.log = {"bleed_enabled": True}, str(tmp_path), "cpu", lines.append
+    t.s, t.job_dir, t.device, t.log = {"bleed_enabled": True, "likeness_enabled": False}, str(tmp_path), "cpu", lines.append
     t.validator = t.probe = None
     t.render_media = lambda model, network, specs: rendered.append(specs) or [Image.new("RGB", (8, 8))] * len(specs)
     driver, items = SimpleNamespace(bucket_divisibility=16), [SimpleNamespace(path=str(train))]
@@ -174,7 +174,7 @@ def test_a_resumed_finetune_never_renders_its_baseline(tmp_path, monkeypatch):
     assert t.ev["recommended"]["file"] == "a_200"
 
     # a fresh start renders them; resumed, they're used again
-    t.s = {"bleed_enabled": True}
+    t.s = {"bleed_enabled": True, "likeness_enabled": False}
     t.make_evaluators(driver, None, None, items, [], [], ["fruit bowl"])
     assert len(rendered) == 1 and all(sp["lora_scale"] == 0.0 for sp in rendered[0]) and t.probe.has_references()
     rendered.clear()
