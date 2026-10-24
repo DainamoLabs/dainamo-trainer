@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { go } from "../App";
-import { api, byFamily, fmtTime, q, type Dataset, type Family, type Gpu, type Job, type MediaItem, type Profile, type Settings, type WhisperModel } from "../api";
+import { api, byFamily, fmtTime, q, type Dataset, type DatasetUpscale, type Family, type Gpu, type Job, type MediaItem, type Profile, type Settings, type WhisperModel } from "../api";
 import { CheckIssues, PairSummary, useDatasetCheck } from "../components/DatasetCheck";
 import { PairsDialog } from "../components/Pairs";
+import { DatasetUpscaleModal, DatasetUpscaleTask } from "../components/Upscale";
 import {
   IconAlert, IconArrowRight, IconCheck, IconCheckCircle, IconCheckSquare, IconCopy, IconDown, IconDownload, IconEdit, IconFile, IconFilm, IconFolder, IconGrid,
   IconImages, IconInfo, IconLayers, IconLeft, IconLink, IconList, IconPause, IconPlayFill, IconPlus, IconRight, IconScissors, IconSearch, IconSparkle, IconTarget,
-  IconTrash, IconUpload, IconWave, IconX,
+  IconTrash, IconUpload, IconUpscale, IconWave, IconX,
 } from "../components/icons";
 import { ConfirmDialog, Empty, Info, Lightbox, Menu, Modal, PathInput, ProfileOptions, SelectBar, fmtSize, someNames, usePoll, useSelection, useToast, type Selection } from "../components/ui";
 import ClipEditor from "./ClipEditor";
@@ -219,6 +220,9 @@ function PlayBar({ audio }: { audio: HTMLAudioElement }) {
 /** A file in the grid view: its picture (a song's spectrogram, which plays here), name, caption and whether it has
  * one (a click on the caption edits it); ⋯ enlarges it, copies its path or deletes it. ``song``: it's the song playing (true) or paused (false).
  * ``sel``: it can be picked (to delete), its box shown on hover. */
+// a file's thumbnail, which the browser keeps a day: by its size too, so a file replaced by an upscaled one shows anew
+const thumbUrl = (it: MediaItem) => `/api/thumb?path=${q(it.path)}&v=${it.size ?? 0}`;
+
 function FileCard({ it, audio, song, onPlay, onOpen, onSaved, onDelete, sel }: {
   it: MediaItem; audio: HTMLAudioElement | null; song: boolean | null; onPlay: () => void; onOpen: () => void; onSaved: (c: string) => void;
   onDelete?: () => void; sel?: Selection;
@@ -228,7 +232,7 @@ function FileCard({ it, audio, song, onPlay, onOpen, onSaved, onDelete, sel }: {
   const copy = () => navigator.clipboard.writeText(it.path).then(() => toast("Path copied"), () => toast("Couldn't copy the path", true));
   return (
     <div className={"file-card" + (sel?.on ? " selecting" : "") + (picked ? " picked" : "")}>
-      <div className={"file-thumb " + it.kind} style={{ backgroundImage: `url(/api/thumb?path=${q(it.path)})` }}
+      <div className={"file-thumb " + it.kind} style={{ backgroundImage: `url(${thumbUrl(it)})` }}
         onClick={() => (sel?.on ? sel.toggle(it.path) : onOpen())}>
         {it.kind !== "image" && !sel?.on && (
           <button className="file-play" aria-label={song ? `Pause ${it.name}` : `Play ${it.name}`}
@@ -319,6 +323,17 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
     if (split?.running) wasSplitting.current = true;
     else if (wasSplitting.current) { wasSplitting.current = false; reloadDs(); }
   }, [split?.running]);
+  // Upscale small images: the dataset's last upscale, its dialog, and a finished one dismissed
+  const [upOpen, setUpOpen] = useState(false);
+  const [up, reloadUp] = usePoll<DatasetUpscale>(`/api/datasets/${id}/upscale`, 1500);
+  const [upHidden, setUpHidden] = useState<string | null>(null);
+  const wasUpscaling = useRef(false);
+  const upActive = up?.state === "queued" || up?.state === "running";
+  useEffect(() => {
+    if (upActive) wasUpscaling.current = true;
+    else if (wasUpscaling.current) { wasUpscaling.current = false; loadItems(); reloadDs(); }
+    if (up?.state === "running" && up.done) loadItems(); // each image shows as it's replaced
+  }, [up?.state, up?.done]);
   const [dlOpen, setDlOpen] = useState(false);
   const [dl, reloadDl] = usePoll<DownloadStatus>(`/api/datasets/${id}/download`, 1500);
   const wasDownloading = useRef(false);
@@ -474,6 +489,10 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
           <Menu label="More" boxed items={[
             ...(items?.some((i) => i.kind === "video") && !d?.split ? [{ label: "Split into clips", icon: <IconScissors />, onClick: () => setSplitOpen(true),
               disabled: !!split?.running, title: "Make a copy of this dataset with each video cut into clips a video model trains on whole" }] : []),
+            ...(items?.some((i) => i.kind === "image") ? [{ label: "Upscale small images", icon: <IconUpscale />, onClick: () => setUpOpen(true),
+              disabled: upActive || !!up?.elsewhere,
+              title: up?.elsewhere ? `${up.elsewhere.name} is being upscaled: one dataset at a time`
+                : "Make the images smaller than the training resolution bigger, keeping the originals in _originals" }] : []),
             { label: "Export", icon: <IconDownload />, onClick: () => setExporting(true), disabled: !items?.length, title: "Download it as a .zip" },
             { label: "Remove dataset", icon: <IconTrash />, onClick: () => setConfirmRemove(true), danger: true },
           ]} />
@@ -545,6 +564,10 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
             {split.running && <div className="progress"><div style={{ width: `${(100 * split.done) / Math.max(1, split.total)}%` }} /></div>}
             {split.errors.length > 0 && <div className="error-box" style={{ marginTop: 8 }}>{split.errors.slice(-5).map((e) => <div key={e}>{e}</div>)}</div>}
           </div>
+        )}
+        {up && up.state !== "none" && up.id !== upHidden && (
+          <DatasetUpscaleTask up={up} onCancel={() => api.post(`/api/datasets/${id}/upscale/cancel`).then(reloadUp)}
+            onDismiss={() => setUpHidden(up.id || null)} />
         )}
         {dl && (dl.running || dl.count > 0 || dl.errors.length > 0 || dl.cancelled) && (
           <div className="dd-task">
@@ -629,7 +652,7 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
             const on = sel.picked.has(it.path);
             return (
               <div className={"media-card" + (on ? " picked" : "")} key={it.path}>
-                <div className={"media-thumb" + (it.kind === "audio" ? " audio" : "")} style={{ backgroundImage: `url(/api/thumb?path=${q(it.path)})` }}
+                <div className={"media-thumb" + (it.kind === "audio" ? " audio" : "")} style={{ backgroundImage: `url(${thumbUrl(it)})` }}
                   onClick={() => (sel.on ? sel.toggle(it.path) : open(it.path))}>
                   {it.kind === "video" && <span className="badge">VIDEO</span>}
                   {it.kind === "audio" && <span className="badge">AUDIO</span>}
@@ -685,6 +708,8 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
       {editOpen && d && <EditCaptionsModal dataset={d} onClose={() => setEditOpen(false)} onChanged={() => { loadItems(); reloadDs(); }} />}
       {splitOpen && d && <SplitModal dataset={d} families={families} onClose={() => setSplitOpen(false)} onStarted={reloadSplit} />}
       {dlOpen && d && <DownloadModal dataset={d} onClose={() => setDlOpen(false)} onStarted={reloadDl} />}
+      {upOpen && d && <DatasetUpscaleModal dataset={d} last={up?.last ?? null} onClose={() => setUpOpen(false)}
+        onStarted={() => { setUpHidden(null); reloadUp(); }} />}
     </div>
   );
 }

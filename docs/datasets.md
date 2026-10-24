@@ -18,7 +18,7 @@ you chose:
 files without one. On an uploaded dataset, **Select files** (or a card's
 checkbox) picks files to delete together. A linked folder's files are only
 deleted in the folder itself. The **⋯** beside Auto-Caption holds Split into
-clips, Export and Remove dataset.
+clips, Upscale small images, Export and Remove dataset.
 
 Click a file to enlarge it. The **Left/Right** arrow keys, or the on-screen
 buttons, move between files in the grid's order. You can edit the caption
@@ -109,9 +109,10 @@ many images have a mask.
 Folded, it still shows how the last check went:
 
 - unreadable files;
-- images and clips smaller than the resolution. Files are never upscaled, so
-  these train smaller; a file is flagged when it would get under 75% of the
-  pixels of a large enough file of its shape;
+- images and clips smaller than the resolution. Training never upscales a
+  file, so these train smaller; a file is flagged when it would get under 75%
+  of the pixels of a large enough file of its shape. [Upscale small
+  images](#upscale-small-images) can make the images bigger;
 - near-duplicate images;
 - missing or empty captions, and two files sharing one caption (`a.png` and
   `a.jpg`);
@@ -119,7 +120,8 @@ Folded, it still shows how the last check went:
   2.5: 1024);
 - clips shorter or longer than the clip length (a longer one trains only its
   start);
-- notes: captions without the trigger word, caption files with no image;
+- notes: captions without the trigger word, caption files with no image, and
+  how many images were upscaled (their originals are in `_originals`);
 - for a model that trains with source or reference images: files without one,
   and sources that pair with no file;
 - masks of another shape than their image (stretched to fit it), and notes:
@@ -127,6 +129,18 @@ Folded, it still shows how the last check went:
 
 Each dataset in Create Job runs the same check for that job. For songs, see
 [Music](music.md#datasets).
+
+## Upscale small images
+
+**Upscale small images**, in the **⋯** menu of a dataset with images, upscales
+the images with fewer pixels than the resolution you train at, so they train
+at full size. Each result is saved as a PNG with the image's name, the original
+is moved into an `_originals` folder beside it (which training skips), and the
+captions stay as they are. A linked folder is changed in place. Pick the
+upscaler (Real-ESRGAN, SeedVR2 or another file in the models folder's
+`upscale_models`), the resolution and the largest factor; the dialog says how
+many images it will upscale. It runs in the Sandbox's worker, and the page
+shows its progress. See [Upscaling](upscaling.md#upscale-small-images).
 
 ## Edit captions
 

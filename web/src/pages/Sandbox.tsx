@@ -4,8 +4,9 @@ import {
   type SandboxOutput, type SandboxParams, type SandboxProgress, type SandboxRun, type SandboxStatus, type SystemRam,
   type MediaKind, type Workflow,
 } from "../api";
-import { IconPlayFill, IconPlus, IconRefresh, IconRight, IconSparkle, IconStop, IconTrash, IconX } from "../components/icons";
+import { IconPlayFill, IconPlus, IconRefresh, IconRight, IconSparkle, IconStop, IconTrash, IconUpscale, IconX } from "../components/icons";
 import { MakeRefModDialog, NEW_REFMOD, type RefModDraft } from "../components/MakeRefMod";
+import { UpscaleDialog, UpscaleFileCard, UpscaleRunView, upscaleMeta, upscaleParams, type UpscaleTarget } from "../components/Upscale";
 import { AudioPlayer, Empty, ImagesInput, Info, Lightbox, PathInput, ProfileOptions, StatusPill, usePoll, useToast } from "../components/ui";
 import { OffloadControl, gpuTarget, offloadFit, useVramProjection } from "../components/Vram";
 
@@ -211,8 +212,8 @@ function GridView({ run, onOpen }: { run: SandboxRun; onOpen: Open }) {
 }
 
 /** One run's outputs, per seed: with the LoRAs and (comparing) the base model side by side, each under its name and
- * over what made it (``meta``, the run's settings, then its seed and LoRAs). */
-function RunView({ run, meta, onOpen }: { run: SandboxRun; meta: string; onOpen: Open }) {
+ * over what made it (``meta``, the run's settings, then its seed and LoRAs). An image or video has an Upscale button. */
+function RunView({ run, meta, onOpen, onUpscale }: { run: SandboxRun; meta: string; onOpen: Open; onUpscale: (o: SandboxOutput) => void }) {
   if (run.params.grid) return <GridView run={run} onOpen={onOpen} />;
   const bySeed = useMemo(() => {
     const m = new Map<number, Partial<Record<"lora" | "base", SandboxOutput>>>();
@@ -230,6 +231,9 @@ function RunView({ run, meta, onOpen }: { run: SandboxRun; meta: string; onOpen:
         <div className="sbx-out-head">
           <strong>{label}</strong>
           {withLoras && <span className="faint ellipsis" title={loras.map((l) => `${base(l.path)} @ ${l.strength}`).join("\n")}>{loras.map((l) => base(l.path)).join(", ")}</span>}
+          {o && (o.kind === "image" || o.kind === "video") && (
+            <button className="btn ghost sm sbx-out-act" onClick={() => onUpscale(o)} title={`Make this ${o.kind} bigger with an upscaler`}><IconUpscale /> Upscale</button>
+          )}
         </div>
         {!o ? <div className={"sbx-wait" + (song ? " song" : "")}>{label}…</div>
           : o.kind === "audio" ? <>
@@ -259,15 +263,19 @@ function RunView({ run, meta, onOpen }: { run: SandboxRun; meta: string; onOpen:
   );
 }
 
-/** Under the progress bar: "Image 2/4 · Step 5/20 · 9.0 s/step" and "0:45 / 3:00" (elapsed / estimated total). */
+/** Under the progress bar: "Image 2/4 · Step 5/20 · 9.0 s/step" (an upscale's: "File 1/2 · Frame 30/96") and
+ * "0:45 / 3:00" (elapsed / estimated total). */
 function StepCounter({ p }: { p: SandboxProgress }) {
-  if (!p.steps) return null;
+  if (!p.steps && p.inputs == null) return null;
   const rate = p.sec_per_step;
-  const parts = [
+  const parts = (p.steps ? [
     (p.images ?? 1) > 1 ? `Image ${p.image}/${p.images}` : "",
     `Step ${p.step ?? 0}/${p.steps}`,
     rate ? (rate >= 1 ? `${rate.toFixed(1)} s/step` : `${(1 / rate).toFixed(1)} steps/s`) : "",
-  ].filter(Boolean);
+  ] : [
+    (p.inputs ?? 1) > 1 ? `File ${p.input}/${p.inputs}` : "",
+    p.total > (p.inputs ?? 1) ? `Frame ${p.done}/${p.total}` : "",
+  ]).filter(Boolean);
   return (
     <div className="sbx-counter">
       <span>{parts.join(" · ")}</span>
@@ -293,6 +301,7 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
   const [defaults, setDefaults] = useState<SandboxDefaults | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [light, setLight] = useState<{ src: string; video: boolean; audio?: { poster?: string; score?: string } } | null>(null);
+  const [upscaling, setUpscaling] = useState<UpscaleTarget | null>(null); // the Upscale dialog's file
   const [busy, setBusy] = useState(false);
   const [enhancing, setEnhancing] = useState(false);
   const [imgSize, setImgSize] = useState<{ path: string; width: number; height: number } | null>(null);
@@ -506,6 +515,14 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
 
   // a run's number: from the server, or (from before runs had one) its place in the list
   const runNumber = (r: SandboxRun) => r.n ?? runs.length - runs.indexOf(r);
+  const currentUpscale = current ? upscaleParams(current) : null;
+  // an output to upscale: a run's file, at the size it was made (an upscale's output carries its own)
+  const upscaleOutput = (r: SandboxRun, o: SandboxOutput) => {
+    const up = upscaleParams(r);
+    const [w, h] = o.width ? [o.width, o.height] : up ? [up.width, up.height] : [r.params.width, r.params.height];
+    setUpscaling({ source: { run_id: r.id, file: o.file }, name: `Run ${runNumber(r)} · ${o.file}`, kind: o.kind === "video" ? "video" : "image",
+      width: w, height: h, preview: fileUrl(r, o.poster || o.file) });
+  };
   const runMeta = (r: SandboxRun) => {
     const p = r.params;
     const song = p.seconds != null;
@@ -940,7 +957,8 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
           <div className="card sbx-session">
             <div className="sbx-session-row">
               <span className={`sbx-dot ${session?.state || "off"}`} aria-hidden="true" />
-              <strong>{SESSION[session?.state || "off"]}</strong>
+              <strong>{session?.state === "busy" && session.current && (session.upscale?.id === session.current
+                || runs.find((r) => r.id === session.current)?.workflow === "upscale") ? "Upscaling" : SESSION[session?.state || "off"]}</strong>
               <span className="sbx-session-sep" aria-hidden="true" />
               <span className="muted ellipsis">
                 {!session || session.state === "off" ? "Loads when generation starts"
@@ -958,7 +976,20 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
             </>}
           </div>
 
-          {current ? (
+          {current && currentUpscale ? (
+            <div className="card card-pad">
+              <div className="card-head">
+                <StatusPill status={current.status === "done" ? "completed" : current.status} />
+                <h3>{current === runs[0] ? "Latest result" : `Run ${runNumber(current)}`}</h3>
+                <span className="pill">upscale</span>
+                <span className="spacer" />
+                {current.elapsed ? <span className="faint small" title="How long it took">{fmtDuration(current.elapsed)}</span> : null}
+              </div>
+              <p className="muted small sbx-detail">{upscaleMeta(currentUpscale)}</p>
+              {current.status === "failed" && <div className="error-box" style={{ marginBottom: 12 }}>{current.message}</div>}
+              <UpscaleRunView run={current} onOpen={(src, v) => setLight({ src, video: v })} onUpscale={(o) => upscaleOutput(current, o)} />
+            </div>
+          ) : current ? (
             <div className="card card-pad">
               <div className="card-head">
                 <StatusPill status={current.status === "done" ? "completed" : current.status} />
@@ -993,7 +1024,8 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
                   {current.report.loras.filter((l) => l.matched < l.total).map((l) => `${l.label}: ${l.matched} of ${l.total} layers matched this model`).join(" · ")}
                 </div>
               )}
-              <RunView run={current} meta={runMeta(current)} onOpen={(src, v, audio) => setLight({ src, video: v, audio })} />
+              <RunView run={current} meta={runMeta(current)} onOpen={(src, v, audio) => setLight({ src, video: v, audio })}
+                onUpscale={(o) => upscaleOutput(current, o)} />
             </div>
           ) : (
             <Empty icon={<IconSparkle />} title="No generations yet">Pick a profile, write a prompt and press Generate.</Empty>
@@ -1007,12 +1039,14 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
                   const first = r.outputs?.[0];
                   const thumb = first ? fileUrl(r, first.poster || first.file) : null;
                   const p = r.params;
+                  const up = upscaleParams(r);
                   const note = r.status !== "done" ? r.status.charAt(0).toUpperCase() + r.status.slice(1)
+                    : up ? `${up.factor}× upscale`
                     : p.seconds != null ? fmtClock(p.seconds) : p.frames > 1 ? `${p.frames} frames` : `${p.width}×${p.height}`;
                   return (
                     <div key={r.id} className={"sbx-thumb" + (r.id === current?.id ? " on" : "")} role="button" tabIndex={0}
                       aria-pressed={r.id === current?.id} onClick={() => setSelected(r.id)} onKeyDown={(e) => e.key === "Enter" && setSelected(r.id)}
-                      title={`${p.source_prompt || p.prompt}\n${fmtTime(r.created)}`}>
+                      title={`${up ? `Upscale: ${upscaleMeta(up)}` : p.source_prompt || p.prompt}\n${fmtTime(r.created)}`}>
                       <div className="sbx-thumb-img">
                         {thumb ? <img src={thumb} alt="" loading="lazy" className={first?.kind === "audio" ? "song" : undefined} /> : <div className="sbx-wait">…</div>}
                         {r.status !== "queued" && r.status !== "running" && (
@@ -1027,9 +1061,15 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
               </div>
             </div>
           )}
+
+          <UpscaleFileCard onUpscale={setUpscaling} />
         </div>
       </div>
       {light && <Lightbox src={light.src} video={light.video} audio={light.audio} onClose={() => setLight(null)} />}
+      {upscaling && (
+        <UpscaleDialog target={upscaling} gpu={gpu} onClose={() => setUpscaling(null)}
+          onQueued={(run) => { setSelected(run.id); reload(); }} />
+      )}
       {refmodOpen && (
         <MakeRefModDialog draft={refmodDraft} setDraft={setRefmodDraft} profileId={form.profile_id} gpu={gpu} making={making}
           onMake={setMakingId} onBack={() => setMakingId(null)} onClose={() => setRefmodOpen(false)} />

@@ -155,3 +155,33 @@ def test_masks(tmp_path):
     # a video model trains on whole frames
     issues = {i["id"]: i for i in dataset_check.check(str(tmp_path), "", [512], 16, 39)["issues"]}
     assert issues["masks_unused"]["count"] == 3 and not {"masks", "mask_shape", "mask_unreadable"} & set(issues)
+
+
+def test_upscaled_images_keep_their_originals_aside(tmp_path):
+    from dainamo.engine.dataset import ORIGINALS_DIR
+
+    _photo(1).save(tmp_path / "a.png")  # upscaled from a.jpg, and from b.png (replaced in place)
+    _photo(2).save(tmp_path / "b.png")
+    (tmp_path / "a.txt").write_text("a photo")
+    originals = tmp_path / ORIGINALS_DIR
+    originals.mkdir()
+    _photo(1, (300, 300)).save(originals / "a.jpg")
+    _photo(2, (300, 300)).save(originals / "b.png")
+    (originals / "a.txt").write_text("a caption left behind")
+    sub = tmp_path / "more" / ORIGINALS_DIR  # one in a subfolder counts too
+    sub.mkdir(parents=True)
+    _photo(3, (300, 300)).save(sub / "c.jpg")
+
+    r = dataset_check.check(str(tmp_path), "", [1024], 16, None, None)
+    issues = {i["id"]: i for i in r["issues"]}
+    assert (r["files"], r["images"]) == (2, 2)  # the originals aren't the dataset's files
+    assert "small" not in issues and "duplicates" not in issues and "orphan_caption" not in issues
+    note = issues["upscaled"]
+    assert (note["level"], note["title"]) == ("info", "3 images were upscaled (originals in _originals)")
+    assert sorted(f["name"] for f in note["files"]) == [os.path.join(ORIGINALS_DIR, "a.jpg"),
+                                                         os.path.join(ORIGINALS_DIR, "b.png"),
+                                                         os.path.join("more", ORIGINALS_DIR, "c.jpg")]
+    # and the small-image warning says they can be upscaled
+    _photo(4, (300, 300)).save(tmp_path / "d.png")
+    issues = {i["id"]: i for i in dataset_check.check(str(tmp_path), "", [1024], 16, None, None)["issues"]}
+    assert "Upscale small images" in issues["small"]["detail"]

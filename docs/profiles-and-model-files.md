@@ -45,6 +45,10 @@ path and precision. **Search** matches families, fields and file names, and the
 status menu shows only the families that are ready, missing files, or not
 checked. **Create profile** starts a profile with a family's files filled in.
 
+The **Upscalers** card lists the files in the models folder's `upscale_models`
+and what each one is, and downloads Real-ESRGAN and SeedVR2 into it (see
+[Upscaling](upscaling.md)).
+
 ### Downloads
 
 The download button beside a field gets a file from Hugging Face in a precision

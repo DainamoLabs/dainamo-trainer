@@ -230,3 +230,75 @@ def test_gated_and_impossible_downloads_say_why(client, hub, tmp_path, monkeypat
     monkeypatch.setattr(model_files, "SPARE_BYTES", 10**18)
     r = client.post("/api/models/downloads", json={"id": d.id, "folder": str(tmp_path)})
     assert r.status_code == 400 and "Not enough space" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------------------------- upscalers ---
+def test_the_upscaler_downloads_go_to_upscale_models():
+    from dainamo.engine import upscale
+    from dainamo.server.model_files import UPSCALER_DOWNLOADS, find_download
+
+    assert {d.name for d in UPSCALER_DOWNLOADS} == {"RealESRGAN_x4plus.safetensors", "seedvr2_3b_fp16.safetensors",
+                                                    "seedvr2_ema_vae_fp16.safetensors"}  # as ComfyUI names them
+    for d in UPSCALER_DOWNLOADS:
+        assert d.kind_folder == upscale.FOLDER and d.name.endswith(".safetensors") and d.size > 0
+        assert re.fullmatch(r"[0-9a-f]{40}", d.revision) and re.fullmatch(r"[0-9a-f]{64}", d.sha256)
+        assert find_download(d.id) == ("upscalers", "Upscalers", d)
+    assert sum(d.recommended for d in UPSCALER_DOWNLOADS) == 1
+
+
+def test_the_upscalers_card(client, tmp_path, monkeypatch):
+    """Model files' Upscalers card: the files in upscale_models (the catalog's known by name and size) and what each
+    is, and the downloads, into that folder."""
+    from dainamo.engine import upscale
+    from dainamo.server.model_files import UPSCALER_DOWNLOADS
+
+    models = tmp_path / "models"
+    folder = models / "upscale_models"
+    folder.mkdir(parents=True)
+    esrgan = next(d for d in UPSCALER_DOWNLOADS if d.name.startswith("RealESRGAN"))
+    with open(folder / esrgan.name, "wb") as f:  # the catalog's file: its name and size (sparse)
+        f.truncate(esrgan.size)
+    header_only_safetensors(folder / "4x-UltraSharp.safetensors", {"w": ("BF16", (4,))})
+    (folder / "put_esrgan_and_other_upscale_models_here").write_text("")
+    infos = [upscale.Info(str(folder / "4x-UltraSharp.safetensors"), "pixel", "4x-UltraSharp", scale=4),
+             upscale.Info(str(folder / esrgan.name), "pixel", "RealESRGAN_x4plus", scale=4)]
+    monkeypatch.setattr(upscale, "list_models", lambda base: infos)
+    client.put("/api/settings", json={"models": {"folder": str(models)}})
+    try:
+        ov = client.get("/api/models").json()
+        assert ov["folders"]["upscale_models"] == str(folder)
+        up = ov["upscalers"]
+        assert (up["id"], up["label"], up["folder"], up["folder_ok"]) == ("upscalers", "Upscalers", str(folder), True)
+        assert [(m["name"], m["kind"], m["scale"]) for m in up["models"]] == [("4x-UltraSharp", "pixel", 4),
+                                                                               ("RealESRGAN_x4plus", "pixel", 4)]
+        [field] = up["fields"]
+        have = {o["name"]: o["have"] for o in field["downloads"]}
+        assert have == {esrgan.name: str(folder / esrgan.name), "seedvr2_3b_fp16.safetensors": None,
+                        "seedvr2_ema_vae_fp16.safetensors": None}
+        assert all(o["folder"] == "upscale_models" for o in field["downloads"])
+        found = {f["name"]: f for f in field["found"]}
+        assert set(found) == {esrgan.name, "4x-UltraSharp.safetensors"}  # model files only
+        assert found[esrgan.name]["download"] == esrgan.id and found[esrgan.name]["where"] == \
+            os.path.join("upscale_models", esrgan.name)
+    finally:
+        client.put("/api/settings", json={"models": {"folder": ""}})
+    assert client.get("/api/models").json()["upscalers"]["models"] == []
+
+
+def test_an_upscaler_downloads_like_a_model_file(client, hub, tmp_path, monkeypatch):
+    from dainamo.engine.families.base import Download
+    from dainamo.server import model_files
+
+    _, data = hub
+    d = Download("upscaler", "test/upscalers", "up.safetensors", len(data), "test", "0" * 40,
+                 sha256=hashlib.sha256(data).hexdigest(), folder="upscale_models")
+    monkeypatch.setattr(model_files, "UPSCALER_DOWNLOADS", [d])
+    _Hub.files[f"/test/upscalers/resolve/{'0' * 40}/up.safetensors"] = data
+    _Hub.slow = set()
+    folder = tmp_path / "models" / "upscale_models"
+    t = client.post("/api/models/downloads", json={"id": d.id, "folder": str(folder)}).json()
+    assert (t["family"], t["family_label"], t["dest"]) == ("upscalers", "Upscalers", str(folder / "up.safetensors"))
+    t = _wait(client, t["id"])
+    assert t["state"] == "done", t["error"]
+    assert (folder / "up.safetensors").read_bytes() == data
+    client.delete(f"/api/models/downloads/{t['id']}")

@@ -6,11 +6,15 @@ sampling time only. Commands arrive as JSON lines on stdin; events go out as JSO
 
   in:  {"cmd": "generate", "id", "out_dir", "profile": {id, family, data}, "params": {...}}
        {"cmd": "refmod", "id", "out_dir", "profile", "paths", "sheet", "name", "settings": {refmod_*}}
+       {"cmd": "upscale", "id", "out_dir", "model", "inputs": [{path, kind}], "factor", "options"}
+       {"cmd": "upscale_dataset", "id", "model", "paths", "resolution", "max_factor"}
        {"cmd": "cancel", "id"}   {"cmd": "unload"}   {"cmd": "shutdown"}
   out: ready | status {message} | started {id}
        | progress {id, done, total, message, image, images, step, steps, sec_per_step, eta, started}
-       | output {id, item} | done {id, elapsed, loras; a RefMod's made} | error {id, message} | cancelled {id}
-       | idle | exit
+         (an upscale's: done and total in frames, an image counting one, with input, inputs, eta and started;
+         a dataset upscale's: done and total in images, with made so far)
+       | output {id, item} | done {id, elapsed, loras; a RefMod's or a dataset upscale's made}
+       | error {id, message} | cancelled {id} | idle | exit
 
 Memory: the diffusion model and VAE stay on the GPU, apart from the share of the diffusion model's
 blocks that the request's ``offload`` keeps in system RAM (changing it reloads the model, as does a request's
@@ -21,15 +25,22 @@ model and VAE are parked in RAM while it runs. A request with ``low_vram`` strea
 layers from system RAM instead, so only the rest of it comes to the GPU, and keeps the VAE in system RAM
 while sampling (unless input images or reference audio need it), moving the diffusion model there while a render decodes if
 the GPU hasn't room for both. Closing stdin (the server going away) shuts the worker down.
+
+Upscaling (``engine.upscale``) keeps its upscaler loaded too, until another model is asked for. The profile's
+models are parked in system RAM while it runs if the GPU hasn't room for both, and an upscaler that takes much
+VRAM (SeedVR2) is unloaded when a generation or RefMod comes next.
 """
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import json
 import os
 import queue
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -63,6 +74,9 @@ class Session:
         self.lora_files: OrderedDict = OrderedDict()  # path -> (mtime, state dict), most recent last
         self.lora_key = None
         self.lora_report: list = []
+        self.upscaler = None  # the loaded upscaler (``engine.upscale.Upscaler``), the file it came from, its VRAM
+        self.upscaler_path: str | None = None
+        self.upscaler_bytes = 0
 
     # --- lifecycle -----------------------------------------------------------
     def unload_all(self):
@@ -70,6 +84,7 @@ class Session:
         self.vae_loaded, self.te_where, self.te_parked, self.lora_key = False, None, None, None
         self.vae_parked, self.texts = None, OrderedDict()
         self.profile_key = None
+        self.drop_upscaler(clean=False)
         gc.collect()
         if self.torch.cuda.is_available():
             self.torch.cuda.empty_cache()
@@ -295,6 +310,7 @@ class Session:
         os.makedirs(out_dir, exist_ok=True)
         t0 = time.time()
         emit("started", id=rid)
+        self.drop_upscaler(big_only=True)
         self.ensure_driver(msg["profile"])
         self.use_model(p.get("model") or msg["profile"]["data"]["diffusion_model"])
         d = self.driver
@@ -429,6 +445,7 @@ class Session:
         os.makedirs(out_dir, exist_ok=True)
         t0 = time.time()
         emit("started", id=rid)
+        self.drop_upscaler(big_only=True)
         d = self.driver
         if d is None or d.info.id != profile["family"] or d.profile.get("vae") != profile["data"].get("vae"):
             self.ensure_driver(profile)
@@ -480,6 +497,404 @@ class Session:
                 self.vae_parked = park(self._vae_modules())
         emit("done", id=rid, elapsed=round(time.time() - t0, 1), made=made)
 
+    # --- upscaling -------------------------------------------------------------
+    def drop_upscaler(self, big_only: bool = False, clean: bool = True):
+        """Unload the upscaler; with ``big_only``, only one that took more than ``BIG_UPSCALER`` of VRAM (a pixel
+        upscaler's tens of MB can stay beside the profile's models)."""
+        if self.upscaler is None or (big_only and self.upscaler_bytes < BIG_UPSCALER):
+            return
+        if big_only:
+            emit("status", message="Unloading the upscaler to make room")
+        try:
+            self.upscaler.unload()
+        finally:
+            self.upscaler, self.upscaler_path, self.upscaler_bytes = None, None, 0
+        if clean:
+            gc.collect()
+            if self.torch.cuda.is_available():
+                self.torch.cuda.empty_cache()
+
+    def ensure_upscaler(self, path: str):
+        """The upscaler of the file at ``path``, loaded unless it already is (another one is unloaded first)."""
+        from . import upscale
+
+        if self.upscaler is not None and self.upscaler_path == path:
+            return self.upscaler
+        self.drop_upscaler()
+        info = upscale.identify(path)
+        cuda = self.torch.cuda.is_available()
+        before = self.torch.cuda.memory_allocated() if cuda else 0
+        emit("status", message=f"Loading {info.name}")
+        self.upscaler = upscale.load(info, self.device, log=lambda m: emit("status", message=str(m).strip()))
+        self.upscaler_path = path
+        self.upscaler_bytes = self.torch.cuda.memory_allocated() - before if cuda else 0
+        return self.upscaler
+
+    def _upscaler_room(self, path: str) -> list:
+        """Park the profile's models (diffusion model, VAE) in system RAM when the upscaler of ``path`` hasn't room
+        beside them: its working memory, plus its weights if it isn't loaded yet. What to unpark afterwards."""
+        torch = self.torch
+        if not torch.cuda.is_available() or not self._gpu_modules():
+            return []
+        from . import upscale
+        from .offload import park
+
+        info = upscale.identify(path)
+        # the upscaler class says what it works in (SeedVR2's ``vram_bytes``); else the table's guess
+        need = _upscaler_work(info)
+        if self.upscaler_path != path:
+            need += sum(os.path.getsize(p) for p in (info.path, info.companion) if p and os.path.exists(p))
+        torch.cuda.empty_cache()
+        if torch.cuda.mem_get_info()[0] >= need:
+            return []
+        emit("status", message="Moving the diffusion model to system RAM while the upscaler runs")
+        return park(self._gpu_modules(), getattr(self.driver, "swapper", None))
+
+    def upscale(self, msg: dict, is_cancelled):
+        """Each of ``inputs`` (images and clips) upscaled by ``factor`` with the upscaler in ``model``, one output
+        each: a fixed-scale model runs at its scale and is fitted to the size asked; clips keep their frame rate and
+        sound. Progress counts frames, an image as one."""
+        from . import upscale
+        from .dataset import image_size, media_kind
+        from .media import save_media
+        from .offload import unpark
+        from .upscale import any_channels
+
+        rid, out_dir, factor = msg["id"], msg["out_dir"], float(msg["factor"])
+        os.makedirs(out_dir, exist_ok=True)
+        t0 = time.time()
+        emit("started", id=rid)
+        check = _checker(is_cancelled)
+        if not factor > 0:
+            raise ValueError(f"Can't upscale by {factor:g}")
+        jobs = []  # (path, kind, its size, the size asked, frames, what was probed of a clip)
+        for i in msg["inputs"]:
+            path = i["path"]
+            kind = i.get("kind") or media_kind(path)
+            if kind == "video":
+                clip = _probe_clip(path)
+                w, h, frames = clip["width"], clip["height"], clip["frames"]
+            elif kind == "image":
+                (w, h), frames, clip = image_size(path), 1, None
+            else:
+                raise ValueError(f"{os.path.basename(path)} isn't an image or a video")
+            # H.264 in 4:2:0 wants even sides
+            jobs.append((path, kind, (w, h), upscale.target_size(w, h, factor, 2 if clip else 1), frames, clip))
+        total = sum(j[4] for j in jobs)
+        total_px = sum(j[4] * j[3][0] * j[3][1] for j in jobs) or 1
+        # the upscaler's own settings (SeedVR2's), passed on as they are; a pixel upscaler has none
+        kw = {"options": dict(msg["options"])} if msg.get("options") else {}
+        state = {"done": 0, "px": 0, "input": 0, "since": None}
+
+        def report(message: str):
+            check()
+            eta = None
+            if state["px"] and state["since"]:  # from the output pixels made so far, model loading left out
+                eta = (time.time() - state["since"]) / state["px"] * (total_px - state["px"])
+            emit("progress", id=rid, done=state["done"], total=total, message=message, input=state["input"] + 1,
+                 inputs=len(jobs), eta=eta, started=t0)
+
+        parked = self._upscaler_room(msg["model"])
+        try:
+            up = self.ensure_upscaler(msg["model"])
+            state["since"] = time.time()
+            for n, (path, kind, (iw, ih), (w, h), frames, clip) in enumerate(jobs):
+                state["input"] = n
+                name = os.path.basename(path)
+                report(f"{name}: {iw}×{ih} to {w}×{h}")
+                stem = f"{n}_{_safe_stem(path)}_x{factor:g}"
+                if kind == "image":
+                    x, mode, _ = _read_image(path)
+                    y = any_channels(up, x, (w, h), lambda text: report(f"{name}: {text}"), check, **kw)
+                    saved = save_media(_to_image(y, mode), out_dir, stem)
+                    state["done"] += 1
+                    state["px"] += w * h
+                else:
+                    media = self._upscale_clip(up, path, clip, (w, h), state, report, check, kw)
+                    report(f"{name}: writing the video")
+                    saved = save_media(media, out_dir, stem)
+                    del media
+                emit("output", id=rid, item={**saved, "source": path, "width": w, "height": h})
+        finally:
+            if parked:
+                unpark(parked)
+        emit("done", id=rid, elapsed=round(time.time() - t0, 1))
+
+    def _upscale_clip(self, up, path: str, clip: dict, size: tuple[int, int], state: dict, report, check,
+                      kw: dict) -> dict:
+        """A clip upscaled to ``size`` -> ``save_media``'s video dict, with its frame rate and sound. Frames are
+        read and upscaled a chunk at a time (one at a time for a pixel upscaler, as much of the clip as fits for one
+        that takes clips as clips), so only the result is held whole, as 8-bit frames."""
+        import numpy as np
+        import psutil
+
+        from .dataset import read_audio
+
+        torch = self.torch
+        name, (w, h), count = os.path.basename(path), size, clip["frames"]
+        free = psutil.virtual_memory().available
+        need = 2 * count * w * h * 3  # the frames, and save_media's copy of them for ffmpeg
+        if need + 2e9 > free:
+            raise ValueError(f"{name}: {count} frames at {w}×{h} take {need / 1e9:.0f} GB of system RAM to write, and "
+                             f"{free / 1e9:.0f} GB is free. Try a smaller factor or a shorter clip.")
+        per = 4 * 3 * (clip["width"] * clip["height"] + w * h)  # a frame in and out, as floats
+        chunk = max(1, min(count, int(min(8e9, free / 4) // per))) if up.info.video else 1
+        per_pass = getattr(up, "frames_per_pass", None)
+        if per_pass is not None and chunk < count:  # pieces end where the upscaler's own passes end
+            n = max(1, int(per_pass(size)))
+            chunk = max(n, chunk - chunk % n) if chunk >= n else chunk
+        out, made = [], 0
+        with contextlib.closing(_clip_frames(path, clip["width"], clip["height"], chunk)) as chunks:
+            for frames in chunks:
+                check()
+                x = torch.from_numpy(frames.astype(np.float32)).div_(255).permute(0, 3, 1, 2).contiguous()
+                y = up.upscale(x, size, lambda text: report(f"{name}: {text}"), check, **kw)
+                out.append((y.permute(0, 2, 3, 1) * 255).round_().clamp_(0, 255).to(torch.uint8).numpy())
+                del x, y
+                made += len(frames)
+                state["done"] += len(frames)
+                state["px"] += len(frames) * w * h
+                report(f"{name}: frame {made} of {max(count, made)}")
+        if not out:
+            raise ValueError(f"{name}: no frames could be read")
+        audio = None
+        if clip["audio"]:
+            audio = read_audio(path, made / clip["rate"], clip["sample_rate"], clip["channels"]).numpy()
+        frames = out[0] if len(out) == 1 else np.concatenate(out)
+        del out
+        # the rate as ffprobe gave it (30000/1001, not 29.97002997...): save_media passes it to ffmpeg as it is
+        return {"frames": frames, "fps": clip["fps"], "audio": audio, "sample_rate": clip["sample_rate"]}
+
+    def upscale_dataset(self, msg: dict, is_cancelled):
+        """A dataset's small images upscaled in place: each of ``paths`` whose area is under ``resolution`` squared
+        is upscaled to reach it (by ``max_factor`` at most), written as <stem>.png beside the original, which moves
+        to the ``_originals`` folder beside it. Captions (<stem>.txt) are untouched. Clips, and images large enough
+        already, are skipped. ``made``: {upscaled, skipped, errors, files: [{path, original, width, height}]}."""
+        from . import upscale
+        from .dataset import image_size, media_kind
+        from .offload import unpark
+        from .upscale import any_channels
+
+        uid, paths = msg["id"], list(msg["paths"])
+        resolution, max_factor = int(msg["resolution"]), float(msg["max_factor"])
+        t0 = time.time()
+        emit("started", id=uid)
+        check = _checker(is_cancelled)
+        made = {"upscaled": 0, "skipped": 0, "errors": [], "files": []}
+        parked, up = [], None
+
+        def report(done: int, message: str):
+            emit("progress", id=uid, done=done, total=len(paths), message=message,
+                 made={k: v for k, v in made.items() if k != "files"})
+
+        try:
+            for n, path in enumerate(paths):
+                check()
+                name = os.path.basename(path)
+                if media_kind(path) != "image":
+                    made["skipped"] += 1
+                    continue
+                try:
+                    w, h = image_size(path)
+                    size = upscale.target_size(w, h, upscale.factor_to_reach(w, h, resolution, max_factor))
+                    if size[0] <= w or size[1] <= h:
+                        made["skipped"] += 1
+                        continue
+                    report(n, f"{name}: {w}×{h} to {size[0]}×{size[1]}")
+                    x, mode, icc = _read_image(path)
+                except Exception as e:  # a file that isn't an image after all: noted, and on to the next
+                    made["errors"].append(f"{name}: {e}")
+                    continue
+                if up is None:  # loaded once something needs it; failing to load or run it ends the job
+                    parked = self._upscaler_room(msg["model"])
+                    up = self.ensure_upscaler(msg["model"])
+                y = any_channels(up, x, size, None, check)
+                try:
+                    original = _replace_image(path, _to_image(y, mode), icc)
+                except (OSError, ValueError) as e:
+                    made["errors"].append(f"{name}: {e}")
+                    continue
+                made["upscaled"] += 1
+                made["files"].append({"path": os.path.splitext(path)[0] + ".png", "original": original,
+                                      "width": size[0], "height": size[1]})
+            report(len(paths), f"Upscaled {made['upscaled']}, skipped {made['skipped']}")
+        finally:
+            if parked:
+                unpark(parked)
+        emit("done", id=uid, elapsed=round(time.time() - t0, 1), made=made)
+
+
+# VRAM an upscaler works in beyond its weights, by kind, to judge whether the profile's models must make room
+UPSCALE_WORK = {"pixel": 3e9, "seedvr2": 9.7e9}
+
+
+def _upscaler_work(info) -> float:
+    """Working VRAM an upscaler of ``info``'s kind needs beside its weights: the class's ``vram_bytes`` when it has
+    one, else ``UPSCALE_WORK``."""
+    if info.kind == "seedvr2":
+        try:
+            from .upscalers.seedvr2 import SeedVR2Upscaler
+            return float(getattr(SeedVR2Upscaler, "vram_bytes", UPSCALE_WORK["seedvr2"]))
+        except ImportError:
+            pass
+    return UPSCALE_WORK.get(info.kind, UPSCALE_WORK["pixel"])
+BIG_UPSCALER = 1.5e9  # an upscaler taking more VRAM than this is unloaded when a generation comes
+
+
+def _checker(is_cancelled):
+    from .sampling import Cancelled
+
+    def check():
+        if is_cancelled():
+            raise Cancelled()
+    return check
+
+
+def _safe_stem(path: str) -> str:
+    stem = "".join(c if c.isalnum() or c in "-_" else "_" for c in os.path.splitext(os.path.basename(path))[0])
+    return stem[:60] or "input"
+
+
+def _read_image(path: str):
+    """An image file, turned by its EXIF orientation -> ((1, C, H, W) float in [0, 1], the mode to save the result
+    in, its ICC profile). C is 3 (RGB), 4 (RGBA), 1 (greyscale) or 2 (greyscale with transparency)."""
+    import numpy as np
+    import torch
+    from PIL import Image, ImageOps
+
+    with Image.open(path) as im:
+        icc = im.info.get("icc_profile")
+        im = ImageOps.exif_transpose(im)
+        if im.mode in ("I", "F") or im.mode.startswith("I;16"):  # 16-bit greyscale
+            arr, mode = np.clip(np.asarray(im, dtype=np.float32) / 65535, 0, 1), "L"
+        else:
+            alpha = im.mode in ("RGBA", "LA", "PA", "RGBa", "La") or "transparency" in im.info
+            gray = im.mode in ("1", "L", "LA", "La")
+            mode = ("LA" if gray else "RGBA") if alpha else ("L" if gray else "RGB")
+            arr = np.asarray(im.convert(mode), dtype=np.float32) / 255
+    arr = arr.reshape(arr.shape[0], arr.shape[1], -1)
+    return torch.from_numpy(arr).permute(2, 0, 1)[None].contiguous(), mode, icc
+
+
+def _to_image(frames, mode: str):
+    """(1, C, H, W) float in [0, 1] -> a PIL image in ``mode`` (L, LA, RGB or RGBA, as C)."""
+    from PIL import Image
+
+    arr = (frames[0].permute(1, 2, 0) * 255).round_().clamp_(0, 255).byte().numpy()
+    return Image.fromarray(arr[..., 0] if mode == "L" else arr)
+
+
+def _replace_image(path: str, image, icc) -> str:
+    """Put ``image`` in the place of the image at ``path``, as <stem>.png beside it, the original moved into the
+    ``_originals`` folder there (never over an earlier original: <name>_2 and so on). Where it moved to."""
+    from .dataset import ORIGINALS_DIR
+
+    folder, name = os.path.split(path)
+    stem, ext = os.path.splitext(name)
+    target = os.path.join(folder, stem + ".png")
+    if os.path.normcase(target) != os.path.normcase(path) and os.path.exists(target):
+        raise ValueError(f"{stem}.png is there already, another image of the same name")
+    keep = os.path.join(folder, ORIGINALS_DIR)
+    os.makedirs(keep, exist_ok=True)
+    kept, k = os.path.join(keep, name), 1
+    while os.path.exists(kept):
+        k += 1
+        kept = os.path.join(keep, f"{stem}_{k}{ext}")
+    tmp = os.path.join(folder, f".{stem}.upscaling.png")  # hidden: datasets skip it if it's ever left behind
+    try:
+        image.save(tmp, **({"icc_profile": icc} if icc else {}))
+        os.replace(path, kept)
+        try:
+            os.replace(tmp, target)
+        except OSError:
+            os.replace(kept, path)  # put the original back
+            raise
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return kept
+
+
+def _probe_clip(path: str) -> dict:
+    """{width, height (as shown, turned by its rotation), frames (from the header, else duration × rate), fps (as
+    ffprobe gives it, e.g. "30000/1001"), rate (as a number), audio, sample_rate, channels (at most 2)} of a clip."""
+    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                          "stream=codec_type,width,height,avg_frame_rate,r_frame_rate,nb_frames,sample_rate,channels"
+                          ":stream_tags=rotate:stream_side_data=rotation:format=duration", "-of", "json", path],
+                         capture_output=True, text=True, timeout=60)
+    info = json.loads(out.stdout or "{}")
+    streams = info.get("streams") or []
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    if video is None:
+        why = f" ({out.stderr.strip()})" if out.stderr.strip() else ""
+        raise ValueError(f"{os.path.basename(path)}: no video stream{why}")
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    fps = next((r for r in (video.get("avg_frame_rate"), video.get("r_frame_rate"))
+                if r and _rate(r) > 0), "24/1")
+    w, h = int(video["width"]), int(video["height"])
+    turns = [(video.get("tags") or {}).get("rotate")] + [d.get("rotation") for d in video.get("side_data_list") or []]
+    if any(t is not None and abs(int(float(t))) % 180 == 90 for t in turns):
+        w, h = h, w
+    duration = float((info.get("format") or {}).get("duration") or 0.0)
+    frames = int(video.get("nb_frames") or 0) or max(1, round(duration * _rate(fps)))
+    return {"width": w, "height": h, "frames": frames, "fps": fps, "rate": _rate(fps), "audio": audio is not None,
+            "sample_rate": int((audio or {}).get("sample_rate") or 48000),
+            "channels": min(2, int((audio or {}).get("channels") or 2))}
+
+
+def _rate(text: str) -> float:
+    num, _, den = str(text).partition("/")
+    try:
+        return float(num) / float(den or 1)
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def _clip_frames(path: str, width: int, height: int, chunk: int):
+    """A clip's frames as (n, height, width, 3) uint8 arrays, ``chunk`` at a time, decoded by ffmpeg as they're
+    asked for: every frame as it is, none added or dropped to even out the frame rate."""
+    import numpy as np
+
+    size = width * height * 3
+    with tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(["ffmpeg", "-v", "error", "-i", path, "-map", "0:v:0", "-fps_mode", "passthrough",
+                                 "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE, stderr=err)
+        try:
+            while True:
+                data = proc.stdout.read(size * chunk)
+                n = len(data) // size
+                if n:
+                    yield np.frombuffer(data, np.uint8, n * size).reshape(n, height, width, 3)
+                if len(data) < size * chunk:
+                    break
+            if proc.wait() != 0:
+                err.seek(0)
+                raise ValueError(f"{os.path.basename(path)}: ffmpeg couldn't read it: "
+                                 f"{err.read().decode(errors='replace').strip()[-500:]}")
+        finally:
+            if proc.poll() is None:  # stopped early (cancelled, or an error upscaling)
+                proc.kill()
+            proc.stdout.close()
+            proc.wait()
+
+
+def _out_of_memory(cmd: str, msg: dict, session: Session) -> str:
+    """What to try when ``cmd`` ran out of GPU memory, to go before the error."""
+    if cmd == "generate":
+        return "Out of GPU memory. Try a smaller size, fewer frames, or fewer LoRAs. "
+    if cmd == "refmod":
+        return "Out of GPU memory: lower the size or the frames per clip. "
+    seedvr2 = session.upscaler is not None and session.upscaler.info.kind == "seedvr2"
+    if session.upscaler is None:
+        try:
+            from .upscale import identify
+
+            seedvr2 = identify(msg["model"]).kind == "seedvr2"
+        except Exception:
+            pass
+    what = "a smaller factor" if cmd == "upscale" else "a lower resolution or max factor"
+    return f"Out of GPU memory: try {what}" + (", or a smaller SeedVR2 tile (its tile option)" if seedvr2 else "") + ". "
+
 
 def main():
     global EVENTS
@@ -519,20 +934,21 @@ def main():
         if cmd == "unload":
             session.unload_all()
             emit("idle")
-        elif cmd in ("generate", "refmod"):
+        elif cmd in ("generate", "refmod", "upscale", "upscale_dataset"):
             rid = msg.get("id")
+            run = {"generate": session.generate, "refmod": session.make_refmod, "upscale": session.upscale,
+                   "upscale_dataset": session.upscale_dataset}[cmd]
             try:
                 if rid in cancelled:
                     raise Cancelled()
-                (session.generate if cmd == "generate" else session.make_refmod)(msg, lambda: rid in cancelled)
+                run(msg, lambda: rid in cancelled)
             except Cancelled:
                 emit("cancelled", id=rid)
             except Exception as e:  # report and keep serving
                 traceback.print_exc()
                 text = f"{type(e).__name__}: {e}"
                 if "out of memory" in str(e).lower():
-                    text = ("Out of GPU memory. Try a smaller size, fewer frames, or fewer LoRAs. " if cmd == "generate"
-                            else "Out of GPU memory: lower the size or the frames per clip. ") + text
+                    text = _out_of_memory(cmd, msg, session) + text
                 emit("error", id=rid, message=text)
                 if session.torch.cuda.is_available():
                     session.torch.cuda.empty_cache()

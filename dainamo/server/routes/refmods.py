@@ -94,15 +94,10 @@ def check(body: RefModIn) -> tuple[dict, type, list[str], dict, str]:
 
 def _gpu(body: RefModIn) -> int:
     """The Sandbox's GPU, or (it isn't running) the one asked for, as a generation picks it."""
-    if sbx.sandbox.alive():
-        return sbx.sandbox.gpu
-    if sbx.mode() != "reserve":
-        return 0
-    n = sbx.gpu_count()
-    gpu = body.gpu if body.gpu is not None else n - 1
-    if not 0 <= gpu < n:
-        raise HTTPException(400, f"No GPU {gpu}")
-    return gpu
+    try:
+        return sbx.pick_gpu(body.gpu)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @router.post("/check")

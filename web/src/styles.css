@@ -886,6 +886,15 @@ img.audio-thumb { aspect-ratio: 2; object-fit: fill; }
 .sbx-out-head .ellipsis { margin-left: auto; font-size: 12px; }
 .sbx-out .sbx-poster { width: 100%; aspect-ratio: 3.4 / 1; object-fit: fill; border: 0; border-radius: 6px; }
 .sbx-out-meta { font-size: 12px; line-height: 1.6; color: var(--label); overflow-wrap: anywhere; }
+/* an output's Upscale button, at the end of its heading */
+.btn.sbx-out-act { flex: none; margin: -3px 0 -3px auto; align-self: center; padding: 3px 8px; }
+.sbx-out-head .ellipsis + .btn.sbx-out-act { margin-left: 0; }
+.btn.sbx-out-act svg { width: 13px; height: 13px; }
+/* the Upscale dialog's file */
+.up-target { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.up-target img, .up-target .up-thumb { width: 56px; height: 56px; flex: none; object-fit: cover; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-2); }
+.up-target .up-thumb { display: grid; place-items: center; color: var(--faint); }
+.up-target .up-thumb svg { width: 22px; height: 22px; }
 
 /* a song's player */
 .player { display: flex; align-items: center; gap: 8px; height: 40px; padding: 0 6px; border-radius: 8px; background: var(--panel-3); font-size: 12px; }

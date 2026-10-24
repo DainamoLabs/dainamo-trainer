@@ -129,6 +129,7 @@ export type SandboxGrid = {
 export type SandboxOutput = {
   file: string; kind: MediaKind; poster?: string; score?: string; seed: number; variant: "lora" | "base" | "grid";
   checkpoint?: number; strength?: number; // a grid image: indexes into the grid's checkpoints and strengths
+  source?: string; width?: number; height?: number; // an upscale's: the file it was made from, and its size
 };
 export type SandboxRun = {
   id: string; created: number; started: number | null; status: "queued" | "running" | "done" | "failed" | "cancelled";
@@ -142,11 +143,48 @@ export type SandboxRun = {
 export type SandboxProgress = {
   done: number; total: number; image?: number; images?: number; step?: number; steps?: number;
   sec_per_step?: number | null; elapsed?: number; eta?: number | null;
+  input?: number; inputs?: number; // an upscale's: the file it's on, of how many (done and total count frames)
 };
 export type SandboxSession = {
   state: "off" | "starting" | "ready" | "busy" | "stopping"; gpu: number | null; message: string;
   progress: SandboxProgress | null; current: string | null; pending: string[]; yielding: boolean;
   idle_seconds: number | null; refmod: SandboxRefMod | null;
+  upscale: (DatasetUpscaleJob & { id: string; dataset_id: string; dataset: string }) | null; // a dataset's small images
+};
+
+// an upscaler in the models folder's upscale_models (GET /api/upscalers): a pixel upscaler has a fixed ``scale``;
+// SeedVR2 makes any size (scale 0) and takes clips whole (``video``), with its VAE (``companion``) beside it
+export type Upscaler = {
+  path: string; kind: "pixel" | "seedvr2" | "unknown"; name: string; scale: number; video: boolean;
+  companion: string | null; error: string | null; size: number;
+};
+export type Upscalers = { folder: string; models: Upscaler[]; error: string };
+// an upscale run's params (a Sandbox run with workflow "upscale"): the upscaler, the factor, and what it upscales
+// (a run's output, or a file), with the size asked for
+export type UpscaleParams = {
+  model: string; model_name: string; kind: Upscaler["kind"]; scale: number; factor: number;
+  source: { run_id: string; file: string; n: number } | null; upload: string | null; options: Record<string, unknown>;
+  input: {
+    path: string; name: string; kind: "image" | "video"; width: number; height: number; frames?: number; fps?: number;
+    url: string | null; poster: string | null; // where the page can show it, if it can
+  };
+  width: number; height: number;
+};
+// Upscale small images on a dataset (GET /api/datasets/{id}/upscale)
+export type DatasetUpscaleJob = {
+  state: "none" | "queued" | "running" | "done" | "failed" | "cancelled"; message: string; done: number; total: number;
+  made: { upscaled: number; skipped: number; errors: string[] } | null;
+  id?: string; dataset_id?: string; dataset?: string; model?: string; model_name?: string; resolution?: number; max_factor?: number;
+};
+export type DatasetUpscale = DatasetUpscaleJob & {
+  elsewhere: { id: string; name: string } | null; // another dataset being upscaled now
+  last: { model: string; resolution: number; max_factor: number } | null; // the last upscale's settings
+};
+// what it would do (GET /api/datasets/{id}/upscale/plan): ``small`` of the ``images`` are under the resolution,
+// ``capped`` of them need more than the largest factor; ``clash``: skipped, as another file has the name they'd get
+export type UpscalePlan = {
+  images: number; small: number; capped: number; clash: string[]; unreadable: number; clips: number;
+  smallest: { name: string; width: number; height: number } | null;
 };
 // the RefMod the Sandbox is making, or made last
 export type SandboxRefMod = {
@@ -325,6 +363,8 @@ export type ModelTask = {
 export type ModelsOverview = {
   folder: string; folder_ok: boolean; folders: Record<string, string>; token: boolean;
   families: ModelFamily[]; tasks: ModelTask[];
+  // the Upscalers card: like a family, with one field to download into upscale_models, and what's there
+  upscalers: ModelFamily & { folder: string; folder_ok: boolean; models: Upscaler[]; error: string };
 };
 
 export type CaptionProvider = "server" | "llama" | "encoder";

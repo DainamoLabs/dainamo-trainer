@@ -68,6 +68,7 @@ download from any address, including ones on your local network.
 - [Captions](docs/captions.md): Auto-Caption and the caption provider
 - [Jobs](docs/jobs.md): Create Job, the queue, editing and continuing jobs, the checkpoint picker, notifications
 - [Sandbox](docs/sandbox.md)
+- [Upscaling](docs/upscaling.md): Real-ESRGAN and SeedVR2 in the Sandbox, and a dataset's small images
 - [LoKr](docs/lokr.md), [Sliders](docs/sliders.md), [Full finetuning](docs/finetuning.md), [RefMods](docs/refmods.md), [Music](docs/music.md)
 - [Memory](docs/memory.md): layer offloading, VRAM projection, Low VRAM
 - [Model families](docs/model-families.md): what each needs, weight formats, speeds, licenses

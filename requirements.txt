@@ -10,6 +10,7 @@ pillow
 bitsandbytes>=0.48
 prodigyopt
 huggingface_hub
+spandrel==0.4.2  # pixel upscalers (the ESRGAN family), from ComfyUI's upscale_models folder
 hf_xet
 fastapi>=0.115
 uvicorn[standard]>=0.30

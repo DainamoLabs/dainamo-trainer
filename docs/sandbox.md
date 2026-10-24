@@ -20,6 +20,11 @@ The Sandbox generates with a profile and LoRAs, to test them.
   but fl2va wasn't trained on references, so it may follow them less closely
   than ref2va.
 
+**Upscale**, on an image or video output, makes it bigger with an upscaler
+(Real-ESRGAN, SeedVR2 or another file in the models folder's `upscale_models`),
+and **Upscale a file**, below History, does the same for a file on this machine
+or one you upload. See [Upscaling](upscaling.md).
+
 **Compare with base model** renders each seed again without the LoRAs. **Compare
 checkpoints** renders one prompt and seed with each of a job's chosen
 checkpoints (up to 12) at each strength (up to 6), optionally with the base
@@ -39,7 +44,8 @@ VRAM** if the offloading setting needs a look. Ctrl+Enter generates.
 The latest run shows each seed with the LoRAs beside the base model, if
 compared. **History** keeps every run, newest first, numbered in the order they
 were made: click one to see it again, and **Reuse settings** puts its settings
-back in the form.
+back in the form. An upscale shows there too, with the file it came from beside
+the result.
 
 ## GPUs
 

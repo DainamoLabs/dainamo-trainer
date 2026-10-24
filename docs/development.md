@@ -20,6 +20,8 @@ dainamo/
     transcribe.py         Whisper speech-to-text for Auto-Caption (a subprocess)
     textgen.py            text encoders that write captions, and their OpenAI-style server
     hf_assets.py          tokenizers and configs from Hugging Face, pinned to a commit
+    upscale.py            upscalers: what each file of upscale_models is, loading one, fitting sizes
+    upscalers/            pixel.py (the spandrel architectures, tiled) and seedvr2/ (the SeedVR2 3B port)
   assets/                 bundled copies of those for the families whose licenses allow it (see its README)
     families/             one driver per model family
       base.py             driver interface
@@ -27,7 +29,7 @@ dainamo/
       ltx2/               LTX 2.5: diffusers' LTX-2 classes loaded from ComfyUI files, and the driver
   server/
     app.py                FastAPI app: middleware, routers, the built web UI
-    routes/               the API, one module per area (system, profiles, models, datasets, clips, jobs, sandbox, llm, tools)
+    routes/               the API, one module per area (system, profiles, models, datasets, clips, jobs, sandbox, refmods, upscale, llm, tools)
     validation.py         job settings checks
     db.py                 SQLite store and its schema migrations
     queue.py              job queue: launches training processes onto GPUs
@@ -117,7 +119,10 @@ only the header matters.
 | `test_lokr.py` | LoKr factor splits, a LoKr layer against the full Kronecker product, `lokr_w1`/`lokr_w2` keys saved and loaded, the Sandbox applying LoKr files and explaining the ones it can't, a tiny LoKr job |
 | `test_slider.py` | the slider step (base predictions with the LoRA off, the guided target, the strength during backward) and a tiny slider job without a dataset |
 | `test_sampling.py` | samplers on Gaussian data with a known solution (Heun and DPM++ 2M converge at second order), DPM++ 2M against k-diffusion, the beta schedule |
-| `test_sandbox.py` | Sandbox requests per family and workflow, GPU rules shared with the queue, the LoRA stack, parking models in RAM, Low VRAM's VAE, checkpoint grids, the step counter, making RefMods (checks, the clip VRAM warning, sheets, listing) |
+| `test_sandbox.py` | Sandbox requests per family and workflow, GPU rules shared with the queue, the LoRA stack, parking models in RAM, Low VRAM's VAE, checkpoint grids, the step counter, making RefMods (checks, the clip VRAM warning, sheets, listing), the worker's upscale and dataset upscale commands |
+| `test_upscale.py` | pixel upscalers: tiles that add up to a whole-image pass, seamless overlaps, odd sizes, greyscale and alpha, fitting to another factor, fp16 overflow, cancelling between tiles, telling files apart. With a GPU and RealESRGAN_x4plus, the real file |
+| `test_seedvr2.py` | the SeedVR2 3B port: the DiT against the reference on small grids (windows, shifted windows), window cuts and RoPE at 1080p, the causal VAE whole vs sliced vs tiled, 4n+1 padding, the colour fix, the one-step schedule, the upscaler end to end on tiny models (odd sizes, frame counts, options, cancelling), and the real files' keys |
+| `test_upscale_routes.py` | upscaling's routes: the upscalers listed from upscale_models, a run's output or an uploaded file upscaled as a run (the command sent, the run's events), a dataset's small images upscaled one dataset at a time (the plan, progress, cancelling, the worker stopping) |
 | `test_evaluation.py` | the hold-out split, recommendation rules, deterministic validation loss, bleed normalisation, multi-resolution items and per-dataset settings with their cache keys |
 | `test_trainer.py` | a tiny stand-in model on the GPU: a job trains, saves, finishes and continues; Evaluate checkpoints; jobs sharing a dataset's encodings; a job with EMA weights saving the average and carrying it on |
 | `test_ema.py` | the EMA's warmup decays, swapping the average in and back (also when the body raises), its saved state |
@@ -125,8 +130,8 @@ only the header matters.
 | `test_timesteps.py` | the noise range on every family's timestep mode, Min-SNR and cosine-map weights, none applied at a pinned sigma, the Validator drawing inside the range |
 | `test_cache.py` | which model files and settings share cache folders, and that a model file is known by its contents |
 | `test_hf_assets.py` | Hugging Face files read from the cache offline, downloaded once at the pinned commit, and a clear error offline without them |
-| `test_model_files.py` | the families' download lists, the models folder setting, finding files by their contents, downloads pausing, resuming and checking their checksum, gated and impossible downloads, the Turbo-without-adapter warning |
-| `test_dataset_check.py` | each kind of health check problem (loss masks among them), and that a file is read once |
+| `test_model_files.py` | the families' download lists, the models folder setting, finding files by their contents, downloads pausing, resuming and checking their checksum, gated and impossible downloads, the Turbo-without-adapter warning, the Upscalers card and its downloads into upscale_models |
+| `test_dataset_check.py` | each kind of health check problem (loss masks among them), upscaled images' _originals left out and noted, and that a file is read once |
 | `test_sources.py` | source datasets: files pairing by name across image types and subfolders, the _refs folder without them, which models take them, the health check's pairing findings, the pairs route, jobs keeping them, the VRAM projection counting them |
 | `test_clip_split.py` | Split into clips: planning inside shots, cutting at 24 fps with sound, captions and references, cancelling, each video once per epoch |
 | `test_clip_editor.py` | the clip editor: a reviewed split cut as planned, then again only where it changed (captions kept, removed clips gone, deleted ones not brought back), crops, splits from before the editor, replanning, checks on edits, and its frames being the clips' own |

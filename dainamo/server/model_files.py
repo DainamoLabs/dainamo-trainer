@@ -21,7 +21,9 @@ from urllib.parse import quote
 
 import httpx
 
+from ..engine import upscale
 from ..engine.families import FAMILIES
+from ..engine.families.base import Download
 from . import db
 
 # ComfyUI's folder for each kind of file, then the older names it still reads
@@ -63,12 +65,37 @@ def hf_token() -> str | None:
         return os.environ.get("HF_TOKEN") or None
 
 
-def find_download(download_id: str):
-    """(family driver, ``Download``) for a catalog id ("<repo>/<path>"); KeyError for one no family lists."""
+# The upscalers Model files offers (``engine.upscale``), into the models folder's upscale_models, where a SeedVR2
+# model looks for its VAE. They belong to no family: their "family" is UPSCALERS. The files are ComfyUI's own repacks.
+UPSCALERS = ("upscalers", "Upscalers")
+UPSCALER_FIELD = "upscaler"
+UPSCALER_DOWNLOADS = [
+    Download(UPSCALER_FIELD, "Comfy-Org/Real-ESRGAN", "RealESRGAN_x4plus.safetensors", 66857836,
+             "Real-ESRGAN x4plus · 4×, photos", "5fd49b7b278836f48af63ecd314d0f98ab336105",
+             "37f9a931c215f040aa6d50f711f2cb115f713c46df1d0d6469a8bd7bfe9a60bb", folder=upscale.FOLDER,
+             recommended=True, note="A small, fast upscaler for images and video frames (BSD-3-Clause)."),
+    Download(UPSCALER_FIELD, "Comfy-Org/SeedVR2", "diffusion_models/seedvr2_3b_fp16.safetensors", 6784268336,
+             "SeedVR2 3B · any size, video", "df48879708206a403d2a61acd55578c2e80fd233",
+             "98669fd2c06df5eca88baf68cd5c478775c8e61fc110e598c52b350145ea2660", folder=upscale.FOLDER,
+             note="ByteDance's one-step video restorer (Apache-2.0). It needs the SeedVR2 VAE in the same folder: "
+                  "download that too."),
+    Download(UPSCALER_FIELD, "Comfy-Org/SeedVR2", "vae/seedvr2_ema_vae_fp16.safetensors", 501324814,
+             "SeedVR2 VAE · for SeedVR2 3B", "df48879708206a403d2a61acd55578c2e80fd233",
+             "20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1", folder=upscale.FOLDER,
+             note="SeedVR2 3B reads and writes frames with it; it goes beside the model."),
+]
+
+
+def find_download(download_id: str) -> tuple[str, str, Download]:
+    """(family id, its label, ``Download``) for a catalog id ("<repo>/<path>"); KeyError for one no family (nor
+    the upscalers) lists."""
     for F in FAMILIES.values():
         for d in F.downloads:
             if d.id == download_id:
-                return F, d
+                return F.info.id, F.info.label, d
+    for d in UPSCALER_DOWNLOADS:
+        if d.id == download_id:
+            return *UPSCALERS, d
     raise KeyError(f"No model family downloads {download_id!r}")
 
 
@@ -173,8 +200,64 @@ def overview() -> dict:
                            "downloads": options, "found": found})
         families.append({"id": F.info.id, "label": F.info.label, "fields": fields})
     return {"folder": base, "folder_ok": bool(base) and os.path.isdir(base),
-            "folders": {k: os.path.join(base, k) if base else "" for k in KIND_FOLDERS},
-            "token": bool(hf_token()), "families": families, "tasks": tasks}
+            "folders": {k: os.path.join(base, k) if base else "" for k in (*KIND_FOLDERS, upscale.FOLDER)},
+            "token": bool(hf_token()), "families": families, "upscalers": _upscalers_overview(base, pending, where),
+            "tasks": tasks}
+
+
+def _upscalers_overview(base: str, pending: dict, where) -> dict:
+    """The Upscalers card: like a family with one field (any upscaler, and SeedVR2's VAE, to download), and the
+    upscalers in upscale_models with what each is (``upscalers``)."""
+    folder = os.path.join(base, upscale.FOLDER) if base else ""
+    files = []
+    for name in sorted(os.listdir(folder)) if folder and os.path.isdir(folder) else []:
+        path = os.path.join(folder, name)
+        if name.lower().endswith(upscale.EXTS) and os.path.isfile(path):
+            files.append({"path": path, "name": name, "size": os.path.getsize(path)})
+    have = {(f["name"], f["size"]): f["path"] for f in files}
+    options = [{**d.to_json(), "have": have.get((d.name, d.size)), "task": pending.get(d.id)} for d in UPSCALER_DOWNLOADS]
+    known = {o["have"]: o["id"] for o in options if o["have"]}
+    found = [{**f, "where": where(f["path"]), "quant": [], "unsupported": [], "download": known.get(f["path"])}
+             for f in files]
+    field = {"key": UPSCALER_FIELD, "label": "Upscaler", "hint": "Any file in upscale_models", "required": False,
+             "downloads": options, "found": found}
+    listed = upscalers(base) if folder else {"models": [], "error": ""}
+    return {"id": UPSCALERS[0], "label": UPSCALERS[1], "folder": folder, "folder_ok": bool(folder) and os.path.isdir(folder),
+            "fields": [field], "models": listed["models"], "error": listed["error"]}
+
+
+_upscalers_seen: dict = {"key": None, "models": [], "error": ""}
+_upscalers_lock = threading.Lock()
+
+
+def upscalers(base: str | None = None) -> dict:
+    """{folder, models: [``upscale.Info`` as JSON, with its size]}: the upscalers in the models folder's
+    upscale_models (``upscale.list_models``). Telling a .pth apart loads it, so the list is kept until a file in the
+    folder changes."""
+    base = models_folder() if base is None else base
+    folder = os.path.join(base, upscale.FOLDER) if base else ""
+    key = [folder]
+    for name in sorted(os.listdir(folder)) if folder and os.path.isdir(folder) else []:
+        try:
+            st = os.stat(os.path.join(folder, name))
+        except OSError:
+            continue
+        key.append((name, st.st_size, st.st_mtime_ns))
+    with _upscalers_lock:
+        if _upscalers_seen["key"] != key:
+            models, error = [], ""
+            try:
+                found = upscale.list_models(base) if folder and os.path.isdir(folder) else []
+            except Exception as e:  # a file that breaks the reader shouldn't break the page
+                found, error = [], f"Couldn't read the upscale_models folder: {e}"
+            for info in found:
+                try:
+                    size = os.path.getsize(info.path)
+                except OSError:
+                    size = 0
+                models.append({**info.to_json(), "size": size})
+            _upscalers_seen.update(key=key, models=models, error=error)
+        return {"folder": folder, "models": list(_upscalers_seen["models"]), "error": _upscalers_seen.get("error", "")}
 
 
 def suggested_folders() -> list[str]:
@@ -293,7 +376,7 @@ class Downloads:
 
     def add(self, download_id: str, folder: str) -> dict:
         """Queue a catalog file to download into ``folder``. ValueError when it can't be."""
-        F, d = find_download(download_id)
+        family, family_label, d = find_download(download_id)
         folder = os.path.abspath(os.path.expanduser(folder.strip())) if folder.strip() else ""
         if not folder:
             raise ValueError("Choose the folder to download it into")
@@ -314,7 +397,7 @@ class Downloads:
         if info["free"] is not None and info["free"] - need < SPARE_BYTES:
             raise ValueError(f"Not enough space: it needs {_gb(need)} and that disk has {_gb(info['free'])} free "
                              f"(Dainamo leaves {_gb(SPARE_BYTES)} spare)")
-        t = {"id": db.new_id(), "download": d.id, "family": F.info.id, "family_label": F.info.label,
+        t = {"id": db.new_id(), "download": d.id, "family": family, "family_label": family_label,
              "field": d.field, "repo": d.repo, "path": d.path, "revision": d.revision, "sha256": d.sha256,
              "name": d.name, "label": d.label, "dest": dest, "size": d.size, "done": self._part_size({"dest": dest}),
              "state": "queued", "error": "", "speed": 0, "added": time.time(), "finished": None, "gated": d.gated}

@@ -17,13 +17,14 @@ from functools import lru_cache
 import numpy as np
 from PIL import Image
 
-from ..engine.dataset import (IMAGE_EXTS, MASKS_DIR, REFS_DIR, SMALL, caption_path, inside, list_media, mask_path,
-                              media_kind, nested_sources, paired_source, probe_audio, probe_video, reference_images,
-                              refers_to, source_index, split_clips, split_lyrics, trains_small)
+from ..engine.dataset import (IMAGE_EXTS, MASKS_DIR, ORIGINALS_DIR, REFS_DIR, SMALL, caption_path, inside, list_media,
+                              mask_path, media_kind, nested_sources, paired_source, probe_audio, probe_video,
+                              reference_images, refers_to, source_index, split_clips, split_lyrics, trains_small)
 
 DUPLICATE_BITS = 4  # difference hashes this close (of 64 bits) are near-duplicates: resized, re-saved, lightly edited
 FPS = 24
 MAX_LISTED = 60
+SKIPPED_DIRS = (REFS_DIR, MASKS_DIR, ORIGINALS_DIR)  # folders of a dataset that aren't its files
 SONG_RATE = 44100  # music: files below this sample rate sound duller than what the model makes
 MIN_SONG, MAX_SONG = 5, 360  # seconds a music model trains on: shorter files are skipped, longer ones cut
 MASK_ASPECT = 0.02  # a mask whose shape is further than this from its image's is noticeably stretched to fit it
@@ -160,7 +161,7 @@ def pairing(root: str, files: list[str], sources: list[dict]) -> dict:
     for dirpath, dirnames, _ in os.walk(root) if os.path.isdir(root) else []:
         if REFS_DIR in dirnames:
             folders.append(os.path.join(dirpath, REFS_DIR))
-        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in (REFS_DIR, MASKS_DIR)]
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in SKIPPED_DIRS]
     if not folders:
         return {"from": None}
     stems: dict[str, set[str]] = {}
@@ -289,9 +290,10 @@ def check(root: str, trigger: str = "", resolution: list[int] | None = None, div
             title = (f"{_plural(len(first), 'file')} train{'s' if len(first) == 1 else ''} below {top}"
                      + "".join(f", {len(fs)} below {r}" for r, fs in rest))
             add("small", "warning", title,
-                f"They have fewer pixels than {f'{top}×{top}' if not rest else 'those sizes'} at their shape, and files "
-                f"are never upscaled, so they train at a smaller size (under {SMALL:.0%} of the pixels). Fine for a few; "
-                "for many, pick a smaller resolution or use larger sources.",
+                f"They have fewer pixels than {f'{top}×{top}' if not rest else 'those sizes'} at their shape, and "
+                f"training never upscales a file, so they train at a smaller size (under {SMALL:.0%} of the pixels). "
+                "Fine for a few; for many, pick a smaller resolution, use larger sources, or upscale them (Upscale "
+                "small images, on the dataset's page).",
                 [f for f in used if any(f in fs for fs in small.values())])
 
     frames = {f: int(infos[f]["seconds"] * FPS + 1e-3) for f in clips}  # as the trainer counts them
@@ -373,18 +375,28 @@ def check(root: str, trigger: str = "", resolution: list[int] | None = None, div
             add("no_trigger", "info", f"{_plural(len(without), 'caption')} without the trigger word",
                 f"“{trigger}” is added at the start of these when training.", without)
     media_stems = set(stems)
-    orphans, mask_dirs = [], []
+    orphans, mask_dirs, originals = [], [], []
     skip = {os.path.abspath(p) for p in inner}  # a source dataset's captions (and masks) are its own
     for dirpath, dirnames, names in os.walk(root):
         if MASKS_DIR in dirnames:
             mask_dirs.append(os.path.join(dirpath, MASKS_DIR))
-        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in (REFS_DIR, MASKS_DIR)
+        if ORIGINALS_DIR in dirnames:
+            folder = os.path.join(dirpath, ORIGINALS_DIR)
+            originals += [os.path.join(folder, n) for n in sorted(os.listdir(folder))
+                          if not n.startswith(".") and media_kind(n) == "image"]
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in SKIPPED_DIRS
                        and os.path.abspath(os.path.join(dirpath, d)) not in skip]
         orphans += [os.path.join(dirpath, n) for n in sorted(names)
                     if n.lower().endswith(".txt") and os.path.join(dirpath, n)[:-4] not in media_stems]
     if orphans:
         add("orphan_caption", "info", f"{_plural(len(orphans), 'caption file')} without a media file",
             "Nothing trains with them; maybe the file they belonged to was renamed or removed.", orphans)
+    if originals:
+        add("upscaled", "info", f"{_plural(len(originals), 'image was', 'images were')} upscaled "
+                                f"(originals in {ORIGINALS_DIR})",
+            f"Upscale small images replaced them with larger copies and kept each original in an {ORIGINALS_DIR} "
+            "folder beside it, which training skips. To undo one, delete the upscaled .png and move the original "
+            "back.", originals)
     if mask_dirs and not music:
         _check_masks(add, files, [f for f in used if infos[f]["kind"] == "image"], infos, mask_dirs,
                      video_frames is not None)

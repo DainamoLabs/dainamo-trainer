@@ -54,3 +54,4 @@ export const IconInfo = base(<><circle cx="12" cy="12" r="10" /><path d="M12 16v
 export const IconMinusCircle = base(<><circle cx="12" cy="12" r="9" /><path d="M8 12h8" /></>);
 export const IconClock = base(<><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>);
 export const IconQueueAdd = base(<><path d="M3 6h14M3 12h10M3 18h7" /><path d="M14 18h7M18 15l3 3-3 3" /></>);
+export const IconUpscale = base(<><path d="M15 3h6v6" /><path d="M9 21H3v-6" /><path d="m21 3-7 7" /><path d="m3 21 7-7" /></>);

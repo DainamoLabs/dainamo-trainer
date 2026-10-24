@@ -16,7 +16,7 @@ export function DownloadDialog(props: {
 }) {
   const toast = useToast();
   const [ov] = usePoll<ModelsOverview>("/api/models", 0);
-  const fam = ov?.families.find((f) => f.id === props.family);
+  const fam = props.family === ov?.upscalers?.id ? ov.upscalers : ov?.families.find((f) => f.id === props.family);
   const fld = fam?.fields.find((f) => f.key === props.field);
   const opts = (fld?.downloads || []).filter((o) => !props.variant || !o.variant || o.variant === props.variant);
   const [sel, setSel] = useState("");
@@ -44,7 +44,7 @@ export function DownloadDialog(props: {
 
   return (
     <Modal
-      title={fam && fld ? `${fld.label.replace(" (CLIP)", "")} for ${fam.label.replace(/ \(.*\)$/, "")}` : "Download"}
+      title={fam && fld ? (fam === ov?.upscalers ? "Download an upscaler" : `${fld.label.replace(" (CLIP)", "")} for ${fam.label.replace(/ \(.*\)$/, "")}`) : "Download"}
       onClose={props.onClose}
       footer={
         <>

@@ -82,6 +82,9 @@ class FakeProc:
     def poll(self):
         return None
 
+    def wait(self, timeout=None):  # the manager's tick may stop an idle fake worker
+        return 0
+
 
 def _queue_job(gpu="auto"):
     jid = db.new_id()
@@ -708,3 +711,261 @@ def test_the_sandbox_makes_refmods(client, profiles, monkeypatch, tmp_path):
         assert client.get("/api/sandbox/refmod/file/abc123/made.json").status_code == 404
     finally:
         shutil.rmtree(folder)
+
+
+# --- upscaling in the worker ---------------------------------------------------------------------------------------
+class FakeUpscaler:
+    """Stands in for an ``engine.upscale.Upscaler``: a nearest-neighbour resize to the size asked, noting what it's
+    given, and telling ``progress`` of each frame as the pixel upscaler does."""
+    unloaded: list = []
+
+    def __init__(self, path, kind="pixel", scale=2, video=False):
+        from dainamo.engine.upscale import Info
+
+        self.info, self.scale, self.calls = Info(path, kind, os.path.basename(path), scale=scale, video=video), scale, []
+        self.after = None  # called after each upscale (to cancel from a test)
+
+    def upscale(self, frames, size, progress=None, check=None, **kw):
+        self.calls.append((tuple(frames.shape), tuple(size), kw))
+        assert frames.dtype == torch.float32 and frames.shape[1] == 3 and 0 <= frames.min() and frames.max() <= 1
+        for i in range(frames.shape[0]):
+            if check:
+                check()
+            if progress and frames.shape[0] > 1:
+                progress(f"Frame {i + 1} of {frames.shape[0]}")
+        out = nn.functional.interpolate(frames, size=(size[1], size[0]), mode="nearest")
+        if self.after:
+            self.after()
+        return out
+
+    def unload(self):
+        FakeUpscaler.unloaded.append(self.info.path)
+
+
+@pytest.fixture
+def upscale_worker(monkeypatch):
+    """A worker Session whose upscalers are FakeUpscalers (loads counted), and the events it sends."""
+    from dainamo.engine import sandbox as worker
+    from dainamo.engine import upscale
+
+    events = io.StringIO()
+    monkeypatch.setattr(worker, "EVENTS", events)
+    loads = []
+
+    def load(info, device, log=print):
+        loads.append(info.path)
+        return FakeUpscaler(info.path, video=info.kind == "seedvr2")
+
+    monkeypatch.setattr(upscale, "identify", lambda path, files=None: upscale.Info(
+        path, "seedvr2" if "seedvr2" in path else "pixel", os.path.basename(path), scale=2))
+    monkeypatch.setattr(upscale, "load", load)
+    session = worker.Session()
+
+    def sent():
+        import json
+        return [json.loads(line) for line in events.getvalue().splitlines()]
+    return session, loads, sent
+
+
+def _clip(path, size="32x24", rate=12, frames=2, audio=True):
+    import subprocess
+
+    cmd = ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"testsrc=size={size}:rate={rate}"]
+    if audio:
+        cmd += ["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100", "-shortest"]
+    subprocess.run(cmd + ["-frames:v", str(frames), "-pix_fmt", "yuv420p", str(path)], check=True)
+    return str(path)
+
+
+def _probe(path):
+    import json
+    import subprocess
+
+    out = subprocess.run(["ffprobe", "-v", "error", "-count_frames", "-show_entries",
+                          "stream=codec_type,width,height,avg_frame_rate,nb_read_frames", "-of", "json", str(path)],
+                         capture_output=True, text=True, check=True)
+    return json.loads(out.stdout)["streams"]
+
+
+def test_the_worker_upscales_an_image_and_a_clip(upscale_worker, tmp_path):
+    """The "upscale" command: each input upscaled to the factor asked (a clip to even sides, with its frame rate
+    and sound), one output each with its source and size, progress counted in frames, and the upscaler kept loaded
+    for the next run; another model replaces it."""
+    from PIL import Image
+
+    session, loads, sent = upscale_worker
+    img = Image.new("RGBA", (24, 15), (200, 30, 30, 255))
+    img.putpixel((0, 0), (0, 0, 0, 0))  # transparency, which carries through
+    img.save(tmp_path / "pic.png")
+    clip = _clip(tmp_path / "walk.mp4")
+    out_dir = tmp_path / "run"
+    msg = {"id": "u1", "out_dir": str(out_dir), "model": "/m/4x.pth", "factor": 2,
+           "inputs": [{"path": str(tmp_path / "pic.png"), "kind": "image"}, {"path": clip, "kind": "video"}]}
+    session.upscale(msg, lambda: False)
+    events = sent()
+    assert events[0] == {"event": "started", "id": "u1"}
+    assert events[-1]["event"] == "done" and events[-1]["elapsed"] >= 0
+    outputs = [e["item"] for e in events if e["event"] == "output"]
+    assert outputs[0] == {"file": "0_pic_x2.png", "kind": "image", "source": str(tmp_path / "pic.png"), "width": 48,
+                          "height": 30}
+    assert outputs[1] == {"file": "1_walk_x2.mp4", "poster": "1_walk_x2_poster.png", "kind": "video", "source": clip,
+                          "width": 64, "height": 48}
+    out = Image.open(out_dir / "0_pic_x2.png")
+    assert out.mode == "RGBA" and out.size == (48, 30)
+    assert out.getpixel((0, 0))[3] < 128 and out.getpixel((40, 20))[3] == 255
+    video, audio = _probe(out_dir / "1_walk_x2.mp4")
+    assert (video["width"], video["height"], video["nb_read_frames"], video["avg_frame_rate"]) == (64, 48, "2", "12/1")
+    assert audio["codec_type"] == "audio" and (out_dir / "1_walk_x2_poster.png").exists()
+    progress = [e for e in events if e["event"] == "progress"]
+    assert all(e["total"] == 3 and e["inputs"] == 2 and e["started"] for e in progress)  # an image and two frames
+    assert [e["done"] for e in progress if e["message"].startswith("walk.mp4: frame")] == [2, 3]
+    assert progress[0]["message"] == "pic.png: 24×15 to 48×30" and progress[-1]["eta"] is not None
+    up = session.upscaler
+    assert [c[:2] for c in up.calls] == [((1, 3, 15, 24), (48, 30))] + [((1, 3, 24, 32), (64, 48))] * 2
+    assert loads == ["/m/4x.pth"] and session.upscaler_path == "/m/4x.pth"
+
+    # the same model again: still loaded; options reach it
+    session.upscale({**msg, "id": "u2", "factor": 1.5, "inputs": msg["inputs"][:1], "options": {"tiles": 2}},
+                    lambda: False)
+    assert loads == ["/m/4x.pth"] and up.calls[-1] == ((1, 3, 15, 24), (36, 22), {"options": {"tiles": 2}})
+    # another one replaces it
+    FakeUpscaler.unloaded.clear()
+    session.upscale({**msg, "id": "u3", "model": "/m/seedvr2.safetensors", "inputs": msg["inputs"][1:]}, lambda: False)
+    assert loads == ["/m/4x.pth", "/m/seedvr2.safetensors"] and FakeUpscaler.unloaded == ["/m/4x.pth"]
+    assert session.upscaler.calls[0][0] == (2, 3, 24, 32)  # one that takes clips as clips gets the frames together
+    session.unload_all()
+    assert session.upscaler is None and FakeUpscaler.unloaded[-1] == "/m/seedvr2.safetensors"
+
+
+def test_upscaling_cancels_between_inputs(upscale_worker, tmp_path):
+    from PIL import Image
+
+    from dainamo.engine.sampling import Cancelled
+
+    session, _, sent = upscale_worker
+    for name in ("a", "b"):
+        Image.new("RGB", (8, 8), (10, 200, 10)).save(tmp_path / f"{name}.png")
+    flag = []
+    session.upscaler = FakeUpscaler("/m/4x.pth")
+    session.upscaler_path = "/m/4x.pth"
+    session.upscaler.after = lambda: flag.append(1)
+    with pytest.raises(Cancelled):
+        session.upscale({"id": "u", "out_dir": str(tmp_path / "run"), "model": "/m/4x.pth", "factor": 2,
+                         "inputs": [{"path": str(tmp_path / f"{n}.png"), "kind": "image"} for n in "ab"]},
+                        lambda: bool(flag))
+    assert len(session.upscaler.calls) == 1 and [e["event"] for e in sent()].count("output") == 1
+    assert session.upscaler is not None  # still loaded for the next run
+
+
+def test_the_worker_upscales_a_datasets_small_images_in_place(upscale_worker, tmp_path):
+    """"upscale_dataset": small images replaced by <stem>.png at the size a job trains at (by the max factor at
+    most), the originals in _originals beside them, captions untouched; large images, clips and clashing or broken
+    files skipped or reported, with counts. Cancelling stops between images."""
+    from PIL import Image
+
+    from dainamo.engine.dataset import ORIGINALS_DIR, list_media
+    from dainamo.engine.sampling import Cancelled
+
+    session, loads, sent = upscale_worker
+    ds = tmp_path / "ds"
+    (ds / "sub").mkdir(parents=True)
+    Image.new("RGB", (64, 48), (90, 20, 20)).save(ds / "small.jpg")
+    (ds / "small.txt").write_text("a red square")
+    Image.new("L", (32, 32), 128).save(ds / "sub" / "grey.png")  # already a PNG; in a subfolder
+    Image.new("RGB", (512, 512)).save(ds / "big.png")
+    Image.new("RGB", (40, 40)).save(ds / "clash.jpg")
+    Image.new("RGB", (600, 600)).save(ds / "clash.png")  # another image where clash.jpg's result would go
+    (ds / "broken.jpg").write_bytes(b"not an image")
+    clip = _clip(ds / "walk.mp4", audio=False)
+    paths = [str(ds / n) for n in ("small.jpg", "sub/grey.png", "big.png", "clash.jpg", "broken.jpg", "walk.mp4")]
+    session.upscale_dataset({"id": "d1", "model": "/m/4x.pth", "paths": paths, "resolution": 128, "max_factor": 4},
+                            lambda: False)
+    events = sent()
+    made = events[-1]["made"]
+    assert events[-1]["event"] == "done" and (made["upscaled"], made["skipped"]) == (2, 2)  # big.png and the clip
+    assert len(made["errors"]) == 2 and made["errors"][0].startswith("clash.jpg: clash.png is there already")
+    assert made["errors"][1].startswith("broken.jpg: ")
+    # 64x48 to an area of 128²: 2.31x
+    assert Image.open(ds / "small.png").size == (148, 111) and not (ds / "small.jpg").exists()
+    assert Image.open(ds / ORIGINALS_DIR / "small.jpg").size == (64, 48)
+    assert (ds / "small.txt").read_text() == "a red square"
+    grey = Image.open(ds / "sub" / "grey.png")
+    assert grey.size == (128, 128) and grey.mode == "L"  # 4x, the most it may
+    assert Image.open(ds / "sub" / ORIGINALS_DIR / "grey.png").size == (32, 32)
+    assert (ds / "clash.jpg").exists() and Image.open(ds / "clash.png").size == (600, 600)  # left as they were
+    assert made["files"] == [
+        {"path": str(ds / "small.png"), "original": str(ds / ORIGINALS_DIR / "small.jpg"), "width": 148, "height": 111},
+        {"path": str(ds / "sub" / "grey.png"), "original": str(ds / "sub" / ORIGINALS_DIR / "grey.png"), "width": 128,
+         "height": 128}]
+    assert sorted(os.path.relpath(p, ds) for p in list_media(str(ds))) == [
+        "big.png", "broken.jpg", "clash.jpg", "clash.png", "small.png", "sub/grey.png", "walk.mp4"]  # no originals
+    assert not [f for f in os.listdir(ds) if f.startswith(".")]  # no temporary files left
+    progress = [e for e in events if e["event"] == "progress"]
+    assert progress[0] == {"event": "progress", "id": "d1", "done": 0, "total": 6,
+                           "message": "small.jpg: 64×48 to 148×111", "made": {"upscaled": 0, "skipped": 0, "errors": []}}
+    assert progress[-1]["done"] == 6 and loads == ["/m/4x.pth"] and clip in paths
+
+    # again, the upscaled PNG now small for a bigger resolution: the first original is kept, the PNG kept beside it,
+    # and a third time, beside that under another name
+    Image.new("RGB", (16, 16)).save(ds / "tiny.png")
+    flag = []
+    session.upscaler.after = lambda: flag.append(1)
+    with pytest.raises(Cancelled):  # cancelled after the first image
+        session.upscale_dataset({"id": "d2", "model": "/m/4x.pth", "resolution": 256, "max_factor": 4,
+                                 "paths": [str(ds / "small.png"), str(ds / "tiny.png")]}, lambda: bool(flag))
+    assert Image.open(ds / "small.png").size == (296, 222)
+    assert Image.open(ds / ORIGINALS_DIR / "small.jpg").size == (64, 48)
+    assert Image.open(ds / ORIGINALS_DIR / "small.png").size == (148, 111)
+    assert Image.open(ds / "tiny.png").size == (16, 16)  # not reached
+    flag.append(0)
+    session.upscaler.after = None
+    session.upscale_dataset({"id": "d3", "model": "/m/4x.pth", "paths": [str(ds / "small.png")], "resolution": 512,
+                             "max_factor": 4}, lambda: False)
+    assert Image.open(ds / ORIGINALS_DIR / "small_2.png").size == (296, 222)
+    assert Image.open(ds / ORIGINALS_DIR / "small.png").size == (148, 111)
+
+
+def test_upscalers_make_room_and_say_what_to_try_out_of_memory(upscale_worker):
+    from dainamo.engine import sandbox as worker
+
+    session, _, _ = upscale_worker
+    session.upscaler, session.upscaler_path = FakeUpscaler("/m/4x.pth"), "/m/4x.pth"
+    session.upscaler_bytes = 40e6
+    FakeUpscaler.unloaded.clear()
+    session.drop_upscaler(big_only=True)  # a pixel upscaler stays beside a generation's models
+    assert session.upscaler is not None and not FakeUpscaler.unloaded
+    session.upscaler_bytes = 8e9  # SeedVR2's DiT doesn't
+    session.drop_upscaler(big_only=True)
+    assert session.upscaler is None and FakeUpscaler.unloaded == ["/m/4x.pth"]
+    up = {"model": "/m/4x.pth"}
+    assert worker._out_of_memory("upscale", up, session).startswith("Out of GPU memory: try a smaller factor. ")
+    assert "max factor" in worker._out_of_memory("upscale_dataset", up, session)
+    assert "SeedVR2 tile" in worker._out_of_memory("upscale", {"model": "/m/seedvr2_3b.safetensors"}, session)
+    assert "fewer LoRAs" in worker._out_of_memory("generate", {}, session)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_an_upscaler_without_room_beside_the_models_has_them_parked(upscale_worker, tmp_path, monkeypatch):
+    from PIL import Image
+
+    from dainamo.engine import sandbox as worker
+
+    session, _, _ = upscale_worker
+    session.model = nn.Linear(8, 8).to(session.device)  # the profile's diffusion model
+
+    class Driver:
+        swapper, vae = None, None
+
+    session.driver = Driver()
+    session.upscaler, session.upscaler_path = FakeUpscaler("/m/4x.pth"), "/m/4x.pth"
+    seen = []
+    session.upscaler.after = lambda: seen.append(session.model.weight.is_cuda)
+    Image.new("RGB", (8, 8)).save(tmp_path / "a.png")
+    msg = {"id": "u", "out_dir": str(tmp_path / "run"), "model": "/m/4x.pth", "factor": 2,
+           "inputs": [{"path": str(tmp_path / "a.png"), "kind": "image"}]}
+    monkeypatch.setitem(worker.UPSCALE_WORK, "pixel", 2**50)  # no room beside it
+    session.upscale(msg, lambda: False)
+    assert seen == [False] and session.model.weight.is_cuda  # in system RAM while it ran, back after
+    monkeypatch.setitem(worker.UPSCALE_WORK, "pixel", 0)
+    session.upscale(msg, lambda: False)
+    assert seen == [False, True]

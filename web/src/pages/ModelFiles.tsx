@@ -119,6 +119,60 @@ function FolderCard({ ov, suggested, onSaved }: { ov: ModelsOverview; suggested:
   );
 }
 
+const usableUpscaler = (m: ModelsOverview["upscalers"]["models"][number]) => m.kind !== "unknown" && !m.error;
+
+/** The upscalers in upscale_models (for the Sandbox's Upscale and a dataset's Upscale small images), what each is,
+ * and downloads of Real-ESRGAN and SeedVR2. */
+function UpscalersCard({ ov, onDownload }: { ov: ModelsOverview; onDownload: () => void }) {
+  const up = ov.upscalers;
+  const field = up.fields[0];
+  const task = ov.tasks.find((t) => ACTIVE.includes(t.state) && field?.downloads.some((o) => o.id === t.download));
+  const pct = task ? Math.floor((100 * task.done) / (task.size || 1)) : 0;
+  const ready = up.models.filter(usableUpscaler);
+  return (
+    <div className="card mf-card">
+      <div className="mf-card-head">
+        <h3>Upscalers</h3>
+        {ready.length ? <span className="mf-badge ok"><IconCheck />{ready.length} ready</span>
+          : <span className="mf-badge">{up.folder_ok ? "None found" : "Not checked"}</span>}
+      </div>
+      <p className="mf-sub muted">For Upscale in the Sandbox and a dataset's Upscale small images. They're read from the models folder's
+        upscale_models, as in ComfyUI.</p>
+      {up.models.map((m) => (
+        <div className="mf-field mf-up" key={m.path}>
+          <div className="mf-label">
+            <div className="mf-name ellipsis" title={m.path}>{m.name}</div>
+            <div className="mf-hint">{m.kind === "seedvr2" ? "SeedVR2 · any size, keeps video frames consistent"
+              : m.kind === "pixel" ? `Pixel upscaler · ${m.scale}×, fitted to the size asked for` : "Not an upscaler Dainamo reads"}</div>
+          </div>
+          <div className="mf-files">
+            {usableUpscaler(m) ? <div className="mf-state ok"><IconCheck /><span>Ready</span></div>
+              : <div className="mf-state warn"><IconAlert /><span>{m.error || "Unknown file"}</span></div>}
+          </div>
+          <span />
+        </div>
+      ))}
+      {!up.models.length && (
+        <div className="mf-field mf-up">
+          <div className="mf-label"><div className="mf-name">No upscaler</div>
+            <div className="mf-hint">{up.folder_ok ? "upscale_models has none" : ov.folder ? "There's no upscale_models folder yet" : "Set your models folder first"}</div></div>
+          <span /><span />
+        </div>
+      )}
+      {up.error && <div className="validation warning">{up.error}</div>}
+      {task && (
+        <div className="mf-state" style={{ paddingTop: 8 }}>
+          <span className="muted">Downloading {task.name} · {pct}%</span>
+          <div className="bar mf-bar"><div style={{ width: `${pct}%` }} /></div>
+        </div>
+      )}
+      <div className="mf-foot">
+        <button className="btn mf-create" onClick={onDownload} disabled={!field}><IconDownload /> Download an upscaler</button>
+      </div>
+    </div>
+  );
+}
+
 type Status = "all" | "ready" | "missing" | "unchecked";
 const STATUSES: [Status, string][] = [["all", "All statuses"], ["ready", "Required files found"], ["missing", "Missing files"], ["unchecked", "Not checked"]];
 
@@ -151,6 +205,9 @@ export default function ModelFiles({ families, onCreate }: { families: Family[];
   const words = search.toLowerCase().split(/\s+/).filter(Boolean);
   const shown = cards.filter((c) => (status === "all" || c.state === status) && words.every((w) =>
     [c.fam.label, ...c.fam.fields.flatMap((f) => [f.label, f.hint, ...usable(f).map((x) => x.name)])].join(" ").toLowerCase().includes(w)));
+  // the Upscalers card belongs to no family: it shows unless a status is picked, or the search leaves it out
+  const upscalers = !!ov.upscalers && status === "all" && words.every((w) =>
+    ["upscalers upscale", ...ov.upscalers.models.map((m) => `${m.name} ${m.kind}`)].join(" ").toLowerCase().includes(w));
   return (
     <div className="stack" style={{ gap: 16 }}>
       <FolderCard ov={ov} suggested={suggested[0] || ""} onSaved={reload} />
@@ -172,7 +229,7 @@ export default function ModelFiles({ families, onCreate }: { families: Family[];
           {STATUSES.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
         </select>
       </div>
-      {!shown.length && (
+      {!shown.length && !upscalers && (
         <div className="empty">
           <strong>No models match</strong>
           <button className="btn ghost" onClick={() => { setSearch(""); setStatus("all"); }}>Clear the search{status !== "all" ? " and filter" : ""}</button>
@@ -201,6 +258,7 @@ export default function ModelFiles({ families, onCreate }: { families: Family[];
             </div>
           </div>
         ))}
+        {upscalers && <UpscalersCard ov={ov} onDownload={() => setDialog({ family: ov.upscalers.id, field: ov.upscalers.fields[0]?.key || "" })} />}
       </div>
       <div className="card ds-note">
         <IconInfo />

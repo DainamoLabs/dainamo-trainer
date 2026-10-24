@@ -176,6 +176,23 @@ non-commercial testing and research, including training a model for commercial u
 is a Derivative under the agreement: distributing it requires passing on the agreement and its use
 restrictions (Attachment A). Model weights are not included with Dainamo.
 
+## SeedVR2 (ByteDance Seed) — Apache License 2.0
+
+Upstream: https://github.com/ByteDance-Seed/SeedVR (the reference training and inference code, Apache License
+2.0, Copyright 2025 ByteDance Ltd. and/or its affiliates), at commit `e4de8c24441a67e1b7df56abea10645059bb1185`.
+The SeedVR2 3B weights (`ByteDance-Seed/SeedVR2-3B`) are Apache License 2.0 as well; Dainamo ships none.
+
+- `dainamo/engine/upscalers/seedvr2/`: the NaDiT restorer (`models/dit_v2`: the windowed multi-modal blocks, 3D
+  RoPE, learned per-block modulation) and its video VAE (`models/video_vae_v3`), ported into our own modules in
+  the layout of the single-file release, and the one-step pipeline of `projects/inference_seedvr2_3b.py`
+  (the lerp schedule, v-prediction Euler step, frame padding). Changes: windows of one shape attend in one batched
+  SDPA call, the VAE runs in overlapping tiles and row bands when a frame doesn't fit, and long clips run in
+  passes. The RoPE frequencies follow the formula of `rotary-embedding-torch` (Phil Wang, MIT License), which the
+  reference uses; the wavelet colour fix is our own, written from StableSR's description. The modules say so in
+  their headers.
+- `tests/test_seedvr2.py` copies trimmed pieces of the reference and of `rotary-embedding-torch` as the yardstick,
+  as its docstring says.
+
 ## YuE2 (M-A-P) — Apache License 2.0; weights under CC BY-NC 4.0
 
 Upstream: https://github.com/multimodal-art-projection/YuE, https://huggingface.co/m-a-p/YuE2-3B.
@@ -337,6 +354,10 @@ SOFTWARE.
   `AutoencoderKLFlux2`, plus its Wan and LDM VAE key converters.
 - Hugging Face `transformers` (Apache-2.0) — Qwen3-VL and Qwen3.5 text models, DINOv2.
 - DINOv2 weights (`facebook/dinov2-small`, Apache-2.0), downloaded at first use by the concept bleed detector.
+- `spandrel` (MIT) — loads the pixel upscalers of the `upscale_models` folder (the ESRGAN family and the other
+  single-image architectures it supports; its core package carries only permissively licensed architectures).
+  The upscaler weights themselves have their own licenses: Real-ESRGAN's are BSD-3-Clause (Xintao Wang and
+  contributors); check a file's source before sharing its outputs commercially.
 - `bitsandbytes` (MIT), `prodigyopt` (MIT), FastAPI (MIT), React (MIT), Vite (MIT).
 
 No ComfyUI code is included. ComfyUI-format model files are read using the

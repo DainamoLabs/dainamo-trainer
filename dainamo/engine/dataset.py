@@ -23,6 +23,8 @@ REFS_DIR = "_refs"
 # per-image loss masks (masked loss): ``<dataset>/_masks/<stem>.png`` beside ``<dataset>/<stem>.jpg``, greyscale,
 # white where the loss counts and black where it doesn't; never trained on directly
 MASKS_DIR = "_masks"
+# where Upscale keeps the images it replaced (``engine.upscale``); never trained on
+ORIGINALS_DIR = "_originals"
 # written by Split into clips: which video each clip was cut from ({"clips": {relative clip path: {source, ...}}})
 CLIPS_MANIFEST = ".clips.json"
 
@@ -41,7 +43,7 @@ def media_kind(path: str) -> str | None:
 def list_media(root: str) -> list[str]:
     out = []
     for dirpath, dirnames, files in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d not in (REFS_DIR, MASKS_DIR))
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d not in (REFS_DIR, MASKS_DIR, ORIGINALS_DIR))
         for f in sorted(files):
             if not f.startswith(".") and media_kind(f):
                 out.append(os.path.join(dirpath, f))
@@ -188,8 +190,8 @@ def load_mask(path: str, image_size: tuple[int, int], size: tuple[int, int], fli
 def probe_video(path: str) -> dict:
     """{width, height, duration, fps, has_audio} via ffprobe."""
     out = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
-                          "stream=codec_type,width,height,avg_frame_rate:stream_tags=rotate:format=duration",
-                          "-of", "json", path], capture_output=True, text=True, timeout=60)
+                          "stream=codec_type,width,height,avg_frame_rate:stream_tags=rotate:stream_side_data=rotation"
+                          ":format=duration", "-of", "json", path], capture_output=True, text=True, timeout=60)
     info = json.loads(out.stdout or "{}")
     streams = info.get("streams", [])
     video = next((s for s in streams if s.get("codec_type") == "video"), None)
@@ -198,7 +200,9 @@ def probe_video(path: str) -> dict:
     num, _, den = (video.get("avg_frame_rate") or "24/1").partition("/")
     fps = float(num) / float(den or 1) if float(den or 1) else 24.0
     w, h = int(video["width"]), int(video["height"])
-    if str((video.get("tags") or {}).get("rotate", "0")) in ("90", "270", "-90"):
+    # a phone clip shot upright: the rotation is a tag in older files and side data in ones ffmpeg 5+ wrote
+    turns = [(video.get("tags") or {}).get("rotate")] + [d.get("rotation") for d in video.get("side_data_list") or []]
+    if any(t is not None and abs(int(float(t))) % 180 == 90 for t in turns):
         w, h = h, w
     return {"width": w, "height": h, "duration": float(info.get("format", {}).get("duration") or 0.0),
             "fps": fps, "has_audio": any(s.get("codec_type") == "audio" for s in streams)}

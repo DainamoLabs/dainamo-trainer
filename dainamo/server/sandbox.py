@@ -21,6 +21,7 @@ import time
 from . import db, procs
 
 SANDBOX_DIR = os.path.join(db.DATA_DIR, "sandbox")
+UPLOADS_DIR = os.path.join(SANDBOX_DIR, "uploads")  # files sent to be upscaled; cleared when the server starts
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
@@ -58,6 +59,21 @@ def free_gpu() -> int | None:
     return next((g for g in reversed(range(gpu_count())) if g not in busy), None)
 
 
+def pick_gpu(asked: int | None) -> int:
+    """The GPU for work that runs beside the Sandbox's models (making a RefMod, upscaling): the Sandbox's own while
+    it's running, so nothing reloads; else, with two or more GPUs, the one asked for (the last by default), as a
+    generation picks it; else GPU 0. ValueError for a GPU that isn't there."""
+    if sandbox.alive():
+        return sandbox.gpu
+    if mode() != "reserve":
+        return 0
+    n = gpu_count()
+    gpu = asked if asked is not None else n - 1
+    if not 0 <= gpu < n:
+        raise ValueError(f"No GPU {gpu}")
+    return gpu
+
+
 class SandboxManager:
     def __init__(self):
         self.proc: subprocess.Popen | None = None
@@ -72,6 +88,9 @@ class SandboxManager:
         # the RefMod being made, or the last one: {id, name, state (queued | running | done | failed | cancelled),
         # message, made (its made.json, when done)}; it's queued with the generations, but isn't one
         self.refmod: dict | None = None
+        # a dataset's small images being upscaled, or the last ones, the same way: {id, dataset_id, dataset, model,
+        # model_name, resolution, max_factor, state, message, done, total, made ({upscaled, skipped, errors})}
+        self.upscale: dict | None = None
         self.lock = threading.RLock()
 
     # --- status ------------------------------------------------------------
@@ -103,6 +122,7 @@ class SandboxManager:
                     "message": self.message, "progress": self._progress_now(), "current": self.current,
                     "pending": list(self.pending), "yielding": self.yielding,
                     "refmod": dict(self.refmod) if self.refmod else None,
+                    "upscale": dict(self.upscale) if self.upscale else None,
                     "idle_seconds": int(time.time() - self.last_used) if self.alive() and self.last_used else None}
 
     # --- worker process ---------------------------------------------------------
@@ -161,14 +181,16 @@ class SandboxManager:
             for rid in ([self.current] if self.current else []) + self.pending:
                 db.execute("UPDATE sandbox_runs SET status='failed', message=? WHERE id=? AND status IN "
                            "('queued','running')", (why, rid))
-            if self.refmod and self.refmod["state"] in ("queued", "running"):
-                self.refmod.update(state="failed", message=why)
+            for job in (self.refmod, self.upscale):
+                if job and job["state"] in ("queued", "running"):
+                    job.update(state="failed", message=why)
             self.current, self.pending, self.progress = None, [], None
             self.state, self.message = "off", ""
 
     def _on_event(self, ev: dict):
         kind, rid = ev.get("event"), ev.get("id")
-        made = self.refmod if self.refmod and rid == self.refmod["id"] else None  # a RefMod's, not a run's
+        # a RefMod's or a dataset upscale's, not a run's
+        made = next((j for j in (self.refmod, self.upscale) if j and rid == j["id"]), None)
         if kind == "ready":
             self.state, self.message = "ready", "Ready"
         elif kind == "status":
@@ -184,6 +206,8 @@ class SandboxManager:
                 db.execute("UPDATE sandbox_runs SET status='running', started=? WHERE id=?", (db.now(), rid))
         elif kind == "progress" and made:
             made["message"] = self.message = ev.get("message") or ""
+            if made is self.upscale:  # images done of the total
+                made.update({k: ev[k] for k in ("done", "total") if isinstance(ev.get(k), int)})
         elif kind == "progress":
             self.progress = {**{k: v for k, v in ev.items() if k not in ("event", "id", "message")}, "at": time.time()}
             if ev.get("message"):
@@ -238,6 +262,28 @@ class SandboxManager:
                 return False
             self.refmod = {"id": make["id"], "name": make["name"], "state": "queued", "message": "", "made": None}
         self._enqueue(gpu, {"cmd": "refmod", **make})
+        return True
+
+    def submit_upscale(self, run: dict, gpu: int):
+        """Upscale a run's input (``run["params"]["input"]``) by its factor, after the generations queued before it.
+        The upscaler is loaded beside the models the worker holds, and kept for the next one."""
+        p = run["params"]
+        self._enqueue(gpu, {"cmd": "upscale", "id": run["id"], "out_dir": run_dir(run["id"]), "model": p["model"],
+                            "inputs": [{"path": p["input"]["path"], "kind": p["input"]["kind"]}],
+                            "factor": p["factor"], "options": p.get("options") or {}})
+
+    def submit_dataset_upscale(self, job: dict, gpu: int) -> bool:
+        """Upscale a dataset's small images (``job``: {id, dataset_id, dataset, model, model_name, paths, resolution,
+        max_factor}), after the generations queued before. False (nothing queued) while another dataset upscale is
+        queued or running: one at a time, like making a RefMod."""
+        with self.lock:
+            if self.upscale and self.upscale["state"] in ("queued", "running"):
+                return False
+            self.upscale = {**{k: job[k] for k in ("id", "dataset_id", "dataset", "model", "model_name", "resolution",
+                                                    "max_factor")},
+                            "state": "queued", "message": "", "done": 0, "total": len(job["paths"]), "made": None}
+        self._enqueue(gpu, {"cmd": "upscale_dataset", "id": job["id"], "model": job["model"], "paths": job["paths"],
+                            "resolution": job["resolution"], "max_factor": job["max_factor"]})
         return True
 
     def _enqueue(self, gpu: int, msg: dict):
@@ -300,6 +346,7 @@ class SandboxManager:
 
     def startup(self):
         os.makedirs(os.path.join(SANDBOX_DIR, "runs"), exist_ok=True)
+        shutil.rmtree(UPLOADS_DIR, ignore_errors=True)
         db.execute("UPDATE sandbox_runs SET status='failed', message='The server restarted' "
                    "WHERE status IN ('queued','running')")
 
