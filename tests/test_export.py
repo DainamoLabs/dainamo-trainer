@@ -22,13 +22,17 @@ def client():
 
 def test_export_zips_each_dataset_with_its_captions(client, tmp_path):
     a, b = tmp_path / "a", tmp_path / "b"
-    (a / "_refs").mkdir(parents=True)
-    (a / "sub").mkdir()
+    for folder in ("_refs", "_masks", "sub/_masks"):
+        (a / folder).mkdir(parents=True)
     b.mkdir()
     Image.new("RGB", (8, 8), "red").save(a / "one.png")
+    Image.new("RGB", (8, 8), "red").save(a / "one.jpg")  # shares its mask (and reference) with one.png
     (a / "one.txt").write_text("a red cat")
     Image.new("RGB", (8, 8)).save(a / "sub" / "two.png")  # no caption
     Image.new("RGB", (8, 8)).save(a / "_refs" / "one.png")
+    Image.new("L", (8, 8), 255).save(a / "_masks" / "one.png")
+    Image.new("L", (8, 8), 255).save(a / "sub" / "_masks" / "two.png")
+    Image.new("L", (8, 8), 255).save(a / "_masks" / "song.png")  # a song has no mask
     (a / "song.mp3").write_bytes(b"ID3 not really a song")
     (a / "song.txt").write_text("pop, upbeat\n[Lyrics]\nla la la")
     (a / "notes.md").write_text("not a dataset file")
@@ -37,17 +41,20 @@ def test_export_zips_each_dataset_with_its_captions(client, tmp_path):
     (b / ".clips.json").write_text('{"clips": {}}')
     da = client.post("/api/datasets", json={"name": "Cats/dogs", "path": str(a), "trigger": "ohwx"}).json()["id"]
     db = client.post("/api/datasets", json={"name": "Cats/dogs", "path": str(b)}).json()["id"]
-    sizes = {d["id"]: d["bytes"] for d in client.get("/api/datasets").json()}
-    assert sizes[db] == len(big)
+    listed = {d["id"]: d for d in client.get("/api/datasets").json()}
+    assert listed[db]["bytes"] == len(big)
+    # masks aren't files of the dataset; three of its images have one
+    assert (listed[da]["count"], listed[da]["images"], listed[da]["masks"], listed[db]["masks"]) == (4, 3, 3, 0)
 
     r = client.get("/api/export/datasets", params={"ids": f"{da},{db}"})
     assert r.status_code == 200 and r.headers["content-type"] == "application/zip"
     assert 'filename="datasets_' in r.headers["content-disposition"]
     z = zipfile.ZipFile(io.BytesIO(r.content))
     assert z.testzip() is None
-    assert set(z.namelist()) == {
-        "Cats_dogs/one.png", "Cats_dogs/one.txt", "Cats_dogs/_refs/one.png", "Cats_dogs/song.mp3", "Cats_dogs/song.txt",
-        "Cats_dogs/sub/two.png", "Cats_dogs (2)/clip.mp4", "Cats_dogs (2)/.clips.json"}
+    assert sorted(z.namelist()) == sorted([
+        "Cats_dogs/one.jpg", "Cats_dogs/one.png", "Cats_dogs/one.txt", "Cats_dogs/_refs/one.png", "Cats_dogs/_masks/one.png",
+        "Cats_dogs/song.mp3", "Cats_dogs/song.txt", "Cats_dogs/sub/two.png", "Cats_dogs/sub/_masks/two.png",
+        "Cats_dogs (2)/clip.mp4", "Cats_dogs (2)/.clips.json"])  # each file once
     assert z.read("Cats_dogs/one.txt") == b"a red cat" and z.read("Cats_dogs (2)/clip.mp4") == big
     assert all(i.compress_type == zipfile.ZIP_STORED for i in z.infolist())
 

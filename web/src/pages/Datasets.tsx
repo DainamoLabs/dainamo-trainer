@@ -5,8 +5,8 @@ import { CheckIssues, PairSummary, useDatasetCheck } from "../components/Dataset
 import { PairsDialog } from "../components/Pairs";
 import {
   IconAlert, IconArrowRight, IconCheck, IconCheckCircle, IconCheckSquare, IconCopy, IconDown, IconDownload, IconEdit, IconFile, IconFilm, IconFolder, IconGrid,
-  IconImages, IconInfo, IconLayers, IconLeft, IconLink, IconList, IconPause, IconPlayFill, IconPlus, IconRight, IconScissors, IconSearch, IconSparkle, IconTrash,
-  IconUpload, IconWave, IconX,
+  IconImages, IconInfo, IconLayers, IconLeft, IconLink, IconList, IconPause, IconPlayFill, IconPlus, IconRight, IconScissors, IconSearch, IconSparkle, IconTarget,
+  IconTrash, IconUpload, IconWave, IconX,
 } from "../components/icons";
 import { ConfirmDialog, Empty, Info, Lightbox, Menu, Modal, PathInput, ProfileOptions, SelectBar, fmtSize, someNames, usePoll, useSelection, useToast, type Selection } from "../components/ui";
 import ClipEditor from "./ClipEditor";
@@ -494,6 +494,12 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
             <IconFile />
             <div><b>{items?.length ?? "…"}</b><span>file{items?.length === 1 ? "" : "s"}</span></div>
           </div>
+          {!!d?.masks && (
+            <div className="dd-stat" title="Images with a loss mask in a _masks folder beside them, for Masked loss (Create Job)">
+              <IconTarget />
+              <div><b>{d.masks}</b><span>mask{d.masks === 1 ? "" : "s"}</span></div>
+            </div>
+          )}
           <div className="dd-stat">
             <span className={"dd-cap-icon" + (done ? " ok" : missing && captioned ? " part" : "")}>{done ? <IconCheckCircle /> : <IconAlert />}</span>
             <div><b>{items ? `${captioned} / ${items.length}` : "…"}</b><span>captioned</span></div>

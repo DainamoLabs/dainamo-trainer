@@ -271,3 +271,26 @@ def test_what_trains_small_is_measured_against_the_bucket_for_its_shape(tmp_path
     Image.new("RGB", (700, 700)).save(tmp_path / "mid.png")
     got = ds.build_items([{"path": str(tmp_path)}], [512, 1024], 16, False, log=lambda *a: None)
     assert sorted((it.resolution, it.small) for it in got) == [(512, False), (1024, True)]
+
+
+def test_validator_scores_the_noise_range_with_masks_and_without_weighting(tmp_path):
+    f = str(tmp_path / "0.pt")
+    mask = torch.zeros(8, 8, dtype=torch.float16)
+    mask[:, :4] = 1
+    torch.save({"latent": torch.randn(4, 8, 8), "mask": mask}, f)
+    model = torch.nn.Conv2d(4, 4, 1)
+
+    def validator(settings):
+        return evaluation.Validator(FakeDriver(), [f], lambda i: {"text": torch.zeros(1)}, settings, 6, seed=3,
+                                    latent_hw=(8, 8))
+
+    noise_range = {"timestep_min": 0.3, "timestep_max": 0.7}
+    v = validator(noise_range)
+    assert all(0.3 - 1e-6 <= s <= 0.7 + 1e-6 for s in v.sigmas)
+    # quantiles of the family's (uniform) distribution, moved into the range
+    assert abs(v.sigmas[0] - (0.3 + 0.4 / 12)) < 0.01 and abs(v.sigmas[-1] - (0.3 + 0.4 * 11 / 12)) < 0.01
+    # loss weighting would only rescale the score: validation leaves it out
+    weighted = validator({**noise_range, "loss_weighting": "min_snr"})
+    assert weighted.sigmas == v.sigmas and weighted.loss(model) == v.loss(model)
+    # masks count, as in training
+    assert validator({**noise_range, "masked_loss": True, "mask_min_weight": 0.0}).loss(model) != v.loss(model)

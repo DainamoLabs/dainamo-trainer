@@ -71,6 +71,7 @@ export type Dataset = {
   videos: number;
   audio: number;
   captioned: number;
+  masks: number; // images with a loss mask (_masks/<name>.png beside them), for masked loss
   bytes: number; // its images, videos and sound files
   video_sources: number; // what its videos count as per epoch: clips split from one video count once
   split: { source: { id: string; name: string }; changes: number } | null; // made by Split into clips: changes not cut yet

@@ -3,8 +3,9 @@
 Validation loss
     Images held out from training (or a separate dataset) are scored at every checkpoint with the
     same noise and the same timesteps each time, so the curve is smooth enough to see where the
-    LoRA starts to overfit. The timesteps are quantiles of the family's own training distribution,
-    which keeps the number comparable with the training loss.
+    LoRA starts to overfit. The timesteps are quantiles of the family's own training distribution
+    in the job's noise range, which keeps the number comparable with the training loss. Loss masks
+    count as they do in training; loss weighting doesn't (it would only rescale the score).
 
 Concept bleed
     Prompts without the trigger word are rendered with a fixed seed by the base model and by each
@@ -100,10 +101,10 @@ class Validator:
                  latent_hw: tuple[int, int]):
         self.driver, self.payload_files, self.cond_for, self.settings = driver, payload_files, cond_for, settings
         self.seed = seed
-        # quantiles of the family's training distribution, drawn reproducibly
+        # quantiles of the family's training distribution in the job's noise range, drawn reproducibly
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(seed)
-            draws = driver.sample_timesteps(8192, latent_hw, settings).double()
+            draws = driver.timesteps(8192, latent_hw, settings).double()
         q = (torch.arange(timesteps, dtype=torch.float64) + 0.5) / timesteps
         self.sigmas = torch.quantile(draws, q).clamp(1e-3, 1.0).tolist()
 
@@ -117,6 +118,7 @@ class Validator:
             cond = self.cond_for(i)
             for k, sigma in enumerate(self.sigmas):
                 g = torch.Generator(device="cpu").manual_seed(self.seed * 7919 + i * 101 + k)
+                # a pinned sigma: the family's training loss without loss weighting
                 total += self.driver.training_loss(model, [payload], [cond], self.settings, sigma=sigma,
                                                    generator=g, deterministic=True).item()
                 n += 1

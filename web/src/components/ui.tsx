@@ -275,11 +275,11 @@ export function Info({ text }: { text: string }) {
   );
 }
 
-export function Num(props: { label: string; v: number; on: (n: number) => void; step?: number; min?: number; help?: string; info?: string }) {
+export function Num(props: { label: string; v: number; on: (n: number) => void; step?: number; min?: number; max?: number; help?: string; info?: string }) {
   return (
     <label className="field">
       <span>{props.label}{props.info && <Info text={props.info} />}</span>
-      <input type="number" value={props.v} step={props.step ?? 1} min={props.min} onChange={(e) => props.on(e.target.value === "" ? 0 : Number(e.target.value))} />
+      <input type="number" value={props.v} step={props.step ?? 1} min={props.min} max={props.max} onChange={(e) => props.on(e.target.value === "" ? 0 : Number(e.target.value))} />
       {props.help && <span className="help">{props.help}</span>}
     </label>
   );

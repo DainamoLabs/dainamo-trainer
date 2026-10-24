@@ -180,3 +180,50 @@ def test_sampling_keeps_the_first_frame_and_returns_audio():
     for sampler, scheduler in (("euler", "default"), ("heun", "simple"), ("dpmpp_2m", "beta")):
         res = d.sample(model, cond(0), None, 64, 64, 8, 1.0, seed=1, frames=9, sampler=sampler, scheduler=scheduler)
         assert torch.isfinite(res["video"]).all() and torch.isfinite(res["audio"]).all()
+
+
+def _stub_driver():
+    """A CPU driver whose DiT is a stand-in predicting zeros (the loss is the target's power), recording the noise
+    levels it's given."""
+    d = LTX25Driver({"variant": "distilled"}, torch.device("cpu"))
+    d.seen = []
+
+    def predict(model, video, audio, conds, video_t, sigma, *rest):
+        d.seen.append(sigma.clone())
+        return torch.zeros_like(video), torch.zeros_like(audio)
+    d._predict = predict
+    return d
+
+
+def test_loss_weighting_and_the_noise_range():
+    import math
+
+    d = _stub_driver()
+    t, h, w = 3, 2, 3
+    clip = {"video": torch.randn(128, t, h, w), "frames": 17, "audio": torch.randn(M.audio_latent_frames(17, 24), 128)}
+    settings = {"i2v_probability": 0.0, "train_audio": True}
+
+    def loss(extra, **kw):
+        return d.training_loss(None, [clip, clip], [{"text": cond()}] * 2, {**settings, **extra},
+                               rng=random.Random(0), generator=torch.Generator().manual_seed(0), **kw)
+
+    # one noise level per item, shared by video and audio: the weight scales the whole loss
+    d._sigmas = lambda b, tokens, s: torch.tensor([0.5, 0.5])
+    assert torch.allclose(loss({"loss_weighting": "cosmap"}), 4 / math.pi * loss({}))
+    d._sigmas = lambda b, tokens, s: torch.tensor([0.2, 0.7])
+    s = {"loss_weighting": "min_snr", "min_snr_gamma": 5}
+    w = d.loss_weights(torch.tensor([0.2, 0.7]), s)
+    g = torch.Generator().manual_seed(0)
+    x0 = torch.stack([clip["video"]] * 2)
+    noise = torch.randn(x0.shape, generator=g)
+    xa = torch.stack([clip["audio"]] * 2)
+    na = torch.randn(xa.shape, generator=g)
+    want = ((((noise - x0) ** 2).flatten(1).mean(1) * w).mean() + (((na - xa) ** 2).flatten(1).mean(1) * w).mean())
+    assert torch.allclose(loss(s), want)
+    # validation pins sigma: no weighting
+    assert torch.equal(loss(s, sigma=0.4), loss({}, sigma=0.4))
+    # the range rescales the family's levels
+    d._sigmas = lambda b, tokens, s: torch.tensor([0.0, 1.0])
+    d.seen.clear()
+    loss({"timestep_min": 0.3, "timestep_max": 0.6})
+    assert torch.allclose(d.seen[0], torch.tensor([0.3, 0.6]))

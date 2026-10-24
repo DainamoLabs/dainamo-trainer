@@ -5,7 +5,7 @@ A job directory holds ``job.json`` (written by the server). The trainer writes:
   metrics.jsonl  one line per step: step, loss, lr
   samples/       samples generated during training (PNG, or MP4 + poster for video families)
   output/        LoRA checkpoints (ComfyUI-compatible .safetensors); a finetune's are whole diffusion models
-  state/         resumable optimizer state
+  state/         resumable optimizer state (and, with ``ema_enabled``, the EMA of the LoRA's weights)
   cache.json     the files of the encoding cache it uses (``engine.cache``), so they're kept while it runs
 and polls ``control.json`` for stop / sample-now / save-now requests. SIGTERM is
 treated like a stop request, so state is saved before exiting.
@@ -19,7 +19,8 @@ A job.json with ``evaluate`` set is a checkpoint evaluation of a finished job in
 ``refmod_enabled`` the job makes a RefMod of them instead (``run_refmod``): nothing is trained. With
 ``finetune_enabled`` every weight of the diffusion model trains (``engine.finetune``) in place of a LoRA, and with
 ``extract_enabled`` the job extracts a LoRA from a finetune's checkpoint (``run_extract``), and with ``merge_enabled``
-it merges LoRAs into one (``run_merge``), training nothing.
+it merges LoRAs into one (``run_merge``), training nothing. With ``ema_enabled`` (not for a finetune) an average of
+the LoRA's weights (``engine.ema``) is what's saved, sampled and evaluated, while training steps the live weights.
 
 Everything model-specific goes through the family driver: which conditions an item trains with
 (caption, or caption plus conditioning images), how an item is VAE-encoded, the loss, sampling and
@@ -44,6 +45,7 @@ from . import cache
 from . import dataset as ds
 from . import evaluation
 from . import refmod
+from .ema import EMA
 from .families import get_family
 from .hf_assets import resolve_path
 from .lora import LoRANetwork
@@ -98,6 +100,7 @@ class Trainer:
         self.device = torch.device("cuda")
         self.text_files: dict[str, str] = {}
         self.opt = None  # the optimizer, once training has one
+        self.ema: EMA | None = None  # the average of the LoRA's weights, with ema_enabled
         for sub in ("samples", "output", "state"):
             os.makedirs(os.path.join(job_dir, sub), exist_ok=True)
         self.cache_root = self.job.get("cache_dir") or os.path.join(job_dir, "cache")
@@ -360,6 +363,8 @@ class Trainer:
             meta.update({"ss_network_dim": str(self.s["rank"]), "ss_network_alpha": str(self.s["alpha"])})
         if self.slider:
             meta.update(self.slider.metadata())
+        if self.ema is not None:  # (the weights saved are the average, ``ema_applied``)
+            meta["dainamo.ema"] = str(self.ema.decay)
         network.save(path, meta)
         self.status["checkpoints"].append({"step": step, "file": fname, "final": final})
         keep = int(self.s.get("keep_last", 0))
@@ -380,12 +385,14 @@ class Trainer:
         return fname
 
     def save_state(self, network, opt, sched, step):
-        """The optimizer and schedule, and the LoRA's weights; a finetune's weights are the checkpoint just saved,
-        which ``weights`` names (the whole model would double the save)."""
+        """The optimizer and schedule, and the LoRA's weights (the live ones, and their EMA if it's on); a finetune's
+        weights are the checkpoint just saved, which ``weights`` names (the whole model would double the save)."""
         if network.kind == "full":
             weights = {"weights": next(c["file"] for c in reversed(self.status["checkpoints"]) if c["step"] == step)}
         else:
             weights = {"lora": network.state_dict(torch.float32)}
+            if self.ema is not None:
+                weights["ema"] = self.ema.state_dict()
         torch.save({"step": step, **weights, "opt": opt.state_dict(), "sched": sched.state_dict(),
                     "status": self.status}, os.path.join(self.job_dir, "state", "last.pt"))
 
@@ -592,7 +599,9 @@ class Trainer:
         items = ds.build_items(self.training_datasets(), res, driver.bucket_divisibility, bool(s.get("flip", False)),
                                log=self.log, video_frames=video_frames, snap_frames=driver.snap_frames, fps=driver.fps,
                                caption_dropout=float(s.get("caption_dropout", 0.0)),
-                               references=driver.trains_references)
+                               references=driver.trains_references, masks=driver.trains_masks)
+        if s.get("masked_loss") and not driver.trains_masks:
+            self.log(f"Note: {type(driver).info.label} trains clips or sound, so loss masks (_masks) aren't used")
         if len(res) > 1:
             per_res = {r: sum(1 for it in items if it.resolution == r) for r in res}
             self.log("Training at " + ", ".join(f"{r} ({n} items)" for r, n in per_res.items()))
@@ -626,7 +635,8 @@ class Trainer:
                 # validation loss is measured at one size: the largest
                 val_items = list({it.path: it for it in ds.build_items(
                     validation_datasets, res[-1], div, False, log=self.log, video_frames=video_frames,
-                    snap_frames=driver.snap_frames, fps=fps, references=driver.trains_references)}.values())
+                    snap_frames=driver.snap_frames, fps=fps, references=driver.trains_references,
+                    masks=driver.trains_masks)}.values())
                 overlap = {it.path for it in val_items} & {it.path for it in items}
                 if overlap:
                     self.log(f"Note: {len(overlap)} validation item(s) are also training items; the picker "
@@ -720,6 +730,29 @@ class Trainer:
             n = network.attach_assistant(resolve_path(adapter), self.device)
             self.log(f"  adapter applied to {n} layers")
         return network
+
+    def make_ema(self, network, saved: dict | None) -> EMA | None:
+        """The average of the LoRA's weights (``engine.ema``) when ``ema_enabled``: carried on from the resume state's
+        ``saved``, else started from the weights as they are (also a job whose EMA an edit turned on). None for a
+        finetune: its weights are the whole model."""
+        if not self.s.get("ema_enabled"):
+            return None
+        if self.finetune:
+            self.log("EMA weights aren't kept for a finetune (its weights are the whole model): it saves the trained "
+                     "weights as they are")
+            return None
+        ema = EMA(list(network.parameters()), float(self.s.get("ema_decay", 0.99)))
+        if saved:
+            ema.load_state_dict(saved)
+        what = "LoKr" if network.kind == "lokr" else "LoRA"
+        self.log(f"EMA of the {what} weights (decay {ema.decay:g}): saves, samples and evaluations use the averaged "
+                 "weights" + (f", carried on from {ema.num_updates} steps" if saved else ""))
+        return ema
+
+    def ema_applied(self):
+        """Saves, samples and evaluations inside this see the EMA weights, if it's on; training's live weights are
+        put back after."""
+        return self.ema.applied() if self.ema is not None else contextlib.nullcontext()
 
     def make_full(self, driver, model):
         """A finetune's stand-in for the LoRA: the model's own weights (``finetune.FullModel``), with the profile's
@@ -1043,6 +1076,7 @@ class Trainer:
         sched = self.make_scheduler(opt)
 
         start = 0
+        ema_saved = None
         if st is not None:
             if not self.finetune:  # a finetune's weights were loaded with the model
                 network.load_state_dict(st["lora"])
@@ -1062,7 +1096,10 @@ class Trainer:
             self.log(f"Resumed from step {start}")
             if start < int(s["steps"]):
                 self.keep_final()  # a finished job given more steps
+            ema_saved = st.get("ema")
             del st
+        # after the resume state, so a new EMA starts from the weights the job carries on with
+        self.ema = self.make_ema(network, ema_saved)
 
         if not items:  # a slider job without datasets renders its training images first
             items, payload_files = self.render_slider_images(driver, model, network)
@@ -1087,9 +1124,10 @@ class Trainer:
         keep_every = max(1, total // 50)  # about 50 progress lines stay in the log; the rest update in place
 
         if start == 0:
-            self.evaluate(model, network, 0, None)
-            if s.get("sample_at_start", True):
-                self.make_samples(model, network, 0)
+            with self.ema_applied():  # (the EMA is the initial weights yet)
+                self.evaluate(model, network, 0, None)
+                if s.get("sample_at_start", True):
+                    self.make_samples(model, network, 0)
 
         self.phase("training", "Training")
         model.train()
@@ -1105,9 +1143,11 @@ class Trainer:
                 if action == "stop":
                     raise StopRequested()
                 if action == "sample":
-                    self.make_samples(model, network, step)
+                    with self.ema_applied():
+                        self.make_samples(model, network, step)
                 if action == "save":
-                    self.evaluate(model, network, step, self.save_lora(network, step))
+                    with self.ema_applied():
+                        self.evaluate(model, network, step, self.save_lora(network, step))
 
                 ts = time.time()
                 loss_acc = 0.0
@@ -1147,6 +1187,8 @@ class Trainer:
                 if max_norm > 0:
                     torch.nn.utils.clip_grad_norm_(params, max_norm)
                 opt.step()
+                if self.ema is not None:
+                    self.ema.update()
                 sched.step()
                 opt.zero_grad(set_to_none=True)
                 if self.finetune and driver.swapper is not None:  # the last block backward ran goes back to RAM
@@ -1169,15 +1211,18 @@ class Trainer:
                               keep=step % keep_every == 0 or step == total)
 
                 if save_every and step % save_every == 0 and step < total:
-                    fname = self.save_lora(network, step)
-                    self.evaluate(model, network, step, fname)
-                    self.save_state(network, opt, sched, step)
+                    with self.ema_applied():
+                        fname = self.save_lora(network, step)
+                        self.evaluate(model, network, step, fname)
+                    self.save_state(network, opt, sched, step)  # (the live weights, and the EMA beside them)
                 if sample_every and step % sample_every == 0 and step < total:
-                    self.make_samples(model, network, step)
+                    with self.ema_applied():
+                        self.make_samples(model, network, step)
         except StopRequested:
             if step > start:  # nothing new to save if no step ran in this session
                 if not any(c["step"] == step for c in self.status["checkpoints"]):  # (else just saved)
-                    self.save_lora(network, step)
+                    with self.ema_applied():
+                        self.save_lora(network, step)
                 self.save_state(network, opt, sched, step)
             self.status["phase"] = "stopped"
             self.log(f"Stopped at step {step}" + ("; state saved for resume" if step > start else ""))
@@ -1185,10 +1230,11 @@ class Trainer:
         finally:
             metrics.close()
 
-        self.evaluate(model, network, step, self.save_lora(network, step, final=True))
-        if s.get("sample_at_end", True):
-            self.make_samples(model, network, step)
-        self.strength_sweep(model, network)
+        with self.ema_applied():
+            self.evaluate(model, network, step, self.save_lora(network, step, final=True))
+            if s.get("sample_at_end", True):
+                self.make_samples(model, network, step)
+            self.strength_sweep(model, network)
         self.save_state(network, opt, sched, step)
         self.status["phase"] = "completed"
         self.log(f"Done in {(time.time() - t0) / 60:.1f} min")

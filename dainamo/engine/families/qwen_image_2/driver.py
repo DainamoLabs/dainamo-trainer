@@ -374,10 +374,14 @@ class QwenImage2Driver(FamilyDriver):
     @torch.no_grad()
     def encode_item(self, item, settings: dict) -> dict:
         self.keep_alpha = bool(settings.get("keep_alpha", True))
-        img = ImageOps.fit(open_image(item.path, self.keep_alpha), item.size, Image.Resampling.LANCZOS)
+        src = open_image(item.path, self.keep_alpha)
+        img = ImageOps.fit(src, item.size, Image.Resampling.LANCZOS)
         if item.flip:
             img = ImageOps.mirror(img)
         payload = {"latent": self.encode_image(to_tensor(img) * 2 - 1)}
+        mask = self.item_mask(item, payload["latent"].shape[-2:], src.size)
+        if mask is not None:
+            payload["mask"] = mask
         refs = item.refs
         if refs:
             w, h = item.size
@@ -438,7 +442,7 @@ class QwenImage2Driver(FamilyDriver):
         if sigma is not None:
             t = torch.full((lat.shape[0],), float(sigma), device=d)
         else:
-            t = self.sample_timesteps(lat.shape[0], lat.shape[-2:], settings).to(d)
+            t = self.timesteps(lat.shape[0], lat.shape[-2:], settings).to(d)
         tb = t.view(-1, 1, 1, 1)
         noisy = (1 - tb) * lat + tb * noise
         # an edit item trains with its references; a dropped caption trains plain text-to-image
@@ -457,7 +461,7 @@ class QwenImage2Driver(FamilyDriver):
             for idx in groups.values():
                 pred[idx] = self._forward(model, noisy[idx], t[idx], [items[i][0] for i in idx],
                                           [items[i][1] for i in idx]).float()
-        return F.mse_loss(pred, noise - lat)
+        return self.weighted_loss(pred, noise - lat, t, settings, payloads, sigma is not None)
 
     # --- sampling -----------------------------------------------------------
     def default_shift(self, width, height):

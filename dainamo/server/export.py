@@ -8,8 +8,8 @@ import os
 import re
 import zipfile
 
-from ..engine.dataset import (CLIPS_MANIFEST, LYRICS_MARK, apply_trigger, caption_path, list_media, media_kind,
-                              read_caption, reference_images, split_lyrics)
+from ..engine.dataset import (CLIPS_MANIFEST, LYRICS_MARK, apply_trigger, caption_path, list_media, mask_path,
+                              media_kind, read_caption, reference_images, split_lyrics)
 
 CHUNK = 1 << 20
 
@@ -78,22 +78,28 @@ def _text(zf: zipfile.ZipFile, sink: _Sink, text: str, arc: str, like: str):
 
 def zip_datasets(datasets: list[dict], with_trigger: bool):
     """The .zip's bytes, a piece at a time: per dataset, a folder with its images, videos and sound files where they
-    are in it, each with its caption (as training reads it, with ``with_trigger``; else as it is) and reference
-    images, and a split's manifest, so each video still trains once per epoch."""
+    are in it, each with its caption (as training reads it, with ``with_trigger``; else as it is), reference images
+    and loss mask, and a split's manifest, so each video still trains once per epoch."""
     sink, used = _Sink(), set()
     with zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED, allowZip64=True, strict_timestamps=False) as zf:
         for d in datasets:
             root, top = d["path"], folder_name(d["name"], used)
             arc = lambda p: f"{top}/{os.path.relpath(p, root).replace(os.sep, '/')}"  # noqa: E731
+            written = set()  # a caption, references and mask two files share (photo.png and photo.jpg) go in once
             for f in list_media(root):
                 yield from _file(zf, sink, f, arc(f))
                 cap = caption_path(f)
-                if with_trigger and (d.get("trigger") or os.path.exists(cap)):
-                    yield from _text(zf, sink, trained_caption(f, d.get("trigger", "")), arc(cap), f)
-                elif os.path.exists(cap):
-                    yield from _file(zf, sink, cap, arc(cap))
-                for ref in reference_images(f):
-                    yield from _file(zf, sink, ref, arc(ref))
+                if cap not in written:
+                    written.add(cap)
+                    if with_trigger and (d.get("trigger") or os.path.exists(cap)):
+                        yield from _text(zf, sink, trained_caption(f, d.get("trigger", "")), arc(cap), f)
+                    elif os.path.exists(cap):
+                        yield from _file(zf, sink, cap, arc(cap))
+                mask = mask_path(f) if media_kind(f) == "image" else None  # clips and songs train without one
+                for extra in reference_images(f) + ([mask] if mask else []):
+                    if extra not in written:
+                        written.add(extra)
+                        yield from _file(zf, sink, extra, arc(extra))
             manifest = os.path.join(root, CLIPS_MANIFEST)
             if os.path.exists(manifest):
                 yield from _file(zf, sink, manifest, arc(manifest))

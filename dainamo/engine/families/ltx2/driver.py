@@ -376,7 +376,7 @@ class LTX25Driver(FamilyDriver):
         frames = int(payloads[0].get("frames", 1))
         a_frames = M.audio_latent_frames(frames, self.fps)
         s = torch.full((b,), float(sigma), device=d) if sigma is not None else \
-            self._sigmas(b, t * h * w, settings).to(d)
+            self.to_noise_range(self._sigmas(b, t * h * w, settings), settings).to(d)
         noise = randn(x0.shape)
         s5 = s.view(-1, 1, 1, 1, 1)
         noisy = (1 - s5) * x0 + s5 * noise
@@ -403,9 +403,16 @@ class LTX25Driver(FamilyDriver):
         pv, pa = self._predict(model, _pack(noisy), audio, [c["text"] for c in conds], video_t, s, audio_sigma,
                                x0.shape, audio.shape[1])
         err = (_unpack(pv, x0.shape) - target) ** 2
-        loss = err[:, :, 1:].mean() if first else err.mean()
+        if first:
+            err = err[:, :, 1:]
+        # one noise level per item (video and audio share it): loss weighting applies per item. Masks don't
+        # (a video family; ``trains_masks``)
+        w = self.step_weights(s, settings, sigma is not None)
+        loss = err.mean() if w is None else (self.per_item_mean(err) * w).mean()
         if audio_target is not None:
-            loss = loss + float(settings.get("audio_loss_weight", 1.0)) * F.mse_loss(pa, audio_target)
+            audio_loss = (F.mse_loss(pa, audio_target) if w is None
+                          else (self.per_item_mean((pa - audio_target) ** 2) * w).mean())
+            loss = loss + float(settings.get("audio_loss_weight", 1.0)) * audio_loss
         return loss
 
     # --- sampling -------------------------------------------------------------------------------------

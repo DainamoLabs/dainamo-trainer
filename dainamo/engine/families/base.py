@@ -360,6 +360,103 @@ class FamilyDriver:
         return model
 
     def sample_timesteps(self, batch: int, latent_hw: tuple[int, int], settings: dict) -> torch.Tensor: ...
+
+    # the lowest noise level a training step is drawn at (``timesteps``), where a narrowed noise range would reach 0
+    timestep_floor: float = 1e-3
+
+    def timesteps(self, batch: int, latent_hw, settings: dict) -> torch.Tensor:
+        """The noise levels of a training step, (B,) with 1 = pure noise: the family's ``sample_timesteps``, moved
+        into the job's noise range (``to_noise_range``). Training and the Validator's quantiles both draw here."""
+        return self.to_noise_range(self.sample_timesteps(batch, latent_hw, settings), settings)
+
+    def to_noise_range(self, t: torch.Tensor, settings: dict) -> torch.Tensor:
+        """Noise levels drawn from the family's distribution over 0..1, rescaled linearly into
+        [timestep_min, timestep_max] (so the distribution keeps its shape inside the range), and kept above
+        ``timestep_floor``. The full range returns ``t`` as it is."""
+        lo, hi = settings.get("timestep_min"), settings.get("timestep_max")
+        lo = 0.0 if lo in (None, "") else float(lo)
+        hi = 1.0 if hi in (None, "") else float(hi)
+        if lo <= 0 and hi >= 1:
+            return t
+        if not 0 <= lo < hi <= 1:
+            raise ValueError(f"The noise range must be 0 <= timestep_min < timestep_max <= 1, not {lo:g}..{hi:g}")
+        return (lo + (hi - lo) * t).clamp_min(self.timestep_floor)
+
+    def loss_weights(self, t: torch.Tensor, settings: dict) -> torch.Tensor:
+        """Per-sample loss weights (B,) by noise level ``t`` (flow matching, 1 = pure noise), for ``loss_weighting``:
+        "none" (all 1); "min_snr", Min-SNR-gamma (Hang et al.) on the velocity loss: min(SNR, gamma) * t^2 with
+        SNR = ((1 - t) / t)^2 (gamma: ``min_snr_gamma``), since the velocity error is the clean-image error over t^2,
+        and Min-SNR weights that by min(SNR, gamma); "cosmap", SD3's cosine-map weighting. They aren't renormalised
+        per batch, which would make the effective learning rate depend on the batch."""
+        mode = str(settings.get("loss_weighting") or "none")
+        t = t.float()
+        if mode == "none":
+            return torch.ones_like(t)
+        if mode == "cosmap":
+            return 2 / (math.pi * (1 - 2 * t + 2 * t * t))
+        if mode == "min_snr":
+            gamma = float(settings.get("min_snr_gamma", 5) or 5)
+            snr = ((1 - t) / t) ** 2  # t = 0 (clean) gives inf, capped at gamma, and a weight of 0 from t^2
+            return snr.clamp(max=gamma) * t * t
+        raise ValueError(f"Unknown loss_weighting {mode!r}")
+
+    def step_weights(self, t: torch.Tensor, settings: dict, sigma_pinned: bool = False) -> torch.Tensor | None:
+        """``loss_weights`` for a training step, or None when there are none to apply: no weighting, or a pinned
+        noise level (validation, where weights would only rescale the score)."""
+        if sigma_pinned or str(settings.get("loss_weighting") or "none") == "none":
+            return None
+        return self.loss_weights(t, settings).to(t.device)
+
+    def weighted_loss(self, pred: torch.Tensor, target: torch.Tensor, t: torch.Tensor, settings: dict,
+                      payloads: list, sigma_pinned: bool = False) -> torch.Tensor:
+        """The training loss of a batch (B, C, ..., h, w): the MSE, with each item's loss mask
+        (``payload["mask"]``, when ``masked_loss`` is on) weighting its pixels as
+        ``mask_min_weight + (1 - mask_min_weight) * mask``, normalised by the weights' sum so a small mask doesn't
+        shrink the loss; each item's loss then times its ``loss_weights`` (not with a pinned sigma); then the mean
+        over the batch. With neither, exactly ``F.mse_loss``."""
+        pred, target = pred.float(), target.float()
+        masks = [p.get("mask") if isinstance(p, dict) else None for p in payloads] if settings.get("masked_loss") \
+            else []
+        weights = self.step_weights(t, settings, sigma_pinned)
+        if weights is None and not any(m is not None for m in masks):
+            return F.mse_loss(pred, target)
+        err = (pred - target) ** 2
+        lo = float(settings.get("mask_min_weight", 0.1))
+        per = []
+        for i in range(err.shape[0]):
+            m = masks[i] if i < len(masks) else None
+            if m is None:
+                per.append(err[i].mean())
+                continue
+            m = m.to(err.device, torch.float32)
+            if tuple(m.shape[-2:]) != tuple(err.shape[-2:]):  # a family whose loss isn't at the cached latent's size
+                m = F.interpolate(m.view(1, 1, *m.shape[-2:]), size=tuple(err.shape[-2:]), mode="area")[0, 0]
+            w = (lo + (1 - lo) * m).expand_as(err[i])  # over channels (and frames)
+            per.append((err[i] * w).sum() / w.sum().clamp_min(1e-8))  # an all-black mask at weight 0 counts 0
+        per = torch.stack(per)
+        return (per if weights is None else per * weights.to(per)).mean()
+
+    @staticmethod
+    def per_item_mean(err: torch.Tensor) -> torch.Tensor:
+        """(B, ...) squared errors -> (B,) their mean per item, for families that weight items' losses themselves."""
+        return err.flatten(1).mean(1)
+
+    @property
+    def trains_masks(self) -> bool:
+        """Whether its items' loss masks reach the loss (``masked_loss``): image families only. Video and audio
+        families leave them out of their payloads."""
+        return not self.supports_video and not self.is_audio
+
+    def item_mask(self, item, latent_hw, image_size: tuple[int, int] | None = None) -> torch.Tensor | None:
+        """An image item's loss mask at the latent's spatial size: (h, w) float16 in [0, 1], area-averaged from
+        the pixel mask cropped like the image (``dataset.load_mask``); None for an item without one.
+        ``image_size``: the image's own size, when the caller has it open."""
+        if not item.mask or item.is_video or item.is_audio:
+            return None
+        from .. import dataset as ds
+        px = ds.load_mask(item.mask, image_size or ds.image_size(item.path), item.size, item.flip)
+        return F.interpolate(px[None], size=tuple(latent_hw), mode="area")[0, 0].to(torch.float16)
+
     def predict(self, model: nn.Module, noisy: torch.Tensor, t: torch.Tensor, text: list[torch.Tensor]) -> torch.Tensor: ...
     def loss_target(self, latents: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
         return noise - latents  # flow-matching velocity
@@ -443,15 +540,20 @@ class FamilyDriver:
         return {"files": [self.profile.get("vae" if kind == "latents" else "text_encoder")]}
 
     def encode_item(self, item, settings: dict) -> dict:
-        """VAE-encode one dataset item (VAE loaded). The payload is cached and passed to training_loss."""
+        """VAE-encode one dataset item (VAE loaded). The payload is cached and passed to training_loss: its
+        "latent", and an image's loss mask at the latent's size ("mask", ``item_mask``) when it has one."""
         from .. import dataset as ds
-        return {"latent": self.encode_image(ds.load_and_crop(item.path, item.size, item.flip))}
+        payload = {"latent": self.encode_image(ds.load_and_crop(item.path, item.size, item.flip))}
+        mask = self.item_mask(item, payload["latent"].shape[-2:])
+        if mask is not None:
+            payload["mask"] = mask
+        return payload
 
     def training_loss(self, model: nn.Module, payloads: list, conds: list[dict], settings: dict, rng=None,
                       sigma: float | None = None, generator: torch.Generator | None = None,
                       deterministic: bool = False) -> torch.Tensor:
-        """Flow-matching MSE on a batch. ``sigma``/``generator`` pin the noise level and noise
-        (validation); otherwise both are random."""
+        """Flow-matching MSE on a batch (``weighted_loss``). ``sigma``/``generator`` pin the noise level and noise
+        (validation); otherwise both are random, the noise level in the job's noise range (``timesteps``)."""
         lat = torch.stack([p["latent"] if isinstance(p, dict) else p for p in payloads]).to(self.device, torch.float32)
         text = [c["text"] for c in conds]
         if generator is not None:
@@ -461,19 +563,19 @@ class FamilyDriver:
         if sigma is not None:
             t = torch.full((lat.shape[0],), float(sigma), device=self.device)
         else:
-            t = self.sample_timesteps(lat.shape[0], lat.shape[-2:], settings).to(self.device)
+            t = self.timesteps(lat.shape[0], lat.shape[-2:], settings).to(self.device)
         tb = t.view(-1, *([1] * (lat.dim() - 1)))
         noisy = (1 - tb) * lat + tb * noise
         with torch.autocast("cuda", dtype=torch.bfloat16):
             pred = self.predict(model, noisy, t, text)
-        return F.mse_loss(pred.float(), self.loss_target(lat, noise).float())
+        return self.weighted_loss(pred, self.loss_target(lat, noise), t, settings, payloads, sigma is not None)
 
     # --- concept sliders (``engine.slider``; families with info.sliders) ----
     def slider_batch(self, payloads: list, settings: dict) -> dict:
         """Training images noised at random timesteps, for ``slider_velocity`` (captions and any reference
         images of the payloads aren't used)."""
         lat = torch.stack([p["latent"] if isinstance(p, dict) else p for p in payloads]).to(self.device, torch.float32)
-        t = self.sample_timesteps(lat.shape[0], lat.shape[-2:], settings).to(self.device)
+        t = self.timesteps(lat.shape[0], lat.shape[-2:], settings).to(self.device)
         tb = t.view(-1, *([1] * (lat.dim() - 1)))
         return {"noisy": (1 - tb) * lat + tb * torch.randn_like(lat), "t": t}
 

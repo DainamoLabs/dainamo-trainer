@@ -15,6 +15,7 @@ dainamo/
     merge.py              LoRAs merged into one, or cut to a smaller rank
     dataset.py            discovery, aspect buckets, caption/trigger handling
     trainer.py            family-agnostic training loop
+    ema.py                an exponential moving average of the trained weights, used for saves and samples
     slider.py             concept sliders: their settings and training step
     transcribe.py         Whisper speech-to-text for Auto-Caption (a subprocess)
     textgen.py            text encoders that write captions, and their OpenAI-style server
@@ -115,15 +116,18 @@ only the header matters.
 | `test_sampling.py` | samplers on Gaussian data with a known solution (Heun and DPM++ 2M converge at second order), DPM++ 2M against k-diffusion, the beta schedule |
 | `test_sandbox.py` | Sandbox requests per family and workflow, GPU rules shared with the queue, the LoRA stack, parking models in RAM, Low VRAM's VAE, checkpoint grids, the step counter, making RefMods (checks, the clip VRAM warning, sheets, listing) |
 | `test_evaluation.py` | the hold-out split, recommendation rules, deterministic validation loss, bleed normalisation, multi-resolution items and per-dataset settings with their cache keys |
-| `test_trainer.py` | a tiny stand-in model on the GPU: a job trains, saves, finishes and continues; Evaluate checkpoints; jobs sharing a dataset's encodings |
+| `test_trainer.py` | a tiny stand-in model on the GPU: a job trains, saves, finishes and continues; Evaluate checkpoints; jobs sharing a dataset's encodings; a job with EMA weights saving the average and carrying it on |
+| `test_ema.py` | the EMA's warmup decays, swapping the average in and back (also when the body raises), its saved state |
+| `test_masks.py` | loss masks: found beside images only, lined up with the crop and flip, in the cache key and the payload, the weighted loss against plain MSE |
+| `test_timesteps.py` | the noise range on every family's timestep mode, Min-SNR and cosine-map weights, none applied at a pinned sigma, the Validator drawing inside the range |
 | `test_cache.py` | which model files and settings share cache folders, and that a model file is known by its contents |
 | `test_hf_assets.py` | Hugging Face files read from the cache offline, downloaded once at the pinned commit, and a clear error offline without them |
 | `test_model_files.py` | the families' download lists, the models folder setting, finding files by their contents, downloads pausing, resuming and checking their checksum, gated and impossible downloads, the Turbo-without-adapter warning |
-| `test_dataset_check.py` | each kind of health check problem, and that a file is read once |
+| `test_dataset_check.py` | each kind of health check problem (loss masks among them), and that a file is read once |
 | `test_sources.py` | source datasets: files pairing by name across image types and subfolders, the _refs folder without them, which models take them, the health check's pairing findings, the pairs route, jobs keeping them, the VRAM projection counting them |
 | `test_clip_split.py` | Split into clips: planning inside shots, cutting at 24 fps with sound, captions and references, cancelling, each video once per epoch |
 | `test_clip_editor.py` | the clip editor: a reviewed split cut as planned, then again only where it changed (captions kept, removed clips gone, deleted ones not brought back), crops, splits from before the editor, replanning, checks on edits, and its frames being the clips' own |
-| `test_export.py` | exporting datasets: a folder each in one stored .zip, unsafe and repeated names, captions as they are or with the trigger word (a song's on its style tags) |
+| `test_export.py` | exporting datasets: a folder each in one stored .zip, unsafe and repeated names, captions as they are or with the trigger word (a song's on its style tags), masks and references once each |
 | `test_captioner.py` | reading LLM replies: thinking left out, cut-off replies retried, errors reported, the contact sheet fallback |
 | `test_llama_server.py` | the caption server against a stand-in (`tests/fake_llama_server.py`): command lines, waiting while loading, GPU choice, failed starts with hints, idle stops, handing over the GPU; the text encoder server's GPU rules |
 | `test_textgen.py` | which text encoders can write (from header-only copies), OpenAI messages to chat templates, the server's answers, quantized layers expanded only while there's room. With a GPU, a tiny random Qwen3-VL end to end |

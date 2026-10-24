@@ -20,6 +20,9 @@ AUDIO_EXTS = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".opus", ".aac"}
 # per-item reference images (an edit's source images, a clip's references) kept inside the dataset, for when no
 # source datasets are chosen; never trained on directly
 REFS_DIR = "_refs"
+# per-image loss masks (masked loss): ``<dataset>/_masks/<stem>.png`` beside ``<dataset>/<stem>.jpg``, greyscale,
+# white where the loss counts and black where it doesn't; never trained on directly
+MASKS_DIR = "_masks"
 # written by Split into clips: which video each clip was cut from ({"clips": {relative clip path: {source, ...}}})
 CLIPS_MANIFEST = ".clips.json"
 
@@ -38,11 +41,24 @@ def media_kind(path: str) -> str | None:
 def list_media(root: str) -> list[str]:
     out = []
     for dirpath, dirnames, files in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d != REFS_DIR)
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d not in (REFS_DIR, MASKS_DIR))
         for f in sorted(files):
             if not f.startswith(".") and media_kind(f):
                 out.append(os.path.join(dirpath, f))
     return out
+
+
+def mask_path(media_path: str) -> str | None:
+    """The loss mask of an image, if it has one: ``<folder>/_masks/<stem>.<image ext>`` beside it (PNG first)."""
+    folder = os.path.join(os.path.dirname(media_path), MASKS_DIR)
+    if not os.path.isdir(folder):
+        return None
+    stem = os.path.splitext(os.path.basename(media_path))[0]
+    for ext in [".png"] + sorted(IMAGE_EXTS - {".png"}):
+        p = os.path.join(folder, stem + ext)
+        if os.path.isfile(p):
+            return p
+    return None
 
 
 def split_clips(root: str) -> dict[str, dict]:
@@ -146,6 +162,26 @@ def load_and_crop(path: str, size: tuple[int, int], flip: bool = False) -> torch
         img = ImageOps.mirror(img)
     arr = np.asarray(img, dtype=np.float32) / 127.5 - 1.0
     return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+
+
+def image_size(path: str) -> tuple[int, int]:
+    """An image's (width, height) the way it's shown, turned by its EXIF orientation (as ``build_items`` sizes it)."""
+    with Image.open(path) as im:
+        return ImageOps.exif_transpose(im).size
+
+
+def load_mask(path: str, image_size: tuple[int, int], size: tuple[int, int], flip: bool = False) -> torch.Tensor:
+    """An image's loss mask (``mask_path``) cropped like the image: read as greyscale, stretched to the image's own
+    size (``image_size``, so a mask of another size or aspect still lines up with it), then fitted to ``size`` and
+    mirrored exactly as ``load_and_crop`` does the image -> (1, H, W) in [0, 1], 1 where the loss counts."""
+    with Image.open(path) as im:
+        mask = ImageOps.exif_transpose(im).convert("L")
+    if mask.size != tuple(image_size):
+        mask = mask.resize(tuple(image_size), Image.Resampling.BILINEAR)
+    mask = ImageOps.fit(mask, size, Image.Resampling.LANCZOS)
+    if flip:
+        mask = ImageOps.mirror(mask)
+    return torch.from_numpy(np.asarray(mask, dtype=np.float32) / 255.0).unsqueeze(0)
 
 
 # ---- video / audio ---------------------------------------------------------
@@ -294,6 +330,7 @@ class Item:
     source: str = ""         # a clip cut from a longer video (``clip_sources``): that video
     group: str = ""          # items of which an epoch trains one, picked at random: a source's clips at one size
     refs: list[str] = field(default_factory=list)  # reference images it trains with (``item_references``)
+    mask: str = ""           # an image's loss mask (``mask_path``), for masked loss
 
     @property
     def is_video(self) -> bool:
@@ -314,12 +351,14 @@ class Item:
             raw += f"|{self.start}|{self.seconds}"
         for ref in self.refs:  # editing or pairing another reference re-encodes the item
             raw += f"|{ref}|{os.stat(ref).st_mtime_ns}"
+        if self.mask:  # so does adding or editing its mask (an item without one keeps the key it had)
+            raw += f"|mask|{self.mask}|{os.stat(self.mask).st_mtime_ns}"
         return hashlib.sha1(raw.encode()).hexdigest()
 
 
 def build_items(datasets: list[dict], resolution: int | list[int], div: int, flip: bool, log=print,
                 video_frames: int | None = None, snap_frames=None, fps: int = 24,
-                caption_dropout: float = 0.0, references: bool = False) -> list[Item]:
+                caption_dropout: float = 0.0, references: bool = False, masks: bool = True) -> list[Item]:
     """``datasets``: [{path, trigger, repeats, resolution?, flip?, caption_dropout?, name?, sources?}] -> list of
     Items (repeats expanded). A dataset's own ``resolution`` (one or several), ``flip`` and ``caption_dropout`` are
     used instead of the arguments of those names.
@@ -327,6 +366,8 @@ def build_items(datasets: list[dict], resolution: int | list[int], div: int, fli
     reference images it pairs with (``item_references``): from the dataset's ``sources`` ([{path, name?}], source
     datasets, whose files never train as items themselves; ``nested_sources``, ``source_index``), or else its _refs
     folder.
+    With ``masks``, each image has the loss mask in its folder's _masks folder, if it has one (``mask_path``; clips
+    don't take them).
     With several resolutions, each file is an item at each of them, except where a small image gives
     the same bucket at two (it isn't upscaled), which would only count it twice.
     With ``video_frames`` set (video families), clips are included at up to that many frames,
@@ -346,7 +387,7 @@ def build_items(datasets: list[dict], resolution: int | list[int], div: int, fli
         if not files:
             log(f"Warning: no usable images{' or videos' if video_frames else ''} found in {ds['path']}")
             continue
-        start, used, small, paired = len(items), {"image": 0, "clip": 0}, 0, 0
+        start, used, small, paired, masked = len(items), {"image": 0, "clip": 0}, 0, 0, 0
         cuts, cut_from, n_cut = clip_sources(ds["path"]), set(), 0
         for f in files:
             frames, has_audio = 1, False
@@ -378,6 +419,8 @@ def build_items(datasets: list[dict], resolution: int | list[int], div: int, fli
             cap = apply_trigger(read_caption(f), ds.get("trigger", ""))
             refs = item_references(f, ds["path"], indexes) if references else []
             paired += bool(refs)
+            mask = (mask_path(f) or "") if masks and frames == 1 else ""
+            masked += bool(mask)
             variants = [False, True] if ds.get("flip", flip) else [False]
             drop = float(ds.get("caption_dropout", caption_dropout))
             for size, res in sizes.items():
@@ -386,7 +429,7 @@ def build_items(datasets: list[dict], resolution: int | list[int], div: int, fli
                     for rep in range(max(1, int(ds.get("repeats", 1)))):
                         group = f"{source}|{res}|{fl}|{rep}" if source else ""
                         items.append(Item(f, cap, size, fl, frames, has_audio, res, drop, small_at,
-                                          source=source, group=group, refs=refs))
+                                          source=source, group=group, refs=refs, mask=mask))
         repeats = max(1, int(ds.get("repeats", 1)))
         counts = " and ".join(f"{n} {kind}{'' if n == 1 else 's'}" for kind, n in used.items() if n)
         mine = items[start:]
@@ -404,6 +447,8 @@ def build_items(datasets: list[dict], resolution: int | list[int], div: int, fli
             log(f"  {paired} of {n} with references"
                 + (f" from {', '.join(src.get('name') or os.path.basename(os.path.normpath(src['path'])) for src in sources)}"
                    if sources else f" in {REFS_DIR}") + (f"; {n - paired} without" if paired < n else ""))
+        if masked:
+            log(f"  {masked} of {used['image']}{' images' if used['clip'] else ''} with masks in {MASKS_DIR}")
     return items
 
 

@@ -19,7 +19,7 @@ from ...engine.families import get_family
 from ...engine.families.base import takes_sources
 from .. import db
 from ..queue import CACHE_DIR, job_dir, job_folder, read_status, scheduler, send_control
-from ..validation import check_evaluation, check_resolution, check_settings
+from ..validation import LOSS_AND_EMA_DEFAULTS, check_evaluation, check_resolution, check_settings
 from .common import dataset_or_404, job_or_404, not_found, profile_or_404
 
 router = APIRouter(prefix="/api")
@@ -242,17 +242,19 @@ def _restart_reason(key: str) -> str | None:
 
 # while the checkpoint picker is on, what its validation items (and how they're scored) come from, along with the
 # datasets: changed mid-run, checkpoints scored before and after wouldn't compare. Likewise the concept bleed check's
-# renders. (The strength sweep and bleed limit only apply to the scores at the end, so they can change.)
+# renders. (The strength sweep and bleed limit only apply to the scores at the end, so they can change; so can EMA,
+# since each checkpoint is scored with the weights it saves, and the loss weighting, which validation leaves out.)
 PICKER_INPUTS = ("val_dataset", "val_holdout", "val_timesteps", "seed", "resolution", "num_frames", "auto_frames",
-                 "clip_seconds")
+                 "clip_seconds", "timestep_sampling", "timestep_min", "timestep_max", "masked_loss", "mask_min_weight")
 BLEED_INPUTS = ("bleed_prompts", "bleed_width", "bleed_height", "bleed_seed")
 
 
 def _restart_reasons(old: dict, new: dict) -> list[str]:
     """What in config ``new`` a job that has trained as ``old`` can't carry on with: another model, settings
     ``_restart_reason`` names, or what the checkpoint picker or concept bleed scores while it's on (settings
-    ``old`` doesn't have, from before they existed, aren't compared)."""
-    o, n = old.get("settings", {}), new["settings"]
+    ``old`` doesn't have, from before they existed, aren't compared; it trained without masked loss, EMA, a noise
+    range or loss weighting, so those are their defaults)."""
+    o, n = {**LOSS_AND_EMA_DEFAULTS, **old.get("settings", {})}, new["settings"]
     reasons = ["the model"] if old.get("profile_name") != new["profile_name"] else []
     if bool(o.get("refmod_enabled")) != bool(n.get("refmod_enabled")):
         reasons.append("what it makes (a LoRA or a RefMod)")
@@ -269,7 +271,8 @@ def _restart_reasons(old: dict, new: dict) -> list[str]:
 
     if n.get("picker_enabled") and (not o.get("picker_enabled") or changed(PICKER_INPUTS)
                                     or _dataset_choices(old) != _dataset_choices(new)):
-        reasons.append("what the checkpoint picker scores (made from the datasets, resolution, clip length and seed)")
+        reasons.append("what the checkpoint picker scores (made from the datasets, resolution, clip length, seed, "
+                       "noise levels and masks)")
     if n.get("bleed_enabled") and (not o.get("bleed_enabled") or changed(BLEED_INPUTS)):
         reasons.append("the concept bleed check")
     return reasons
@@ -288,7 +291,7 @@ def _changes(old: dict, new: dict) -> list[str]:
         t = json.dumps(v) if isinstance(v, (list, dict)) else str(v)
         return t if len(t) <= 40 else t[:37] + "..."
 
-    s = old.get("settings", {})
+    s = {**LOSS_AND_EMA_DEFAULTS, **old.get("settings", {})}  # a job from before them trained with their defaults
     out = [f"{k} {short(s[k])} → {short(v)}" for k, v in sorted(new["settings"].items()) if k in s and s[k] != v]
     return out + (["datasets"] if _dataset_choices(old) != _dataset_choices(new) else [])
 

@@ -448,7 +448,7 @@ class MinimaxH3Driver(FamilyDriver):
         if sigma is not None:
             sv = torch.full((b,), float(sigma), device=d)
         else:
-            sv = self.sample_timesteps(b, None, settings).to(d)
+            sv = self.timesteps(b, None, settings).to(d)
         sa = P.remap_sigma(sv, P.VIDEO_SIGMA_SHIFT, P.AUDIO_SIGMA_SHIFT)
         tv, ta = 1.0 - sv, 1.0 - sa
 
@@ -520,10 +520,21 @@ class MinimaxH3Driver(FamilyDriver):
             audio_pred.append(a)
         # every group's predictions against its items' targets: the loss is the mean over the whole batch
         pred_v = P.unpatchify_video_tokens(torch.cat(video_pred).float(), t_lat, h_lat, w_lat)
-        loss = F.mse_loss(pred_v, target_v[order])
+        audio_weight = float(settings.get("audio_loss_weight", 1.0))
+        # loss weighting, per item: the timesteps are per row, but every row in the loss has its item's own noise
+        # level (``sv`` for video, ``sa`` for audio; the keyframe and reference rows that differ aren't in the
+        # loss), so each item's loss is weighted by the noise level it was trained at. Masks don't apply (a video
+        # family; ``trains_masks``)
+        w_v = self.step_weights(sv, settings, sigma is not None)
+        if w_v is None:
+            loss = F.mse_loss(pred_v, target_v[order])
+            if audio_target is not None:
+                loss = loss + audio_weight * F.mse_loss(torch.cat(audio_pred).float(), audio_target[order])
+            return loss
+        loss = (self.per_item_mean((pred_v - target_v[order]) ** 2) * w_v[order]).mean()
         if audio_target is not None:
-            loss = loss + float(settings.get("audio_loss_weight", 1.0)) * F.mse_loss(torch.cat(audio_pred).float(),
-                                                                                     audio_target[order])
+            err_a = (torch.cat(audio_pred).float() - audio_target[order]) ** 2
+            loss = loss + audio_weight * (self.per_item_mean(err_a) * self.loss_weights(sa, settings)[order]).mean()
         return loss
 
     # --- sampling -----------------------------------------------------------

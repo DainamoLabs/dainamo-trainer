@@ -726,6 +726,96 @@ def test_editing_a_job(client, tmp_path, monkeypatch):
     db.execute("UPDATE jobs SET status='stopped' WHERE id=?", (jid,))
 
 
+def test_masked_loss_ema_noise_range_and_loss_weighting_are_checked(client, tmp_path, monkeypatch):
+    from dainamo.server.queue import scheduler
+    from dainamo.server.validation import LOSS_AND_EMA_DEFAULTS
+
+    monkeypatch.setattr(scheduler, "_launch", lambda: None)  # its jobs stay queued
+    pid = client.post("/api/profiles", json={"name": "ml", "family": "krea2", "data": {}}).json()["id"]
+    did = client.post("/api/datasets", json={"name": "ml", "path": str(tmp_path)}).json()["id"]
+
+    def post(settings):
+        return client.post("/api/jobs", json={"name": "ml", "profile_id": pid, "datasets": [{"id": did}],
+                                              "settings": settings})
+
+    # left out, each is off or the whole range
+    s = post({}).json()["config"]["settings"]
+    assert {k: s[k] for k in LOSS_AND_EMA_DEFAULTS} == LOSS_AND_EMA_DEFAULTS
+    r = post({"masked_loss": True, "mask_min_weight": "0", "ema_enabled": 1, "ema_decay": "0.9999",
+              "timestep_min": 0.3, "timestep_max": "1", "loss_weighting": "min_snr", "min_snr_gamma": "2.5"})
+    s = r.json()["config"]["settings"]
+    assert [s[k] for k in LOSS_AND_EMA_DEFAULTS] == [True, 0.0, True, 0.9999, 0.3, 1.0, "min_snr", 2.5]
+    for bad, why in (({"mask_min_weight": 1.5}, "Setting 'mask_min_weight'=1.5 is out of range (0–1)"),
+                     ({"ema_decay": 0.5}, "Setting 'ema_decay'=0.5 is out of range (0.9–0.9999)"),
+                     ({"ema_decay": 1}, "'ema_decay'=1 is out of range"), ({"ema_decay": "nan"}, "out of range"),
+                     ({"timestep_min": -0.1}, "'timestep_min'=-0.1 is out of range (0–1)"),
+                     ({"timestep_max": 2}, "'timestep_max'=2 is out of range"),
+                     ({"timestep_min": 0.6, "timestep_max": 0.4},
+                      "The noise range's minimum (0.6) must be below its maximum (0.4)"),
+                     ({"timestep_min": 0.5, "timestep_max": 0.5}, "must be below its maximum"),
+                     ({"loss_weighting": "snr"}, "Unknown loss weighting 'snr' (none, min_snr or cosmap)"),
+                     ({"min_snr_gamma": 0}, "Setting 'min_snr_gamma'=0 must be above 0"),
+                     ({"min_snr_gamma": "a lot"}, "Setting 'min_snr_gamma' must be a number"),
+                     ({"mask_min_weight": "some"}, "Setting 'mask_min_weight' must be a number")):
+        r = post(bad)
+        assert r.status_code == 400 and why in r.json()["detail"], bad
+    # a finetune's weights are the whole model, so it keeps no average of them: refused rather than dropped
+    finetune = {"finetune_enabled": True, "optimizer": "adafactor"}
+    assert post(finetune).status_code == 200
+    r = post({**finetune, "ema_enabled": True})
+    assert r.status_code == 400 and "Turn EMA off to finetune" in r.json()["detail"]
+    for j in client.get("/api/jobs").json():
+        if j["name"] == "ml":
+            client.delete(f"/api/jobs/{j['id']}")
+
+
+def test_masks_ema_and_the_noise_range_change_without_starting_again(client, tmp_path, monkeypatch):
+    import json
+
+    from dainamo.server import db
+    from dainamo.server.queue import job_dir, scheduler
+
+    monkeypatch.setattr(scheduler, "_launch", lambda: None)  # its jobs stay queued
+    pid = client.post("/api/profiles", json={"name": "me", "family": "krea2", "data": {}}).json()["id"]
+    did = client.post("/api/datasets", json={"name": "me", "path": str(tmp_path)}).json()["id"]
+    jid = client.post("/api/jobs", json={"name": "me", "profile_id": pid, "datasets": [{"id": did}],
+                                         "settings": {"steps": 3000}}).json()["id"]
+    d = job_dir(jid)
+    os.makedirs(os.path.join(d, "state"))
+    open(os.path.join(d, "state", "last.pt"), "wb").close()
+    with open(os.path.join(d, "status.json"), "w") as f:
+        json.dump({"phase": "stopped", "step": 800}, f)
+    # a job from before these settings: it trained without them
+    db.execute("UPDATE jobs SET status='stopped', config=json_remove(config, '$.settings.masked_loss', "
+               "'$.settings.ema_enabled', '$.settings.timestep_min', '$.settings.loss_weighting') WHERE id=?", (jid,))
+
+    def edit(settings):
+        cfg = client.get(f"/api/jobs/{jid}/config").json()
+        datasets = [{k: x[k] for k in ("id", "repeats", "resolution", "flip", "caption_dropout")} for x in cfg["datasets"]]
+        return client.put(f"/api/jobs/{jid}", json={"name": cfg["name"], "profile_id": pid, "gpu": "auto",
+                                                    "datasets": datasets, "settings": {**cfg["settings"], **settings}})
+
+    r = edit({"masked_loss": True, "ema_enabled": True, "ema_decay": 0.995, "timestep_min": 0.2,
+              "loss_weighting": "cosmap"})
+    assert r.status_code == 200 and r.json()["status"] == "stopped"
+    assert os.path.exists(os.path.join(d, "state", "last.pt"))
+    with open(os.path.join(d, "log.txt"), encoding="utf-8") as f:
+        log = f.read()
+    assert "carries on from step 800 with" in log
+    for change in ("ema_enabled False → True", "masked_loss False → True", "timestep_min 0.0 → 0.2",
+                   "loss_weighting none → cosmap", "ema_decay 0.99 → 0.995"):
+        assert change in log, change
+    # while the checkpoint picker is on, the noise levels and masks are part of what it scores
+    db.execute("UPDATE jobs SET config=json_set(config, '$.settings.picker_enabled', json('true')) WHERE id=?", (jid,))
+    for change in ({"timestep_max": 0.8}, {"masked_loss": False}, {"mask_min_weight": 0.5},
+                   {"timestep_sampling": "uniform"}):
+        r = edit({"picker_enabled": True, **change})
+        assert r.status_code == 409 and "what the checkpoint picker scores" in r.json()["detail"], change
+    # each checkpoint is scored with the weights it saves, and validation leaves the loss weighting out
+    assert edit({"picker_enabled": True, "ema_enabled": False, "loss_weighting": "min_snr"}).status_code == 200
+    client.delete(f"/api/jobs/{jid}")
+
+
 def test_a_job_keeps_its_datasets_once_theyre_removed(client, tmp_path, monkeypatch):
     from dainamo.server.queue import scheduler
 

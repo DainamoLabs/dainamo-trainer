@@ -3,6 +3,8 @@
     .venv/bin/python -m pytest tests/test_dataset_check.py -v
 """
 
+import os
+
 import numpy as np
 from PIL import Image
 
@@ -115,3 +117,41 @@ def test_clips(tmp_path):
     auto = dataset_check.check(str(tmp_path), "", [256], 32, 226, clip_length=241, auto_frames=True)
     assert {i["id"] for i in auto["issues"]} & {"short_clips", "long_clips"} == set()
     assert "clip_too_short" in {i["id"] for i in auto["issues"]} and auto["longest_clip"] == 72
+
+
+def test_masks(tmp_path):
+    from dainamo.engine.dataset import MASKS_DIR
+
+    _photo(1, (512, 512)).save(tmp_path / "a.png")
+    _photo(2, (512, 256)).save(tmp_path / "b.jpg")
+    _photo(3).save(tmp_path / "c.png")
+    masks = tmp_path / MASKS_DIR
+    masks.mkdir()
+    Image.new("L", (256, 256), 255).save(masks / "a.png")  # smaller, of the same shape: it lines up
+    Image.new("L", (300, 300), 255).save(masks / "b.png")  # square for a 2:1 image: stretched
+    Image.new("L", (64, 64)).save(masks / "gone.png")  # its image isn't there
+    (masks / "notes.txt").write_text("not a caption")
+    named = lambda issue: [f["name"] for f in issue["files"]]  # noqa: E731
+
+    r = dataset_check.check(str(tmp_path), "", [512], 16, None, None)
+    issues = {i["id"]: i for i in r["issues"]}
+    assert (r["files"], r["images"]) == (3, 3)  # the masks aren't the dataset's files
+    assert (issues["masks"]["level"], issues["masks"]["title"]) == ("info", "2 of 3 images have masks")
+    assert issues["mask_without_image"]["level"] == "info"
+    assert named(issues["mask_without_image"]) == [os.path.join(MASKS_DIR, "gone.png")]
+    assert issues["mask_shape"]["level"] == "warning"
+    assert named(issues["mask_shape"]) == [os.path.join(MASKS_DIR, "b.png")]
+    assert "orphan_caption" not in issues  # _masks isn't looked in for captions
+    # within 2% of its image's shape it isn't flagged
+    Image.new("L", (507, 256), 255).save(masks / "b.png")
+    issues = {i["id"]: i for i in dataset_check.check(str(tmp_path), "", [512], 16, None, None)["issues"]}
+    assert "mask_shape" not in issues
+    # one that can't be read
+    (masks / "c.png").write_bytes(b"\x89PNG not really")
+    issues = {i["id"]: i for i in dataset_check.check(str(tmp_path), "", [512], 16, None, None)["issues"]}
+    assert issues["masks"]["title"] == "3 of 3 images have masks"
+    assert issues["mask_unreadable"]["level"] == "warning"
+    assert named(issues["mask_unreadable"]) == [os.path.join(MASKS_DIR, "c.png")]
+    # a video model trains on whole frames
+    issues = {i["id"]: i for i in dataset_check.check(str(tmp_path), "", [512], 16, 39)["issues"]}
+    assert issues["masks_unused"]["count"] == 3 and not {"masks", "mask_shape", "mask_unreadable"} & set(issues)

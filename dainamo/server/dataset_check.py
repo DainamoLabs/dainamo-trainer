@@ -17,15 +17,16 @@ from functools import lru_cache
 import numpy as np
 from PIL import Image
 
-from ..engine.dataset import (IMAGE_EXTS, REFS_DIR, SMALL, caption_path, inside, list_media, media_kind,
-                              nested_sources, paired_source, probe_audio, probe_video, reference_images, refers_to,
-                              source_index, split_clips, split_lyrics, trains_small)
+from ..engine.dataset import (IMAGE_EXTS, MASKS_DIR, REFS_DIR, SMALL, caption_path, inside, list_media, mask_path,
+                              media_kind, nested_sources, paired_source, probe_audio, probe_video, reference_images,
+                              refers_to, source_index, split_clips, split_lyrics, trains_small)
 
 DUPLICATE_BITS = 4  # difference hashes this close (of 64 bits) are near-duplicates: resized, re-saved, lightly edited
 FPS = 24
 MAX_LISTED = 60
 SONG_RATE = 44100  # music: files below this sample rate sound duller than what the model makes
 MIN_SONG, MAX_SONG = 5, 360  # seconds a music model trains on: shorter files are skipped, longer ones cut
+MASK_ASPECT = 0.02  # a mask whose shape is further than this from its image's is noticeably stretched to fit it
 
 _files: dict[tuple, dict] = {}
 _lock = threading.Lock()
@@ -67,6 +68,27 @@ def file_info(path: str) -> dict:
     with _lock:
         _files[key] = info
     return info
+
+
+def mask_size(path: str) -> tuple[int, int] | str:
+    """A mask's (width, height) as training reads it (turned by its EXIF orientation), or why it can't be read; kept
+    like ``file_info``."""
+    st = os.stat(path)
+    key = ("mask", path, st.st_size, st.st_mtime_ns)
+    with _lock:
+        if key in _files:
+            return _files[key]["size"]
+    try:
+        with Image.open(path) as im:
+            w, h = im.size
+            size = (h, w) if im.getexif().get(0x0112) in (5, 6, 7, 8) else (w, h)
+            im.draft("L", (128, 128))  # JPEGs decode small; every file is still read through
+            im.load()
+    except (OSError, ValueError, SyntaxError) as e:
+        size = str(e) or type(e).__name__
+    with _lock:
+        _files[key] = {"size": size}
+    return size
 
 
 def _duplicate_groups(hashes: list[tuple[str, int]]) -> list[list[str]]:
@@ -137,7 +159,7 @@ def pairing(root: str, files: list[str], sources: list[dict]) -> dict:
     for dirpath, dirnames, _ in os.walk(root) if os.path.isdir(root) else []:
         if REFS_DIR in dirnames:
             folders.append(os.path.join(dirpath, REFS_DIR))
-        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d != REFS_DIR]
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in (REFS_DIR, MASKS_DIR)]
     if not folders:
         return {"from": None}
     stems: dict[str, set[str]] = {}
@@ -350,21 +372,68 @@ def check(root: str, trigger: str = "", resolution: list[int] | None = None, div
             add("no_trigger", "info", f"{_plural(len(without), 'caption')} without the trigger word",
                 f"“{trigger}” is added at the start of these when training.", without)
     media_stems = set(stems)
-    orphans = []
-    skip = {os.path.abspath(p) for p in inner}  # a source dataset's captions are its own
+    orphans, mask_dirs = [], []
+    skip = {os.path.abspath(p) for p in inner}  # a source dataset's captions (and masks) are its own
     for dirpath, dirnames, names in os.walk(root):
-        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d != REFS_DIR
+        if MASKS_DIR in dirnames:
+            mask_dirs.append(os.path.join(dirpath, MASKS_DIR))
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in (REFS_DIR, MASKS_DIR)
                        and os.path.abspath(os.path.join(dirpath, d)) not in skip]
         orphans += [os.path.join(dirpath, n) for n in sorted(names)
                     if n.lower().endswith(".txt") and os.path.join(dirpath, n)[:-4] not in media_stems]
     if orphans:
         add("orphan_caption", "info", f"{_plural(len(orphans), 'caption file')} without a media file",
             "Nothing trains with them; maybe the file they belonged to was renamed or removed.", orphans)
+    if mask_dirs and not music:
+        _check_masks(add, files, [f for f in used if infos[f]["kind"] == "image"], infos, mask_dirs,
+                     video_frames is not None)
 
     order = {"error": 0, "warning": 1, "info": 2}
     issues.sort(key=lambda i: order[i["level"]])
     return {"files": len(files), "images": sum(1 for f in ok if infos[f]["kind"] == "image"), "videos": len(clips),
             "audio": len(songs), "issues": issues, "longest_clip": max(frames.values(), default=0), "pairs": pairs}
+
+
+def _check_masks(add, files: list[str], images: list[str], infos: dict, folders: list[str], video: bool):
+    """Masked loss's masks (``_masks/<name>.png`` beside an image, ``dataset.mask_path``) in ``folders``: how many of
+    the ``images`` trained have one, masks no image of the dataset's ``files`` is named like, and masks of another
+    shape than their image, which are stretched to fit it. A ``video`` model trains without them."""
+    masks = {f: m for f in images if (m := mask_path(f))}
+    if video:
+        if masks:
+            add("masks_unused", "info", f"{_plural(len(masks), 'mask')} won't be used",
+                "Masked loss is for image models; this model trains on the whole picture.", list(masks.values()))
+        return
+    if masks:
+        n = len(masks)
+        add("masks", "info", f"{n} of {_plural(len(images), 'image')} {'has a mask' if n == 1 else 'have masks'}",
+            "With Masked loss on (Create Job), the loss counts where each mask is white, and elsewhere at the "
+            "Outside the mask weight.")
+    named = {(os.path.dirname(f), os.path.splitext(os.path.basename(f))[0]) for f in files
+             if media_kind(f) == "image"}
+    lone = [os.path.join(folder, n) for folder in folders for n in sorted(os.listdir(folder))
+            if not n.startswith(".") and os.path.splitext(n)[1].lower() in IMAGE_EXTS
+            and (os.path.dirname(folder), os.path.splitext(n)[0]) not in named]
+    if lone:
+        add("mask_without_image", "info", f"{_plural(len(lone), 'mask')} without an image",
+            f"Nothing uses them; maybe the image was renamed or removed. A mask has its image's name, in a "
+            f"{MASKS_DIR} folder beside it: {MASKS_DIR}/photo.png is the mask of photo.jpg.", lone)
+    sizes = {f: mask_size(m) for f, m in masks.items()}
+    unreadable = {f: why for f, why in sizes.items() if isinstance(why, str)}
+    if unreadable:
+        add("mask_unreadable", "warning", f"{_plural(len(unreadable), 'mask')} can't be read",
+            "Re-save them as greyscale PNGs: " + next(iter(unreadable.values()))[:160], [masks[f] for f in unreadable])
+
+    def stretched(f):
+        (w, h), (iw, ih) = sizes[f], (infos[f]["width"], infos[f]["height"])
+        return not (w and h and iw and ih) or abs(w * ih / (h * iw) - 1) > MASK_ASPECT
+
+    other = [masks[f] for f in masks if f not in unreadable and stretched(f)]
+    if other:
+        add("mask_shape", "warning", f"{_plural(len(other), 'mask')} of another shape than "
+                                     f"{'its image' if len(other) == 1 else 'their images'}",
+            "Each is stretched to its image's size, so it may not line up with it. Make each mask the same size as "
+            "its image.", other)
 
 
 def _check_songs(add, songs: list[str], infos: dict, clip_seconds: int):

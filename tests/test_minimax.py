@@ -314,3 +314,43 @@ def test_sampler_lands_on_the_clean_latent_given_the_true_velocity():
     out = d.sample(Oracle(x0v, x0a), text_cond(), None, 96, 64, 6, 0, 3, frames=22)
     assert torch.allclose(P.patchify_video_latents(out["video"]), x0v, atol=1e-4)
     assert torch.allclose(out["audio"], x0a, atol=1e-4)
+
+
+def test_loss_weighting_follows_each_items_own_noise_level():
+    """Per-row timesteps, but every row in the loss has its item's noise level: each item's video loss is weighted
+    by its sigma and its audio by the audio's, also through ref2va's reordered groups."""
+    d = MinimaxH3Driver({"variant": "ref2va"}, CPU)
+    d.dtype = torch.float32
+    items = [video_payload(refs=1), video_payload(), video_payload(refs=1)]  # groups: items 0 and 2, then 1
+    conds = [{"text": text_cond(), "ref": text_cond(7, vision=12)}, {"text": text_cond()},
+             {"text": text_cond(), "ref": text_cond(7, vision=12)}]
+    sv = torch.tensor([0.2, 0.5, 0.8])
+    d.sample_timesteps = lambda b, hw, settings: sv.clone()
+
+    def loss(settings, **kw):
+        return d.training_loss(Echo(), items, conds, settings, generator=torch.Generator().manual_seed(0), **kw)
+
+    # the same draws by hand (Echo predicts its noisy input back)
+    g = torch.Generator().manual_seed(0)
+    x0, xa = torch.stack([p["video"] for p in items]), torch.stack([p["audio"] for p in items])
+    noise, na = torch.randn(x0.shape, generator=g), torch.randn(xa.shape, generator=g)
+    sa = P.remap_sigma(sv, P.VIDEO_SIGMA_SHIFT, P.AUDIO_SIGMA_SHIFT)
+    s5, s3 = sv.view(-1, 1, 1, 1, 1), sa.view(-1, 1, 1)
+    err_v = (((1 - s5) * x0 + s5 * noise - (x0 - noise)) ** 2).flatten(1).mean(1)
+    err_a = (((1 - s3) * xa + s3 * na - (xa - na)) ** 2).flatten(1).mean(1)
+    assert torch.allclose(loss({}), err_v.mean() + err_a.mean())
+    s = {"loss_weighting": "cosmap"}
+    w_v, w_a = d.loss_weights(sv, s), d.loss_weights(sa, s)
+    assert torch.allclose(loss(s), (err_v * w_v).mean() + (err_a * w_a).mean())
+    # a pinned sigma (validation) isn't weighted
+    assert torch.equal(loss(s, sigma=0.5), loss({}, sigma=0.5))
+
+
+def test_the_noise_range_reaches_the_rows():
+    d = MinimaxH3Driver({"variant": "fl2va"}, CPU)
+    m = Recorder()
+    d.training_loss(m, [video_payload() for _ in range(32)], [{"text": text_cond()}] * 32,
+                    {"timestep_min": 0.4, "timestep_max": 0.6})
+    call = m.calls[0]
+    video_t = call["row_timesteps"][:, call["video_indices"]]  # the model's t is 1 - sigma
+    assert float(video_t.min()) >= 0.4 - 1e-6 and float(video_t.max()) <= 0.6 + 1e-6

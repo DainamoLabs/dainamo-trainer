@@ -16,8 +16,8 @@ MAX_LYRICS = 6000
 
 
 def check_settings(s: dict, div: int, audio: bool = False) -> dict:
-    """Coerce and sanity-check the numeric training settings; raises 400 with a readable message.
-    ``audio``: a music family's job, which trains on clips of songs rather than at resolutions."""
+    """Coerce and sanity-check the numeric training settings, filling in the optional ones left out; raises 400 with
+    a readable message. ``audio``: a music family's job, which trains on clips of songs rather than at resolutions."""
     def num(key, kind, lo=None, hi=None):
         try:
             v = kind(s[key])
@@ -60,9 +60,51 @@ def check_settings(s: dict, div: int, audio: bool = False) -> dict:
     s["sample_prompts"] = check_sample_prompts(s.get("sample_prompts", []), div, audio)
     check_refmod(s)  # first: a RefMod turns the slider, checkpoint picker and concept bleed off
     check_finetune(s)
+    check_loss_and_ema(s)
     check_evaluation(s, div, audio)
     check_slider(s)
     return s
+
+
+LOSS_WEIGHTINGS = ("none", "min_snr", "cosmap")
+# masked loss, EMA weights, the noise range and loss weighting: off, or the whole range, unless a job says otherwise
+# (and what a job from before they existed trained with)
+LOSS_AND_EMA_DEFAULTS = {"masked_loss": False, "mask_min_weight": 0.1, "ema_enabled": False, "ema_decay": 0.99,
+                         "timestep_min": 0.0, "timestep_max": 1.0, "loss_weighting": "none", "min_snr_gamma": 5.0}
+
+
+def check_loss_and_ema(s: dict) -> None:
+    """Masked loss (``mask_min_weight``: how much the loss outside a mask counts), EMA weights (``ema_decay`` a step),
+    the noise range training draws from (``timestep_min`` to ``timestep_max``; 0 is clean, 1 pure noise) and how a
+    step's loss is weighted by its noise level (``min_snr_gamma`` for Min-SNR). Left out, each is off or the whole
+    range. EMA keeps an average of the adapter's weights, so not of a finetune's: those are the whole model."""
+    for k, v in LOSS_AND_EMA_DEFAULTS.items():
+        if s.get(k) in (None, ""):
+            s[k] = v
+    s["masked_loss"], s["ema_enabled"] = bool(s["masked_loss"]), bool(s["ema_enabled"])
+    for key, lo, hi in (("mask_min_weight", 0, 1), ("ema_decay", 0.9, 0.9999), ("timestep_min", 0, 1),
+                        ("timestep_max", 0, 1)):
+        try:
+            v = float(s[key])
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"Setting {key!r} must be a number")
+        if not lo <= v <= hi:  # NaN too
+            raise HTTPException(400, f"Setting {key!r}={v:g} is out of range ({lo:g}–{hi:g})")
+        s[key] = v
+    if s["timestep_min"] >= s["timestep_max"]:
+        raise HTTPException(400, f"The noise range's minimum ({s['timestep_min']:g}) must be below its maximum "
+                                 f"({s['timestep_max']:g})")
+    if s["loss_weighting"] not in LOSS_WEIGHTINGS:
+        raise HTTPException(400, f"Unknown loss weighting {s['loss_weighting']!r} (none, min_snr or cosmap)")
+    try:
+        s["min_snr_gamma"] = float(s["min_snr_gamma"])
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Setting 'min_snr_gamma' must be a number")
+    if not 0 < s["min_snr_gamma"] < float("inf"):
+        raise HTTPException(400, f"Setting 'min_snr_gamma'={s['min_snr_gamma']:g} must be above 0")
+    if s["ema_enabled"] and s.get("finetune_enabled"):
+        raise HTTPException(400, "EMA weights are for LoRAs and LoKrs: a finetune's weights are the whole model, too "
+                                 "big to keep an average of beside it. Turn EMA off to finetune.")
 
 
 def check_finetune(s: dict) -> None:

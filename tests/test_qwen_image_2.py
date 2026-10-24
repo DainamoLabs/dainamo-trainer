@@ -162,3 +162,34 @@ def test_sampler_lands_on_the_clean_latent_given_the_true_velocity():
     x0 = torch.randn(1, 4 * 6, 64)
     out = d.sample(Oracle(x0), cond(5), None, 96, 64, 12, 1, 3)
     assert torch.allclose(out.reshape(1, 64, -1).transpose(1, 2), x0, atol=1e-4)
+
+
+def test_masked_loss_noise_range_and_weighting():
+    """Zero predictions: the loss is the target's power, over the masked half with masked loss on; loss weighting
+    scales it at a drawn noise level, not a pinned one."""
+    import math
+
+    import torch.nn.functional as F
+
+    d = QwenImage2Driver({}, CPU)
+    lat = torch.randn(64, 4, 6)
+    mask = torch.zeros(4, 6, dtype=torch.float16)
+    mask[:, :3] = 1
+    payload = {"latent": lat, "mask": mask}
+
+    def loss(settings, **kw):
+        return d.training_loss(Recorder(), [payload], [{"text": cond(5)}], settings,
+                               generator=torch.Generator().manual_seed(0), **kw)
+
+    target = torch.randn((1, 64, 4, 6), generator=torch.Generator().manual_seed(0)) - lat[None]
+    assert torch.equal(loss({}, sigma=0.5), F.mse_loss(torch.zeros_like(target), target))
+    masked = {"masked_loss": True, "mask_min_weight": 0.0}
+    assert torch.allclose(loss(masked, sigma=0.5), (target[..., :3] ** 2).mean())
+    assert torch.equal(loss({**masked, "loss_weighting": "min_snr"}, sigma=0.5), loss(masked, sigma=0.5))
+    d.sample_timesteps = lambda b, hw, settings: torch.full((b,), 0.5)
+    assert torch.allclose(loss({"loss_weighting": "cosmap"}), 4 / math.pi * loss({}))
+    # the noise range moves the drawn level: 0.5 of the family's range lands mid-way in 0.2..0.4
+    seen = []
+    d._forward = lambda model, noisy, t, conds, refs: seen.append(t.clone()) or torch.zeros_like(noisy)
+    loss({"timestep_min": 0.2, "timestep_max": 0.4})
+    assert torch.allclose(seen[0], torch.tensor([0.3]))

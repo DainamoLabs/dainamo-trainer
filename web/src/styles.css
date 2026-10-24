@@ -371,6 +371,10 @@ img.audio-thumb { aspect-ratio: 2; object-fit: fill; }
 .ds-opts { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 14px 24px; }
 .ds-opts .ds-dropout { width: 195px; }
 .ds-opts .check { padding-bottom: 9px; }
+/* options for all of a job's datasets (masked loss), below their cards */
+.ds-shared { border-top: 1px solid var(--border); margin-top: 16px; padding-top: 14px; }
+.ds-shared .field { width: 195px; }
+.ds-shared-note { flex: 1 1 220px; padding-bottom: 10px; }
 
 /* the cards scroll when they're taller than the window, so Add to queue stays in view */
 .create-side { position: sticky; top: 16px; max-height: calc(100vh - var(--topbar) - var(--tabbar) - 32px); display: flex; flex-direction: column; gap: 12px; }
@@ -432,7 +436,7 @@ img.audio-thumb { aspect-ratio: 2; object-fit: fill; }
   .ds-row { grid-template-columns: minmax(0, 1fr) 36px; grid-template-areas: "pick pick" "rep x" "add add"; }
   .ds-row.refmod { grid-template-columns: minmax(0, 1fr) 36px; grid-template-areas: "pick x" "add add"; }
   .btn.add-ds { justify-self: stretch; }
-  .ds-opts .ds-dropout { width: 100%; }
+  .ds-opts .ds-dropout, .ds-shared .field { width: 100%; }
   .section.saving { grid-template-columns: 1fr; }
 }
 @media (max-width: 720px) {

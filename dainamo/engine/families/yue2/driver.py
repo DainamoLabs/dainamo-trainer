@@ -244,13 +244,16 @@ class YuE2Driver(FamilyDriver):
         x0 = torch.stack([p["latent"] for p in payloads]).to(d, torch.float32)  # (B, T, 64)
         b = x0.shape[0]
         noise = torch.randn(x0.shape, generator=generator).to(d) if generator is not None else torch.randn_like(x0)
-        t = torch.full((b,), float(sigma)) if sigma is not None else self.sample_timesteps(b, None, settings)
+        t = torch.full((b,), float(sigma)) if sigma is not None else self.timesteps(b, None, settings)
         t = t.to(d)
         noisy = (1 - t.view(-1, 1, 1)) * x0 + t.view(-1, 1, 1) * noise
         k, v, n = self._conds([c["text"] for c in conds])
         with torch.autocast("cuda", dtype=torch.bfloat16):
             pred = model(noisy, t, k, v, n)
-        return F.mse_loss(pred.float(), noise - x0)
+        w = self.step_weights(t, settings, sigma is not None)  # one noise level per clip; songs have no masks
+        if w is None:
+            return F.mse_loss(pred.float(), noise - x0)
+        return (self.per_item_mean((pred.float() - (noise - x0)) ** 2) * w).mean()
 
     # --- sampling ---------------------------------------------------------------------------------------
     def sample_steps(self) -> int:

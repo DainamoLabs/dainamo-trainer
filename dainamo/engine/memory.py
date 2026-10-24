@@ -337,8 +337,10 @@ def project(driver_cls, profile: dict, settings: dict, kind: str = "train") -> d
         else:
             params = lora_params(shapes, driver_cls.lora_targets, rank, net, int(settings.get("lokr_factor", -1) or -1))
             name = "LoKr" if net == "lokr" else "LoRA"
-            lora = params * 8 + adapter  # fp32 weights and gradients, plus the adapter
-            weights = params * 4 + adapter  # while sampling: no gradients
+            # fp32 weights and gradients, plus the adapter; EMA keeps an fp32 average beside them (``engine.ema``)
+            ema = params * 4 if settings.get("ema_enabled") else 0
+            lora = params * 8 + adapter + ema
+            weights = params * 4 + adapter + ema  # while sampling: no gradients
             opt = params * OPTIMIZER_BYTES.get(settings.get("optimizer", "adamw8bit"), 8)
         n_tok = max(tokens(r, r, f) + refs * driver_cls.reference_tokens(r, r) for r, f, refs in sizes) * batch
         saved = n_tok * len(blocks) * mem.saved if offload_saved and mem is not None else 0

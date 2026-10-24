@@ -39,12 +39,12 @@ The **⋯** on a card exports or deletes that dataset. **Select** on the Dataset
 page puts a checkbox on each dataset (the ones the search shows). Then
 **Export** downloads the selected datasets as one .zip, with a folder for each.
 Each folder holds the dataset's files in their subfolders, each file's caption,
-the reference images, and a split's clip list. Nothing is compressed again, so
-the download starts at once. **Put the trigger word in each caption** writes the
-captions as training reads them: Dainamo adds the trigger word when it trains,
-but other trainers read captions as they are. **Delete** removes the selected
-datasets. Linked folders are left alone; uploaded files are deleted only if you
-tick the box. Esc or **Done** leaves Select.
+the reference images and masks, and a split's clip list. Nothing is compressed
+again, so the download starts at once. **Put the trigger word in each caption**
+writes the captions as training reads them: Dainamo adds the trigger word when
+it trains, but other trainers read captions as they are. **Delete** removes the
+selected datasets. Linked folders are left alone; uploaded files are deleted
+only if you tick the box. Esc or **Done** leaves Select.
 
 ## Edit datasets: sources and results
 
@@ -80,6 +80,28 @@ inside the dataset, named after the file they belong to: `_refs/photo.png`,
 `_refs/photo_1.png`, and so on. Those are used when no source dataset is
 chosen, and checked and shown the same way.
 
+## Masks
+
+**Masked loss** (in Create Job) trains on part of each image, such as the
+subject and not its background. Put a greyscale mask for an image in a `_masks`
+folder beside it, with the image's name: `_masks/photo.png` is the mask of
+`photo.jpg`. White is where the loss counts, black where it doesn't, and grey
+counts partly. A PNG is looked for first, but any image type works.
+
+- A mask is stretched to its image's size, then cropped and flipped with it,
+  so a smaller mask still lines up if it has the image's shape. The health
+  check warns about a mask whose shape differs from its image's by over 2%.
+- The loss is averaged over the mask, so a small mask doesn't make its image
+  count for less. Outside it, the loss counts at **Outside the mask** (0.1 by
+  default).
+- An image without a mask trains as usual, and the checkpoint picker scores
+  with the masks too.
+- Only image models use masks (Krea 2, MOSS-Image and Qwen-Image 2.1). Video
+  and music models train on whole frames and songs.
+
+The `_masks` folder is never trained on itself. The dataset's page shows how
+many images have a mask.
+
 ## Health check
 
 **Dataset health check**, folded under the dataset's counts until you open it
@@ -99,7 +121,9 @@ Folded, it still shows how the last check went:
   start);
 - notes: captions without the trigger word, caption files with no image;
 - for a model that trains with source or reference images: files without one,
-  and sources that pair with no file.
+  and sources that pair with no file;
+- masks of another shape than their image (stretched to fit it), and notes:
+  how many images have a mask, and masks with no image of their name.
 
 Each dataset in Create Job runs the same check for that job. For songs, see
 [Music](music.md#datasets).

@@ -48,6 +48,27 @@ Besides a LoRA, a job can make:
 **Sample prompts** are cards. Width, height, seed and LoRA strength left blank
 use the Sampling defaults.
 
+**Masked loss**, below the datasets (image models), trains each image where its
+mask is white ([Masks](datasets.md#masks)). **Outside the mask** is how much the
+rest counts: 0 ignores it, and the default 0.1 keeps a little, so the LoRA
+doesn't learn just anything there.
+
+**EMA weights**, under Saving, keeps an average of the LoRA's recent weights.
+**EMA decay** 0.99 averages about the last 100 steps, 0.999 about the last
+1000. Saves, samples, the checkpoint picker and concept bleed use the average,
+which is steadier than any single step. Training carries on from the live
+weights, and the training state keeps both. A finetune can't use it: an average
+of the whole model wouldn't fit beside it.
+
+**Noise range**, in Advanced training settings, limits the noise levels the
+steps are drawn from: 0 is the clean image, 1 pure noise. Narrowing it focuses
+training: 0.3 to 1 for composition and style, 0 to 0.5 for detail. **Loss
+weighting** counts each step by its noise level. **Min-SNR** caps how much the
+low-noise steps count (at **Min-SNR gamma**, 5 by default), and counts the
+noisiest ones little too. **Cosine map** is SD3's weighting, a gentler lean
+toward the middle levels. A slider learns from its prompts, with its own loss:
+of these settings, it has EMA weights and the noise range.
+
 ## Queue
 
 Each job's card shows a small loss curve once it has 10 steps, so you can spot a
@@ -78,12 +99,14 @@ checkpoint now, or duplicate its settings into a new job.
 **Edit** opens a job that isn't running in the Create Job form. Before it has
 trained, anything can change. After that, it carries on from its last save with
 the changes: datasets, clip length, resolution, batch size, learning rate and
-schedule, steps, samples and memory settings. The model, network (LoRA or LoKr,
-rank, alpha, or a finetune), optimizer and slider can't change, since the saved
-state wouldn't fit them. While the checkpoint picker or concept bleed is on,
-what it scores can't change either (for the picker: datasets, resolution, clip
-length and seed). Changing one of these restarts the job from step 0, after
-asking.
+schedule, steps, samples, memory settings, masked loss, EMA weights, the noise
+range and loss weighting. EMA turned on part way averages from the weights at
+that point. The model, network (LoRA or LoKr, rank, alpha, or a finetune),
+optimizer and slider can't change, since the saved state wouldn't fit them.
+While the checkpoint picker or concept bleed is on, what it scores can't change
+either (for the picker: datasets, resolution, clip length, seed, timestep
+sampling, noise range and masked loss). Changing one of these restarts the job
+from step 0, after asking.
 
 **Continue training** gives a finished job more steps, picking up with the same
 optimizer state. Its final LoRA so far is kept as `name_002000.safetensors`,

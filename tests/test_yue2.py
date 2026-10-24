@@ -312,3 +312,31 @@ def test_vae_keeps_a_chords_envelope(tmp_path):
 
     a, b = env(x.numpy()[:, : y.shape[1]]), env(y.numpy())
     assert np.abs(a[10:-10] - b[10:-10]).max() < 1.5  # the loudness, 10 ms at a time, within 1.5 dB
+
+
+def test_loss_weighting_and_the_noise_range():
+    import math
+
+    nar, d = _nar(), YuE2Driver({}, DEV)
+    kv = torch.randn(1, 7, M.KV_HEADS, M.HEAD_DIM, dtype=torch.bfloat16)
+    conds = [{"text": {"k": kv, "v": kv}}] * 2
+    payloads = [{"latent": torch.randn(10, M.LATENT_DIM)} for _ in range(2)]
+    seen = []
+    forward = nar.forward
+
+    def spy(x, t, *rest):
+        seen.append(t.clone())
+        return forward(x, t, *rest)
+    nar.forward = spy
+
+    def loss(settings, **kw):
+        with torch.no_grad():
+            return d.training_loss(nar, payloads, conds, settings, generator=torch.Generator().manual_seed(0),
+                                   **kw).item()
+
+    d.sample_timesteps = lambda b, hw, settings: torch.full((b,), 0.5)
+    assert loss({"loss_weighting": "cosmap"}) == pytest.approx(4 / math.pi * loss({}), rel=1e-4)
+    assert loss({"loss_weighting": "min_snr"}, sigma=0.3) == loss({}, sigma=0.3)  # pinned: not weighted
+    seen.clear()
+    loss({"timestep_min": 0.6, "timestep_max": 0.8})
+    assert torch.allclose(seen[0].float().cpu(), torch.tensor([0.7, 0.7]))

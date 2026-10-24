@@ -1,5 +1,6 @@
 """The trainer end to end with a tiny model standing in for a family's: training a job, continuing a finished
-one, and evaluating a finished job's saved checkpoints afterwards (Evaluate checkpoints).
+one, evaluating a finished job's saved checkpoints afterwards (Evaluate checkpoints), and saving an EMA of the
+LoRA's weights.
 
     .venv/bin/python -m pytest tests/test_trainer.py -v
 """
@@ -226,3 +227,57 @@ def test_jobs_share_encodings_and_encode_only_what_changed(tmp_path, monkeypatch
     used = json.loads((tmp_path / "c" / "cache.json").read_text())["files"]
     assert sum(f.startswith("latents/") for f in used) == 3 and all(os.path.exists(tmp_path / "cache" / f) for f in used)
     assert not (tmp_path / "c" / "cache").exists()
+
+
+def test_a_job_with_ema_saves_the_average_and_carries_it_on(tmp_path, monkeypatch):
+    from safetensors import safe_open
+    from safetensors.torch import load_file
+
+    from dainamo.engine.ema import EMA
+
+    monkeypatch.setattr(trainer_mod, "get_family", lambda name: TinyFamily)
+    _images(str(tmp_path / "train"), [(200, 30, 30), (190, 40, 20), (60, 160, 60)])
+
+    def run(name, steps, ema):
+        job_dir = tmp_path / name
+        job_dir.mkdir(exist_ok=True)
+        (job_dir / "job.json").write_text(json.dumps({
+            "name": "t", "family": "tiny", "profile": {},
+            "datasets": [{"path": str(tmp_path / "train"), "trigger": "", "repeats": 1, "resolution": 64}],
+            "settings": {"steps": steps, "rank": 2, "alpha": 2, "resolution": 64, "seed": 1, "optimizer": "adamw",
+                         "learning_rate": 0.05, "save_every": 3, "sample_every": 0, "ema_enabled": ema,
+                         "ema_decay": 0.9}}))
+        assert trainer_mod.Trainer(str(job_dir)).run() == "completed"
+        state = torch.load(job_dir / "state" / "last.pt", weights_only=False)
+        return job_dir, state
+
+    plain_dir, plain = run("plain", 6, False)
+    ema_dir, state = run("ema", 6, True)
+    # training steps the live weights just the same; only what's saved is the average
+    assert plain["lora"].keys() == state["lora"].keys()
+    assert all(torch.allclose(plain["lora"][k], state["lora"][k], atol=1e-6) for k in plain["lora"])
+    assert "ema" not in plain and state["ema"]["num_updates"] == 6
+
+    net = LoRANetwork(TinyModel(), TinyFamily.lora_targets, 2, 2)
+    net.load_state_dict(state["lora"])
+    live = net.state_dict()
+    ema = EMA(list(net.parameters()), 0.9)
+    ema.load_state_dict(state["ema"])
+    with ema.applied():
+        averaged = net.state_dict()
+    saved = load_file(str(ema_dir / "output" / "t.safetensors"))
+    assert all(torch.equal(saved[k], averaged[k]) for k in averaged)  # the final file is the average
+    assert not torch.equal(saved["diffusion_model.blocks.0.lora_B.weight"],
+                           live["diffusion_model.blocks.0.lora_B.weight"])
+    assert all(torch.equal(load_file(str(plain_dir / "output" / "t.safetensors"))[k], live[k]) for k in live)
+    for f in ("t_000003.safetensors", "t.safetensors"):
+        with safe_open(str(ema_dir / "output" / f), "pt") as fh:
+            assert fh.metadata()["dainamo.ema"] == "0.9"
+    with safe_open(str(plain_dir / "output" / "t.safetensors"), "pt") as fh:
+        assert "dainamo.ema" not in fh.metadata()
+
+    # continued, the average carries on counting; turned on by an edit, it starts from the weights then
+    _, state = run("ema", 9, True)
+    assert state["ema"]["num_updates"] == 9
+    _, plain = run("plain", 9, True)
+    assert plain["ema"]["num_updates"] == 3

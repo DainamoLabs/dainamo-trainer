@@ -16,8 +16,8 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 
-from ...engine.dataset import (REFS_DIR, caption_path, inside, list_media, media_kind, nested_sources, read_caption,
-                               resolutions, split_clips)
+from ...engine.dataset import (MASKS_DIR, REFS_DIR, caption_path, inside, list_media, mask_path, media_kind,
+                               nested_sources, read_caption, resolutions, split_clips)
 from ...engine.families import get_family
 from ...engine.media import spectrogram
 from ...engine.transcribe import MODELS as WHISPER_MODELS
@@ -53,6 +53,7 @@ def list_datasets():
         d["audio"] = sum(1 for f in files if media_kind(f) == "audio")
         d["images"] = d["count"] - d["videos"] - d["audio"]
         d["captioned"] = sum(1 for f in files if os.path.exists(caption_path(f)))
+        d["masks"] = _masked(files)
         d["bytes"] = sum(_size(f) for f in files)  # the media files'
         # what a video model trains on per epoch: clips split from one video count as one
         cut = split_clips(d["path"]) if d["videos"] else {}
@@ -70,6 +71,12 @@ def _size(path: str) -> int:
         return os.path.getsize(path)
     except OSError:
         return 0
+
+
+def _masked(files: list[str]) -> int:
+    """How many of the images have a loss mask (``mask_path``), looking only in folders that have a _masks folder."""
+    folders = {d for d in {os.path.dirname(f) for f in files} if os.path.isdir(os.path.join(d, MASKS_DIR))}
+    return sum(1 for f in files if os.path.dirname(f) in folders and media_kind(f) == "image" and mask_path(f))
 
 
 @router.get("/export/datasets")
@@ -181,8 +188,8 @@ def delete_media(path: str):
         raise HTTPException(400, "Files in linked folders are not deleted from disk; remove them yourself")
     if os.path.isdir(path):
         raise HTTPException(400, "That's a folder: only files are deleted here")
-    for p in (path, caption_path(path)):
-        if os.path.exists(p):
+    for p in (path, caption_path(path), mask_path(path) or ""):  # its caption and loss mask go with it
+        if p and os.path.exists(p):
             os.remove(p)
     return {"ok": True}
 

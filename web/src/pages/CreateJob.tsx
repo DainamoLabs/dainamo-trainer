@@ -21,6 +21,13 @@ const BASE_SETTINGS: S = {
   low_vram: false, // stream the text encoder's layers from system RAM too
   // the adapter trained: a LoRA (rank, alpha) or a LoKr (lokr_factor); or the whole model (families with info.finetune)
   network_type: "lora", lokr_factor: 16, finetune_enabled: false,
+  // masked loss (image families): the loss counts where each image's mask (_masks/<name>.png) is white, and
+  // elsewhere at mask_min_weight
+  masked_loss: false, mask_min_weight: 0.1,
+  // saves, samples and evaluations use an average of the adapter's recent weights (not a finetune's)
+  ema_enabled: false, ema_decay: 0.99,
+  // the noise levels training draws from (0 clean, 1 pure noise), and each step's loss weighted by its noise level
+  timestep_min: 0, timestep_max: 1, loss_weighting: "none", min_snr_gamma: 5,
   // video families
   num_frames: 39, i2v_probability: 0.5, train_audio: true, audio_loss_weight: 1, sample_frames: 39,
   auto_frames: false, // each clip at its own length, up to MAX_CLIP_FRAMES
@@ -94,6 +101,13 @@ const INFO = {
   checkpointing: "Recomputes parts of the model during the backward pass instead of keeping them in VRAM: much less VRAM for somewhat slower steps. Leave it on unless the VRAM projection shows room to spare.",
   keepAlpha: "Images with an alpha channel train as RGBA, so the LoRA keeps their transparency. Off, they're composited over white.",
   sampleAtStart: "Renders the sample prompts before the first update, so they show the base model: a baseline to compare the later samples with.",
+  maskedLoss: "Trains on part of each image: a greyscale mask at _masks/<name>.png beside each image, white where the loss counts and black where it doesn't. Images without one train as usual.",
+  maskWeight: "How much the loss counts where a mask is black. 0 ignores those parts entirely; a little (0.1) keeps the LoRA from drifting there.",
+  ema: "Saves, samples and evaluations use an average of recent weights, which is steadier than any single step; training itself carries on from the live weights.",
+  emaDecay: "How slowly the average follows training: 0.99 averages about the last 100 steps, 0.999 about the last 1000. Higher is smoother but lags further behind.",
+  noiseRange: "The noise levels training steps are drawn from: 0 is the clean image, 1 is pure noise. Narrowing it focuses training: e.g. 0.3 to 1 for composition and style, 0 to 0.5 for detail.",
+  lossWeighting: "How much each step's loss counts by its noise level. Min-SNR caps how much low-noise steps count, and counts the noisiest ones little too; the cosine map is SD3's weighting, a gentler lean toward the middle levels. None counts every step the same.",
+  minSnrGamma: "Min-SNR's cap: lower counts the low-noise steps less. 5 is the usual value.",
   finetuneLr: "How big each update to the model's weights is. A finetune changes the model itself, so it takes a far lower rate than a LoRA (about a tenth); too high and the model forgets what it knew.",
   finetuneOptimizer: "Adafactor keeps almost no state beside the model, so it fits where AdamW 8-bit, which keeps 2 bytes a weight (as much again as the model), may not. Either way each weight is updated as soon as its gradient is ready, so the model's gradients never all exist at once.",
   refmodMode: REFMOD_INFO.mode,
@@ -208,6 +222,9 @@ function Resolutions(props: { v: unknown; on: (v: number | number[]) => void; vi
 type DsCard = { id: string; repeats: number; resolution: number | number[]; flip: boolean; caption_dropout: number; sources: string[] };
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+const LOSS_WEIGHTINGS: [string, string][] = [["none", "None"], ["min_snr", "Min-SNR"], ["cosmap", "Cosine map"]];
+// a number typed into a 0..1 field, kept in range
+const unit = (v: number) => Math.min(1, Math.max(0, Number(v) || 0));
 // strengths as typed ("0.6, 0.8") that the server takes: 1 to most of them, each -10 to 10
 const strengthsOk = (raw: unknown, most: number) => {
   const v = String(raw ?? "").replace(/,/g, " ").split(/\s+/).filter(Boolean).map(Number);
@@ -342,6 +359,10 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
   const slider = !refmod && !finetune && !!family?.sliders && !!s.slider_enabled;
   const lokr = !slider && !finetune && s.network_type === "lokr";
   const kind: Kind = refmod ? "refmod" : finetune ? "finetune" : slider ? "slider" : lokr ? "lokr" : "lora";
+  // masked loss is for image models (video and music models train on whole frames and songs); a slider learns from
+  // its prompts, so neither masks nor the noise range and loss weighting apply to it
+  const maskable = !!family && !isVideo && !isAudio && !refmod && !slider;
+  const ema = !refmod && !finetune && !!s.ema_enabled; // an average of a finetune's weights would be the whole model again
   const preserve: string[] = Array.isArray(s.slider_preserve) ? s.slider_preserve : [];
   // a slider keeps either its layout or the attributes listed (the attributes stay put while the layout is chosen)
   const keepLayout = !!s.slider_keep_layout;
@@ -404,6 +425,8 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
   const setAutoFrames = (on: boolean) => setS((x) => ({ ...x, auto_frames: on,
     ...(!on && longestKnown && longestClip ? { num_frames: Math.max(5, longestClip) } : {}) }));
   const missingCaps = chosen.reduce((n, c) => n + c.d.count - c.d.captioned, 0);
+  const chosenImages = chosen.reduce((n, c) => n + c.d.images, 0);
+  const maskedImages = chosen.reduce((n, c) => n + (c.d.masks || 0), 0);
   // a RefMod's references: every image and clip of its datasets (one reference when merged), and at most the
   // tokens they'd take if square (a reference of another shape takes fewer), within the cap
   const refImages = chosen.reduce((n, c) => n + c.d.images, 0);
@@ -433,6 +456,8 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
     const settings = {
       ...s, sample_prompts: fromCards(cards), slider_enabled: slider, network_type: lokr ? "lokr" : "lora", grad_accum: accum,
       refmod_enabled: refmod, finetune_enabled: finetune, ...(refmod ? { picker_enabled: false, bleed_enabled: false } : {}),
+      masked_loss: maskable && !!s.masked_loss, ema_enabled: ema,
+      ...(slider ? { loss_weighting: "none" } : {}),  // a slider's loss is its own, in the noise range
       ...(finetune ? { bleed_enabled: false, sweep_enabled: false, optimizer: finetuneOptimizer } : {}),
       ...(isAudio ? { bleed_enabled: false } : {}),
       ...(slider ? { picker_enabled: false, ...(keepLayout ? { slider_preserve: [] } : {}) } : {}),
@@ -504,6 +529,9 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
     : refmod && !refFits ? "Fix the token cap above to continue."
     : refmod && Math.trunc(Number(s.refmod_grid)) % 2 ? "Make the RefMod's grid an even number to continue."
     : finetune && Number(s.offload) > 0 && !s.gradient_checkpointing ? "Turn on gradient checkpointing, or offload 0%, to continue."
+    : !refmod && Number(s.timestep_min) >= Number(s.timestep_max) ? "Noise range min must be below max: change one to continue."
+    : !refmod && !slider && s.loss_weighting === "min_snr" && !(Number(s.min_snr_gamma) > 0) ? "Set Min-SNR gamma above 0 to continue."
+    : ema && !(Number(s.ema_decay) >= 0.9 && Number(s.ema_decay) <= 0.9999) ? "Set EMA decay between 0.9 and 0.9999 to continue."
     : !refmod && !slider && !finetune && s.picker_enabled && s.sweep_enabled && !strengthsOk(s.sweep_strengths, 8)
       ? "Give the strength sweep 1–8 strengths, each -10 to 10, to continue."
     : !refmod && !finetune && !isAudio && s.bleed_enabled && !(s.bleed_prompts || []).some((p: string) => p.trim())
@@ -521,7 +549,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
             <p>{refmod ? (edit.status === "queued" ? "Change its settings before it's made."
                 : "Saving makes the RefMod again with your changes, replacing the one it made.")
               : edit.done > 0
-              ? `It has trained ${plural(edit.done, "step")}, and carries on from its last save with your changes. Changing its model, network (LoRA or LoKr, rank, alpha, or a finetune), optimizer or slider starts it again from step 0 instead, as does changing what the checkpoint picker or concept bleed check scores while it's on (with the picker on, that includes the datasets, resolution, clip length and seed).`
+              ? `It has trained ${plural(edit.done, "step")}, and carries on from its last save with your changes. Changing its model, network (LoRA or LoKr, rank, alpha, or a finetune), optimizer or slider starts it again from step 0 instead, as does changing what the checkpoint picker or concept bleed check scores while it's on (with the picker on, that includes the datasets, resolution, clip length, seed, timestep sampling, noise range and masked loss).`
               : "Change its settings before it trains."}</p>
           </div>
         ) : (
@@ -862,6 +890,19 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
                 Repeats control each dataset's weight.{isVideo ? " Images train as stills, and clips at the clip length below." : ""}
               </div>
             )}
+            {maskable && (
+              <div className="ds-opts ds-shared">
+                <label className="check">
+                  <input type="checkbox" checked={!!s.masked_loss} onChange={(e) => set("masked_loss")(e.target.checked)} /> Masked loss<Info text={INFO.maskedLoss} />
+                </label>
+                {s.masked_loss && <>
+                  <Num label="Outside the mask" info={INFO.maskWeight} v={s.mask_min_weight} on={(v) => set("mask_min_weight")(unit(v))} step={0.05} min={0} max={1} />
+                  {chosen.length > 0 && (maskedImages
+                    ? <span className="help ds-shared-note">{maskedImages} of {plural(chosenImages, "image")} {maskedImages === 1 ? "has a mask" : "have masks"}; the rest train as usual.</span>
+                    : <span className="validation warning ds-shared-note">None of these datasets' images have masks yet (in a _masks folder beside them), so this changes nothing.</span>)}
+                </>}
+              </div>
+            )}
           </div>
 
           {!refmod && <>
@@ -932,6 +973,23 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
                 </>}
                 <Num label="Weight decay" info={INFO.weightDecay} v={s.weight_decay} on={set("weight_decay")} step={0.001} min={0} />
                 <Num label="Seed" v={s.seed} on={set("seed")} />
+                  <div className="field">
+                    <span>Noise range<Info text={INFO.noiseRange} /></span>
+                    <div className="row" style={{ gap: 8 }}>
+                      <input type="number" aria-label="Noise range min" min={0} max={1} step={0.05} style={{ flex: 1, minWidth: 0 }}
+                        value={s.timestep_min} onChange={(e) => set("timestep_min")(unit(Number(e.target.value)))} />
+                      <span className="faint small">to</span>
+                      <input type="number" aria-label="Noise range max" min={0} max={1} step={0.05} style={{ flex: 1, minWidth: 0 }}
+                        value={s.timestep_max} onChange={(e) => set("timestep_max")(unit(Number(e.target.value)))} />
+                    </div>
+                    {Number(s.timestep_min) >= Number(s.timestep_max) && <span className="validation warning">The min must be below the max.</span>}
+                  </div>
+                {!slider && <>
+                  <Sel label="Loss weighting" info={INFO.lossWeighting} v={s.loss_weighting} on={set("loss_weighting")} opts={LOSS_WEIGHTINGS} />
+                  {s.loss_weighting === "min_snr" && (
+                    <Num label="Min-SNR gamma" info={INFO.minSnrGamma} v={s.min_snr_gamma} on={set("min_snr_gamma")} step={0.5} min={0} />
+                  )}
+                </>}
                 <label className="check" style={{ alignSelf: "end", paddingBottom: 8 }}><input type="checkbox" checked={s.gradient_checkpointing} onChange={(e) => set("gradient_checkpointing")(e.target.checked)} /> Gradient checkpointing<Info text={INFO.checkpointing} /></label>
                 {finetune && (
                   <div className="help" style={{ gridColumn: "1 / -1" }}>
@@ -954,6 +1012,12 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
             <div className="grid cols-2">
               <Num label="Save every (steps)" info={INFO.saveEvery} v={s.save_every} on={set("save_every")} min={0} />
               <Num label="Keep last N saves" info={INFO.keepLast} v={s.keep_last} on={set("keep_last")} min={0} />
+              {!finetune && <>
+                <label className="check" style={{ alignSelf: "end", paddingBottom: 8 }}>
+                  <input type="checkbox" checked={!!s.ema_enabled} onChange={(e) => set("ema_enabled")(e.target.checked)} /> EMA weights<Info text={INFO.ema} />
+                </label>
+                {ema && <Num label="EMA decay" info={INFO.emaDecay} v={s.ema_decay} on={set("ema_decay")} step={0.001} min={0.9} max={0.9999} />}
+              </>}
             </div>
             {finetune && saveGb > 0 && (
               <div className="help saving-note">
