@@ -7,7 +7,7 @@ training engine. It reads ComfyUI model files directly, including `fp8_scaled`,
 int8 and nvfp4 weights, and saves LoRAs that load in ComfyUI. It trains Krea 2,
 MOSS-Image, Qwen-Image 2.1, LTX 2.5, MiniMax H3 and YuE2.
 
-![A finished Krea 2 job: its samples at each checkpoint, step 0 being the base model](docs/screenshots/job.png)
+![A finished Krea 2 job: its samples at each checkpoint, step 0 being the base model, each scored for likeness to the dataset](docs/screenshots/job.png)
 
 ## Run
 

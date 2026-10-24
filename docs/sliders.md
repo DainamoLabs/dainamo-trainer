@@ -51,5 +51,5 @@ lower guidance strength.
 
 ![A smile slider's samples at -1, 0 and +1, at steps 0, 200 and 400](screenshots/slider.png)
 
-These samples are from a smile slider trained without preservation: by step 400
-the +1 samples change the clothes as well as the expression.
+These samples are from a smile slider trained with **Keep the layout**: the
+expression moves either way while the clothes, props and backgrounds stay.
