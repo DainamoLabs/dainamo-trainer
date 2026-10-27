@@ -46,8 +46,12 @@ def main():
             sys.exit(1)
         status = trainer.status if trainer else {}
         status.update(phase="failed", message=f"{type(e).__name__}: {e}", failed_at=time.time())
-        with open(os.path.join(job_dir, "status.json"), "w") as f:
+        from ..fsutil import replace
+
+        path = os.path.join(job_dir, "status.json")
+        with open(path + ".tmp", "w") as f:
             json.dump(status, f)
+        replace(path + ".tmp", path)
         sys.exit(1)
 
 

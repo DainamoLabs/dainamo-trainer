@@ -221,3 +221,15 @@ def test_dataset_list_and_check_count_videos(client, tmp_path):
     check = client.get(f"/api/datasets/{did}/check", params={"family": "minimax_h3", "resolution": "256", "frames": 22}).json()
     note = next(i for i in check["issues"] if i["id"] == "split_clips")
     assert note["title"] == "3 clips cut from 2 videos"
+
+
+@pytest.mark.parametrize("ext, codecs", [("mp4", ["-c:v", "libx264", "-c:a", "aac"]),
+                                         ("mkv", ["-c:v", "libx264", "-c:a", "aac"]),
+                                         ("webm", ["-c:v", "libvpx", "-c:a", "libvorbis"])])
+def test_a_clips_length_is_its_videos_when_its_audio_runs_on(tmp_path, ext, codecs):
+    """A clip whose sound outlasts its last frame is as long as its video (the container's duration is the
+    sound's): it passed the health check and failed caching latents for frames that aren't there."""
+    path = str(tmp_path / f"clip.{ext}")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=24:duration=1",
+                    "-f", "lavfi", "-i", "sine=duration=3", *codecs, path], check=True)
+    assert ds.probe_video(path)["duration"] == pytest.approx(1.0, abs=0.05)

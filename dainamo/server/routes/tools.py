@@ -87,7 +87,8 @@ def extract(body: ExtractIn):
     name = _name(body.name, f"{os.path.splitext(file)[0]}_r{body.rank}")
     settings = {"steps": 0, "extract_enabled": True, "extract_rank": int(body.rank), "extract_source": tuned,
                 "extract_base": base, "extract_from": {"file": file, "step": 0, "trigger": body.trigger.strip()}}
-    return queue_made(name, profile["family"], profile["name"], profile["data"], settings, body.gpu)
+    return queue_made(name, profile["family"], profile["name"], profile["data"], settings, body.gpu,
+                      profile["id"])
 
 
 # the profile's model as merging checks layers against, built from its file's header: by (family, path, mtime)
@@ -180,4 +181,5 @@ def merge(body: MergeIn):
     settings = {"steps": 0, "merge_enabled": True, "merge_rank": int(body.rank),
                 "merge_loras": [{"path": p, "strength": float(e.strength), "trigger": i["trigger"]}
                                 for p, e, i in zip(paths, body.loras, plan["inputs"])]}
-    return queue_made(name, profile["family"], profile["name"], profile["data"], settings, body.gpu)
+    return queue_made(name, profile["family"], profile["name"], profile["data"], settings, body.gpu,
+                      profile["id"])

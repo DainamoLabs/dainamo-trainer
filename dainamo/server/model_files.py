@@ -642,44 +642,47 @@ class Downloads:
                     sha.update(chunk)
                     read += len(chunk)
                     self._progress(t, read)
-        token = hf_token()
-        headers = {"User-Agent": "dainamo-trainer"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"  # httpx drops it on the redirect to the file's CDN
-        if have:
-            headers["Range"] = f"bytes={have}-"
-        url = f"{HF_URL}/{t['repo']}/resolve/{t['revision']}/{quote(t['path'])}"
-        self._set(t, state="downloading", done=have, speed=0)
-        self.samples.clear()
-        try:
-            with httpx.stream("GET", url, headers=headers, follow_redirects=True,
-                              timeout=httpx.Timeout(30.0, read=120.0)) as r:
-                with self.lock:
-                    self.response = r
-                if r.status_code in (401, 403):
-                    raise RuntimeError(_refused(t, token, r.status_code))
-                if r.status_code == 404:
-                    raise RuntimeError(f"Hugging Face doesn't have {t['path']} in {t['repo']} any more")
-                if r.status_code == 200 and have:  # the whole file came back: start over
-                    have = 0
-                    sha = hashlib.sha256() if t["sha256"] else None
-                elif r.status_code not in (200, 206):
-                    raise RuntimeError(f"Hugging Face answered {r.status_code}")
-                done = have
-                with open(part, "ab" if have else "wb") as f:
-                    for chunk in r.iter_bytes(CHUNK):
-                        f.write(chunk)
-                        if sha:
-                            sha.update(chunk)
-                        done += len(chunk)
-                        self._progress(t, done)
-                        if time.monotonic() - self.saved > 10:
-                            with self.lock:
-                                self._save()
-        except httpx.HTTPError as e:
-            if t["id"] in self.cancelling:
-                raise Cancelled() from e
-            raise RuntimeError(f"The connection failed ({e or type(e).__name__}). Press Resume to carry on") from e
+        # a part that's all there (stopped while it was being checked): nothing to ask for, and a range from its
+        # end is one the server refuses (416) every time
+        if have < t["size"]:
+            token = hf_token()
+            headers = {"User-Agent": "dainamo-trainer"}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"  # httpx drops it on the redirect to the file's CDN
+            if have:
+                headers["Range"] = f"bytes={have}-"
+            url = f"{HF_URL}/{t['repo']}/resolve/{t['revision']}/{quote(t['path'])}"
+            self._set(t, state="downloading", done=have, speed=0)
+            self.samples.clear()
+            try:
+                with httpx.stream("GET", url, headers=headers, follow_redirects=True,
+                                  timeout=httpx.Timeout(30.0, read=120.0)) as r:
+                    with self.lock:
+                        self.response = r
+                    if r.status_code in (401, 403):
+                        raise RuntimeError(_refused(t, token, r.status_code))
+                    if r.status_code == 404:
+                        raise RuntimeError(f"Hugging Face doesn't have {t['path']} in {t['repo']} any more")
+                    if r.status_code == 200 and have:  # the whole file came back: start over
+                        have = 0
+                        sha = hashlib.sha256() if t["sha256"] else None
+                    elif r.status_code not in (200, 206):
+                        raise RuntimeError(f"Hugging Face answered {r.status_code}")
+                    done = have
+                    with open(part, "ab" if have else "wb") as f:
+                        for chunk in r.iter_bytes(CHUNK):
+                            f.write(chunk)
+                            if sha:
+                                sha.update(chunk)
+                            done += len(chunk)
+                            self._progress(t, done)
+                            if time.monotonic() - self.saved > 10:
+                                with self.lock:
+                                    self._save()
+            except httpx.HTTPError as e:
+                if t["id"] in self.cancelling:
+                    raise Cancelled() from e
+                raise RuntimeError(f"The connection failed ({e or type(e).__name__}). Press Resume to carry on") from e
         size = self._part_size(t)
         if size != t["size"]:
             raise RuntimeError(f"The download stopped at {_gb(size)} of {_gb(t['size'])}. Press Resume to carry on")

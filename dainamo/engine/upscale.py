@@ -103,15 +103,15 @@ def _keys(path: str) -> list[str] | None:
 
 def identify(path: str, vae_files: list[str] | None = None) -> Info:
     """What ``path`` is, from its tensor names (a .pth is read by spandrel). A SeedVR2 DiT's ``companion`` is the
-    SeedVR2 VAE among ``vae_files`` (else the files of its own folder), or None when there isn't one, which
-    ``error`` explains."""
+    SeedVR2 VAE among ``vae_files`` (else ``companion_files``: its own folder's, then the models folder's), or None
+    when there isn't one, which ``error`` explains."""
     name = os.path.splitext(os.path.basename(path))[0]
     try:
         keys = _keys(path)
     except (OSError, ValueError) as e:
         return Info(path, "unknown", name, error=f"Couldn't read it: {e}")
     if keys is not None and is_seedvr2(keys):
-        files = vae_files if vae_files is not None else _folder_files(os.path.dirname(path))
+        files = vae_files if vae_files is not None else companion_files(path)
         vae = None
         for f in files:
             try:
@@ -126,6 +126,17 @@ def identify(path: str, vae_files: list[str] | None = None) -> Info:
         return Info(path, "seedvr2_vae", name)
     from .upscalers import pixel
     return pixel.identify(path, name)
+
+
+def companion_files(path: str) -> list[str]:
+    """Where a SeedVR2 DiT's VAE may be, as ``list_models`` finds it: the DiT's own folder, then the models folder's
+    ``upscale_models`` and ``vae`` (the DiT is in ``upscale_models`` or ``diffusion_models``)."""
+    own = os.path.dirname(os.path.abspath(path))
+    models = os.path.dirname(own)
+    out = []
+    for folder in (own, os.path.join(models, FOLDER), os.path.join(models, "vae")):
+        out += [f for f in _folder_files(folder) if f not in out]
+    return out
 
 
 def _folder_files(folder: str) -> list[str]:

@@ -128,8 +128,15 @@ class Trainer:
             self.status["evaluation"] = {"state": "running", "settings": self.job["evaluate"]["settings"],
                                          "evals": [], "recommended": None, "sweep": None,
                                          "started_at": time.time(), "vram_gb": None}
-        elif old.get("evaluation"):  # a checkpoint evaluation's results are kept until the job restarts
-            self.status["evaluation"] = old["evaluation"]
+        else:
+            if old.get("evaluation"):  # a checkpoint evaluation's results are kept until the job restarts
+                self.status["evaluation"] = old["evaluation"]
+            if os.path.exists(os.path.join(job_dir, "state", "last.pt")):
+                # resuming: what it made so far stays listed if it stops or fails before its state loads (which
+                # lists them again from the state)
+                for k in ("samples", "checkpoints", "evals", "likeness", "recommended", "sweep"):
+                    if k in old:
+                        self.status[k] = old[k]
         # where evaluation results go: the job's own status while training, else status["evaluation"]
         self.ev = self.status["evaluation"] if self.evaluating else self.status
 
@@ -386,17 +393,45 @@ class Trainer:
         self.log(f"Saved {fname}")
         return fname
 
-    def save_state(self, network, opt, sched, step):
+    def save_state(self, network, opt, sched, step, batches=None):
         """The optimizer and schedule, and the LoRA's weights (the live ones, and their EMA if it's on); a finetune's
-        weights are the checkpoint just saved, which ``weights`` names (the whole model would double the save)."""
+        weights are the checkpoint just saved, which ``weights`` names (the whole model would double the save).
+        Also where training's randomness is (``rng_state``), so a resumed job draws on instead of replaying."""
         if network.kind == "full":
             weights = {"weights": next(c["file"] for c in reversed(self.status["checkpoints"]) if c["step"] == step)}
         else:
             weights = {"lora": network.state_dict(torch.float32)}
             if self.ema is not None:
                 weights["ema"] = self.ema.state_dict()
+        # written beside it and then swapped in, so a kill, OOM or full disk mid-save keeps the last good state
+        path = os.path.join(self.job_dir, "state", "last.pt")
         torch.save({"step": step, **weights, "opt": opt.state_dict(), "sched": sched.state_dict(),
-                    "status": self.status}, os.path.join(self.job_dir, "state", "last.pt"))
+                    "status": self.status, "rng": self.rng_state(batches)}, path + ".tmp")
+        replace(path + ".tmp", path)
+
+    def rng_state(self, batches) -> dict | None:
+        """Training's random state: the batch draws, caption dropout and slider directions (``train_rng``), the
+        noise (torch's generators), and the batches left in this epoch, for the data they index (``data_key``)."""
+        if getattr(self, "train_rng", None) is None:
+            return None
+        return {"python": self.train_rng.getstate(), "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+                "batches": [list(b) for b in batches or []], "data": self.data_key}
+
+    def restore_rng(self, saved: dict | None, batches: list) -> None:
+        """Put back ``rng_state``'s random state (a state saved before it was kept starts afresh, as it did); the
+        epoch's batches only for the same data, else a new shuffle starts."""
+        if not saved:
+            self.log("Note: this job's saved state predates its random state, so the batch order starts afresh")
+            return
+        self.train_rng.setstate(saved["python"])
+        torch.set_rng_state(saved["torch"])
+        if torch.cuda.is_available() and len(saved["cuda"]) == torch.cuda.device_count():
+            torch.cuda.set_rng_state_all(saved["cuda"])
+        if saved.get("data") == self.data_key:
+            batches[:] = saved["batches"]
+        else:
+            self.log("The datasets changed since the last save: the batch order starts a new epoch")
 
     def sample_specs(self) -> list[dict]:
         """The sample prompt cards with blank fields filled from the Sampling defaults.
@@ -471,8 +506,11 @@ class Trainer:
                 for sp in specs:
                     network.set_multiplier(sp["lora_scale"])
                     cond = self.text_emb(sp.get("cond_key") or sp["prompt"])
+                    # each step rewrites the status file (at most once a second): a job asked to stop while it
+                    # renders shows the queue it's still working, so isn't killed before it saves
                     lats.append(d.sample(model, cond, negative, sp["width"], sp["height"], steps, cfg,
-                                         sp["seed"], frames=sp.get("frames", 1), images=sp.get("images")))
+                                         sp["seed"], frames=sp.get("frames", 1), images=sp.get("images"),
+                                         callback=lambda *_: self.write_status()))
             finally:
                 network.set_multiplier(1.0)
                 network.set_assistants_enabled(True)
@@ -1060,7 +1098,7 @@ class Trainer:
         s = self.s
         seed = int(s.get("seed", 42))
         torch.manual_seed(seed)
-        rng = random.Random(seed)
+        rng = self.train_rng = random.Random(seed)
         driver = self.driver = self.make_driver()
         items, item_keys, payload_files, val_keys, val_payload_files, bleed_prompts = self.prepare(
             driver, self.job.get("validation_datasets") or [])
@@ -1101,7 +1139,7 @@ class Trainer:
         sched = self.make_scheduler(opt)
 
         start = 0
-        ema_saved = None
+        ema_saved = rng_saved = None
         if st is not None:
             if not self.finetune:  # a finetune's weights were loaded with the model
                 network.load_state_dict(st["lora"])
@@ -1121,7 +1159,7 @@ class Trainer:
             self.log(f"Resumed from step {start}")
             if start < int(s["steps"]):
                 self.keep_final()  # a finished job given more steps
-            ema_saved = st.get("ema")
+            ema_saved, rng_saved = st.get("ema"), st.get("rng")
             del st
         # after the resume state, so a new EMA starts from the weights the job carries on with
         self.ema = self.make_ema(network, ema_saved)
@@ -1159,6 +1197,10 @@ class Trainer:
         self.phase("training", "Training")
         model.train()
         batches: list[list[int]] = []
+        # the data the batches index: its latents' files, in order
+        self.data_key = hashlib.sha1("\n".join(map(str, payload_files)).encode()).hexdigest()
+        if start:
+            self.restore_rng(rng_saved, batches)
         ema_loss = None
         t0, step_times = time.time(), []
         step = start
@@ -1241,7 +1283,7 @@ class Trainer:
                     with self.ema_applied():
                         fname = self.save_lora(network, step)
                         self.evaluate(model, network, step, fname)
-                    self.save_state(network, opt, sched, step)  # (the live weights, and the EMA beside them)
+                    self.save_state(network, opt, sched, step, batches)  # (the live weights, and the EMA beside them)
                 if sample_every and step % sample_every == 0 and step < total:
                     with self.ema_applied():
                         self.make_samples(model, network, step)
@@ -1250,7 +1292,7 @@ class Trainer:
                 if not any(c["step"] == step for c in self.status["checkpoints"]):  # (else just saved)
                     with self.ema_applied():
                         self.save_lora(network, step)
-                self.save_state(network, opt, sched, step)
+                self.save_state(network, opt, sched, step, batches)
             self.status["phase"] = "stopped"
             self.log(f"Stopped at step {step}" + ("; state saved for resume" if step > start else ""))
             return "stopped"
@@ -1262,7 +1304,7 @@ class Trainer:
             if s.get("sample_at_end", True):
                 self.make_samples(model, network, step)
             self.strength_sweep(model, network)
-        self.save_state(network, opt, sched, step)
+        self.save_state(network, opt, sched, step, batches)
         self.status["phase"] = "completed"
         self.log(f"Done in {(time.time() - t0) / 60:.1f} min")
         return "completed"

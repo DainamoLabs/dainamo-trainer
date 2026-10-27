@@ -359,15 +359,35 @@ def project(driver_cls, profile: dict, settings: dict, kind: str = "train") -> d
         if saved:
             notes.append(f"Low VRAM: training steps keep the blocks' saved activations ({saved / GB:.1f} GB at "
                          "the largest size) in system RAM and copy each back as the backward pass needs it.")
-        sw, sh = int(settings.get("sample_width", res)), int(settings.get("sample_height", res))
-        sf = int(settings.get("sample_frames", 1) or 1) if video else 1
+        # the largest sample: the Sampling defaults, or a prompt card's own size and frames where it sets them,
+        # rounded as training renders them (``Trainer.sample_specs``)
+        div, snap = driver_cls.bucket_divisibility, driver_cls.snap_frames
+
+        def sample_size(w, h, f) -> tuple[int, int, int]:
+            w, h, f = int(float(w)), int(float(h)), max(1, int(float(f))) if video else 1
+            return max(div, w // div * div), max(div, h // div * div), snap(f) if f > 1 and snap else f
+
+        base_w, base_h = settings.get("sample_width", res), settings.get("sample_height", res)
+        base_f = settings.get("sample_frames", 1) or 1
+        sw, sh, sf = sample_size(base_w, base_h, base_f)
+        for card in settings.get("sample_prompts") or []:
+            if not isinstance(card, dict) or not str(card.get("prompt") or "").strip():
+                continue
+            try:
+                cw, ch, cf = sample_size(card.get("width") or base_w, card.get("height") or base_h,
+                                         card.get("frames") or base_f)
+            except (TypeError, ValueError, OverflowError):  # a half-typed field in the form
+                continue
+            if cw * ch * cf > sw * sh * sf:
+                sw, sh, sf = cw, ch, cf
         if mem is not None:
             decode = _vae_work(mem.vae_decode, sw * sh * sf, mem.decode_tile_pixels)
             infer = activations(tokens(sw, sh, sf), False)
             held = beside if finetune else [[name, weights / GB]]  # a finetune's are the model's
             if low_vram:  # denoise with the optimizer state in RAM, then decode with the model and LoRA there too
                 # sample cards with images (a first frame, references) have the VAE encode them while sampling
-                cards = [c for c in settings.get("sample_prompts") or [] if isinstance(c, dict)]
+                cards = [c for c in settings.get("sample_prompts") or []
+                         if isinstance(c, dict) and str(c.get("prompt") or "").strip()]
                 with_vae = [["VAE", vae / GB]] if any(c.get("images") for c in cards) else []
                 phases.append({"id": "sampling", "label": "Sampling", "model": True, "parts": [
                     *held, *with_vae, ["Working memory", infer / GB]], "ram": [["Optimizer", opt / GB]]})

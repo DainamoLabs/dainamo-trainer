@@ -92,14 +92,20 @@ function NewDataset({ onClose, onCreated }: { onClose: () => void; onCreated: (d
 }
 
 /** A file's caption: a click edits it; Ctrl+Enter or clicking away saves, Escape
- * cancels. ``grid``: the grid view's two lines, and a boxed editor. */
+ * cancels. ``grid``: the grid view's two lines, and a boxed editor. While it's being edited, the page's polling
+ * doesn't replace what's typed (a caption written meanwhile, say by Auto-Caption, is noted; saving keeps the typed
+ * one). */
 function CaptionCell({ item, onSaved, grid }: {
   item: MediaItem; onSaved: (c: string) => void; grid?: boolean;
 }) {
   const toast = useToast();
   const [editing, setEditing] = useState(false);
   const [val, setVal] = useState(item.caption);
-  useEffect(() => setVal(item.caption), [item.caption]);
+  // the caption as it was when editing began: a different one arriving meanwhile was written by something else
+  const [began, setBegan] = useState(item.caption);
+  useEffect(() => { if (!editing) setVal(item.caption); }, [item.caption, editing]);
+  const edit = () => { setVal(item.caption); setBegan(item.caption); setEditing(true); };
+  const changed = editing && item.caption !== began;
   const save = async () => {
     setEditing(false);
     if (val.trim() === item.caption) return;
@@ -112,12 +118,15 @@ function CaptionCell({ item, onSaved, grid }: {
   };
   if (editing)
     return (
-      <textarea autoFocus value={val} onChange={(e) => setVal(e.target.value)} onBlur={save} className={grid ? "file-cap-edit" : undefined}
-        onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) save(); if (e.key === "Escape") { e.stopPropagation(); setVal(item.caption); setEditing(false); } }}
-        style={grid ? undefined : { border: 0, borderRadius: 0, minHeight: 110, fontSize: 12 }} />
+      <>
+        <textarea autoFocus value={val} onChange={(e) => setVal(e.target.value)} onBlur={save} className={grid ? "file-cap-edit" : undefined}
+          onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) save(); if (e.key === "Escape") { e.stopPropagation(); setVal(item.caption); setEditing(false); } }}
+          style={grid ? undefined : { border: 0, borderRadius: 0, minHeight: 110, fontSize: 12 }} />
+        {changed && <span className="help warn">This caption was rewritten while you typed. Saving keeps yours; Escape keeps the new one.</span>}
+      </>
     );
   return (
-    <div className={(grid ? "file-cap" : "media-cap") + (item.caption ? "" : " none")} onClick={() => setEditing(true)} title="Click to edit">
+    <div className={(grid ? "file-cap" : "media-cap") + (item.caption ? "" : " none")} onClick={edit} title="Click to edit">
       {item.caption || "No caption: click to write one"}
     </div>
   );
@@ -321,6 +330,8 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
   const [trigger, setTrigger] = useState("");
   const [over, setOver] = useState(false);
   const [uploading, setUploading] = useState<string | null>(null);
+  // caption files uploaded for files already here replace the captions those have (off: theirs are kept)
+  const [replaceCaptions, setReplaceCaptions] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const [cap, , ] = usePoll<CapStatus>(`/api/datasets/${id}/autocaption`, 1500);
   const wasRunning = useRef(false);
@@ -366,19 +377,43 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
   const upload = async (files: FileList | File[]) => {
     const arr = Array.from(files);
     if (!arr.length) return;
-    let saved = 0;
-    for (let i = 0; i < arr.length; i += 20) {
-      setUploading(`Uploading ${Math.min(i + 20, arr.length)} / ${arr.length}`);
+    // a file and its caption (a.png, a.txt) go in the same request, so a name taken in the dataset renames both
+    const stem = (f: File) => f.name.replace(/\.[^.]*$/, "").toLowerCase();
+    const groups = new Map<string, File[]>();
+    for (const f of arr) groups.set(stem(f), [...(groups.get(stem(f)) || []), f]);
+    const batches: File[][] = [];
+    for (const g of groups.values()) {
+      const last = batches[batches.length - 1];
+      if (last && last.length + g.length <= 20) last.push(...g);
+      else batches.push([...g]);
+    }
+    let saved = 0, sent = 0, failed = 0, firstError = "";
+    const renamed: string[][] = [];
+    const kept: string[] = [];
+    for (const batch of batches) {
+      sent += batch.length;
+      setUploading(`Uploading ${sent} / ${arr.length}`);
       const fd = new FormData();
-      arr.slice(i, i + 20).forEach((f) => fd.append("files", f));
+      batch.forEach((f) => fd.append("files", f));
+      fd.append("overwrite_captions", replaceCaptions ? "true" : "false");
       try {
-        saved += (await api.post<{ saved: number }>(`/api/datasets/${id}/upload`, fd)).saved;
+        const r = await api.post<{ saved: number; renamed?: string[][]; captions_kept?: string[] }>(`/api/datasets/${id}/upload`, fd);
+        saved += r.saved;
+        renamed.push(...(r.renamed || []));
+        kept.push(...(r.captions_kept || []));
       } catch (e: any) {
-        toast(e.message, true);
+        failed += batch.length;
+        firstError ||= e.message;
       }
     }
     setUploading(null);
-    toast(`Uploaded ${saved} file${saved === 1 ? "" : "s"}`);
+    const parts = [saved || !kept.length ? `Uploaded ${saved} file${saved === 1 ? "" : "s"}` : "Nothing was uploaded"];
+    if (renamed.length) parts.push(renamed.length === 1 ? `${renamed[0][0]} was taken, so it's ${renamed[0][1]}`
+      : `${renamed.length} names were taken, so those files have a number added`);
+    if (kept.length) parts.push(`${kept.length === 1 ? `${kept[0]} already has a caption, so it was kept`
+      : `${kept.length} files already have captions, so theirs were kept`} (tick "Uploaded captions replace existing ones" to replace them)`);
+    if (failed) parts.push(`${failed} failed: ${firstError}`);
+    toast(parts.join("; "), failed > 0);
     loadItems();
     reloadDs();
   };
@@ -498,7 +533,8 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
           <button className="btn primary lg" onClick={() => setCapOpen(true)} disabled={!items?.length || onlyAudio}
             title={onlyAudio ? "Auto-Caption describes images and clips; write each song's style tags yourself (lyrics go after a [Lyrics] line)" : undefined}>
             <IconSparkle /> Auto-Caption</button>
-          <input ref={fileRef} type="file" multiple hidden accept="image/*,video/*,audio/*,.txt" onChange={(e) => e.target.files && upload(e.target.files)} />
+          <input ref={fileRef} type="file" multiple hidden accept="image/*,video/*,audio/*,.txt"
+            onChange={(e) => { if (e.target.files) upload(e.target.files); e.target.value = ""; /* so picking the same files again uploads them again */ }} />
         </div>
       </div>
 
@@ -526,6 +562,10 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
             <div><b>{items ? `${captioned} / ${items.length}` : "…"}</b><span>captioned</span></div>
             <div className={"bar dd-bar" + (done ? " ok" : "")}><div style={{ width: `${items?.length ? (100 * captioned) / items.length : 0}%` }} /></div>
           </div>
+          <label className="check dd-replace" title="Caption files you upload for files already in the dataset replace their captions. Off: a file's caption is kept and the uploaded one skipped.">
+            <input type="checkbox" checked={replaceCaptions} onChange={(e) => setReplaceCaptions(e.target.checked)} />
+            Uploaded captions replace existing ones
+          </label>
         </div>
         {cap && (cap.running || cap.errors.length > 0) && (
           <TaskProgress className="dd-task" icon={<IconSparkle />} running={cap.running} errors={cap.errors.slice(-3)}
@@ -697,7 +737,7 @@ function DeleteDatasets({ datasets, onClose, onDeleted }: { datasets: Dataset[];
   const [jobs] = usePoll<Job[]>("/api/jobs", 0);
   const uploaded = datasets.filter((d) => d.managed);
   const names = new Set(datasets.map((d) => d.name));
-  const using = (jobs || []).filter((j) => ["queued", "running", "stopping"].includes(j.status) && j.datasets.some((n) => names.has(n)));
+  const using = (jobs || []).filter((j) => ["ready", "queued", "running", "stopping"].includes(j.status) && j.datasets.some((n) => names.has(n)));
   const remove = async (files: boolean) => {
     let removed = 0;
     const failed: string[] = [];
@@ -919,7 +959,7 @@ function SplitModal({ dataset, families, onClose, onStarted }: { dataset: Datase
       if (!sys) return;
       setGpus(sys.gpus);
       setRam(sys.ram || null);
-      if (sys.gpus.length) setGpu(sys.gpus.reduce((a, b) => (b.mem_total < a.mem_total ? b : a)).index);
+      if (sys.gpus.length) setGpu(sys.gpus.reduce((a, b) => ((b.mem_total ?? Infinity) < (a.mem_total ?? Infinity) ? b : a)).index);
     });
   }, []);
   const gpuGb = (gpus.find((g) => g.index === gpu)?.mem_total ?? 0) / 1024;
@@ -927,11 +967,13 @@ function SplitModal({ dataset, families, onClose, onStarted }: { dataset: Datase
     if (!profileId || !gpuGb) return;
     let live = true;
     setFit(null);
-    api.post<ClipFit>(`/api/datasets/${dataset.id}/split/fit`, { profile_id: profileId, resolution, offload, low_vram: lowVram, gpu_gb: gpuGb })
-      .then((f) => {
+    api.post<Partial<ClipFit>>(`/api/datasets/${dataset.id}/split/fit`, { profile_id: profileId, resolution, offload, low_vram: lowVram, gpu_gb: gpuGb })
+      .then((answer) => {
         if (!live) return;
+        // a projection that failed is only {error}: no lengths to pick from
+        const f: ClipFit = { frames: null, fps: 24, ...answer, lengths: answer.lengths || [] };
         setFit(f);
-        setFrames(f.frames ?? f.lengths?.[0]?.frames ?? 0);
+        setFrames(f.frames ?? f.lengths[0]?.frames ?? 0);
       })
       .catch((e) => live && setFit({ frames: null, fps: 24, lengths: [], error: e.message }));
     return () => { live = false; };
@@ -987,7 +1029,7 @@ function SplitModal({ dataset, families, onClose, onStarted }: { dataset: Datase
           <label className="field">
             <span>GPU</span>
             <select value={gpu} onChange={(e) => setGpu(Number(e.target.value))} disabled={!gpus.length}>
-              {gpus.map((g) => <option key={g.index} value={g.index}>GPU {g.index} · {g.name} · {(g.mem_total / 1024).toFixed(0)} GB</option>)}
+              {gpus.map((g) => <option key={g.index} value={g.index}>GPU {g.index} · {g.name} · {g.mem_total != null ? `${(g.mem_total / 1024).toFixed(0)} GB` : "memory not reported"}</option>)}
             </select>
           </label>
           <label className="field">

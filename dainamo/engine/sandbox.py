@@ -240,8 +240,18 @@ class Session:
                 self.driver.load_text_encoder()
             self.te_where = "gpu"
             emit("status", message=f"Encoding {len(missing)} prompt(s)")
-            for k, (prompt, images) in missing.items():
-                self.texts[k] = self.driver.encode_condition(prompt, images)
+            try:
+                for k, (prompt, images) in missing.items():
+                    self.texts[k] = self.driver.encode_condition(prompt, images)
+            except BaseException:
+                # off the GPU as after an encode that worked: left there (and marked so), later requests would skip
+                # parking and run it beside the diffusion model
+                try:
+                    self._park_text_encoder()
+                except Exception:
+                    self.driver.unload_text_encoder()
+                    self.te_where, self.te_parked = None, None
+                raise
             while len(self.texts) > TEXTS_KEPT:  # (never this request's: they're the most recent)
                 self.texts.popitem(last=False)
             self._park_text_encoder()
@@ -338,12 +348,23 @@ class Session:
                 # would take one as its first frame)
                 **({"references": True} if p.get("workflow") == "r2v" else {})}
 
-        prompt, cond_images = d.sample_condition({"prompt": p["prompt"], "width": w, "height": h,
-                                                  "images": images, "frames": frames,
-                                                  "lyrics": p.get("lyrics") or "", "seconds": p.get("seconds"),
-                                                  **refs})
-        key = cond_key(prompt, cond_images)
-        conds = {key: (prompt, cond_images)}
+        def condition(size: tuple[int, int]):
+            """The prompt's condition for a render ``size`` (width, height) -> (its cache key, (prompt, images))."""
+            prompt, cond_images = d.sample_condition({"prompt": p["prompt"], "width": size[0], "height": size[1],
+                                                      "images": images, "frames": frames,
+                                                      "lyrics": p.get("lyrics") or "", "seconds": p.get("seconds"),
+                                                      **refs})
+            return cond_key(prompt, cond_images), (prompt, cond_images)
+
+        # the condition for each pass: an edit model's references are sized for the render, so the hi-res fix's
+        # bigger second pass has its own (the same key, encoded once, where the size doesn't change it)
+        key, cond = condition((w, h))
+        conds = {key: cond}
+        keys = [key]
+        if hires:
+            key2, cond2 = condition((int(hires["width"]), int(hires["height"])))
+            conds[key2] = cond2
+            keys.append(key2)
         cfg = float(p.get("cfg") or 1.0)
         negative = str(p.get("negative") or "")
         use_cfg = d.supports_samplers and cfg != 1
@@ -474,7 +495,7 @@ class Session:
             progress(at["base"], f"{label} · seed {seed}")
             clock["last"] = time.time()
             extra = {"init": init_, "strength": strength_} if init_ is not None else {}
-            lat = d.sample(self.model, self.texts[key], self.texts.get(negative) if use_cfg else None,
+            lat = d.sample(self.model, self.texts[keys[k]], self.texts.get(negative) if use_cfg else None,
                            rw, rh, steps_, cfg, seed, frames=frames, images=images or None, sampler=sampler,
                            scheduler=scheduler, shift=shift, callback=callback, **refs, **extra)
             progress(at["base"] + ps["calls"], "Decoding")

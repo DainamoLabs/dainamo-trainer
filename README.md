@@ -48,6 +48,10 @@ Tailscale). Anyone signed in can use
 [Add from URL](docs/datasets.md#add-from-url-experimental) to make this machine
 download from any address, including ones on your local network.
 
+Other websites open in your browser can't use the app on your behalf: changes
+(starting jobs, writing files) are only accepted from the app's own pages, or
+from scripts that call the API directly.
+
 ## First job
 
 1. **Models → Model files**: set your ComfyUI models folder, download what's
@@ -56,7 +60,8 @@ download from any address, including ones on your local network.
    to each file; **Auto-Caption** writes them once a caption provider is set
    up in Settings.
 3. **New job**: pick the profile and datasets, set the steps and sample prompts,
-   and press **Fit to GPU** if the projection says it won't fit.
+   and press **Fit to GPU** if the projection says it won't fit. **Add and
+   start** runs it; **Add to queue** keeps it ready until you press **Start**.
 4. **Queue**: open the job for its samples, loss and log. The LoRA is saved in
    `data/jobs/<job name>_<id>/` and downloadable from the Checkpoints tab.
 5. **Sandbox**: generate with the LoRA and compare it with the render without

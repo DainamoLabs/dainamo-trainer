@@ -84,11 +84,23 @@ def caption_path(media_path: str) -> str:
     return os.path.splitext(media_path)[0] + ".txt"
 
 
+def read_text(path: str) -> str:
+    """A caption file's text: UTF-8 (with or without a BOM), else Windows-1252, as many Windows tools write it, so one
+    caption in another encoding doesn't stop a dataset from loading."""
+    with open(path, "rb") as f:
+        data = f.read()
+    for encoding in ("utf-8-sig", "cp1252"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            pass
+    return data.decode("latin-1")  # every byte is a character
+
+
 def read_caption(media_path: str) -> str:
     p = caption_path(media_path)
     if os.path.exists(p):
-        with open(p, encoding="utf-8") as f:
-            return f.read().strip()
+        return read_text(p).strip()
     return ""
 
 
@@ -188,9 +200,11 @@ def load_mask(path: str, image_size: tuple[int, int], size: tuple[int, int], fli
 
 # ---- video / audio ---------------------------------------------------------
 def probe_video(path: str) -> dict:
-    """{width, height, duration, fps, has_audio} via ffprobe."""
+    """{width, height, duration, fps, has_audio} via ffprobe. The duration is the video stream's: a clip's audio
+    can run on past its last frame, and the container's duration is the longer of the two."""
     out = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
-                          "stream=codec_type,width,height,avg_frame_rate:stream_tags=rotate:stream_side_data=rotation"
+                          "stream=codec_type,width,height,avg_frame_rate,duration:stream_tags"
+                          ":stream_side_data=rotation"
                           ":format=duration", "-of", "json", path], capture_output=True, text=True, timeout=60)
     info = json.loads(out.stdout or "{}")
     streams = info.get("streams", [])
@@ -204,8 +218,24 @@ def probe_video(path: str) -> dict:
     turns = [(video.get("tags") or {}).get("rotate")] + [d.get("rotation") for d in video.get("side_data_list") or []]
     if any(t is not None and abs(int(float(t))) % 180 == 90 for t in turns):
         w, h = h, w
-    return {"width": w, "height": h, "duration": float(info.get("format", {}).get("duration") or 0.0),
+    duration = _seconds(video.get("duration"))
+    if not duration:  # Matroska and WebM keep it as a tag, "00:00:01.000000000"
+        duration = next((_seconds(v) for k, v in (video.get("tags") or {}).items()
+                         if k.upper().startswith("DURATION")), 0.0)
+    duration = duration or float(info.get("format", {}).get("duration") or 0.0)
+    return {"width": w, "height": h, "duration": duration,
             "fps": fps, "has_audio": any(s.get("codec_type") == "audio" for s in streams)}
+
+
+def _seconds(v) -> float:
+    """ffprobe's seconds ("1.5") or Matroska's "HH:MM:SS.fraction" -> seconds (0 when it's neither)."""
+    try:
+        total = 0.0
+        for part in str(v or "0").split(":"):
+            total = total * 60 + float(part)
+        return total
+    except ValueError:
+        return 0.0
 
 
 def read_video_frames(path: str, size: tuple[int, int], frames: int, fps: int, flip: bool = False,

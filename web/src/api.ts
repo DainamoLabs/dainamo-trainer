@@ -43,7 +43,8 @@ export type FamilyWorkflow = Workflow & {
   audio: { label: string; max: number; help: string } | null;
 };
 
-export type Gpu = { index: number; name: string; mem_used: number; mem_total: number; util: number; temp: number };
+// a value nvidia-smi doesn't report (a GPU without the sensor, or one sharing system memory) is null
+export type Gpu = { index: number; name: string; mem_used: number | null; mem_total: number | null; util: number | null; temp: number | null };
 export type SystemRam = { total_gb: number; available_gb: number; used_gb: number };
 // the CPU's temperature is null where it isn't reported (Windows, or a Linux machine without the sensor driver)
 
@@ -273,7 +274,8 @@ export type JobDiskUse = DiskUse & { shared: number };
 export type Job = {
   id: string;
   name: string;
-  status: "queued" | "running" | "stopping" | "completed" | "failed" | "stopped" | "interrupted";
+  // ready: added, waiting for Start (the queue doesn't run it yet); queued: waiting for a free GPU
+  status: "ready" | "queued" | "running" | "stopping" | "completed" | "failed" | "stopped" | "interrupted";
   family: string;
   media: string[]; // its model's: "image", "video" or "audio"
   profile_name: string;

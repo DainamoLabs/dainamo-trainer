@@ -84,6 +84,7 @@ def test_sampling_sigmas_match_the_release_scheduler():
     for steps, seq in ((40, 64 * 64), (20, 84 * 48), (8, 32 * 32)):
         sched.set_timesteps(sigmas=np.linspace(1.0, 1 / steps, steps), mu=Q.mu_for(seq))
         assert np.allclose(Q.sampling_sigmas(steps, seq), sched.sigmas.numpy(), atol=1e-6)
+    assert Q.sampling_sigmas(1, 4096) == [1.0, 0.0]  # one step: noise to image (it was NaN)
     turbo = Q.sampling_sigmas(40, 4096, turbo=True)
     assert len(turbo) == 9 and turbo[0] == 1.0 and turbo[-1] == 0.0
 

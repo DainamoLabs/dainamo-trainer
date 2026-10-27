@@ -97,6 +97,10 @@ class SandboxManager:
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
+    def _closing(self) -> bool:
+        """The worker was told to exit (its stdin is closed): it takes no more commands."""
+        return self.proc is not None and (self.state == "stopping" or self.proc.stdin is None or self.proc.stdin.closed)
+
     def occupies(self, gpu: int) -> bool:
         return self.alive() and self.gpu == gpu
 
@@ -191,7 +195,7 @@ class SandboxManager:
         kind, rid = ev.get("event"), ev.get("id")
         # a RefMod's or a dataset upscale's, not a run's
         made = next((j for j in (self.refmod, self.upscale) if j and rid == j["id"]), None)
-        if kind == "ready":
+        if kind == "ready" and not self._closing():
             self.state, self.message = "ready", "Ready"
         elif kind == "status":
             self.message = ev.get("message", "")
@@ -199,7 +203,9 @@ class SandboxManager:
             self.current = rid
             if rid in self.pending:
                 self.pending.remove(rid)
-            self.state, self.progress = "busy", None
+            self.progress = None
+            if not self._closing():
+                self.state = "busy"
             if made:
                 made["state"] = "running"
             else:
@@ -231,7 +237,7 @@ class SandboxManager:
                 self.current = None
             self.progress = None
             self.last_used = time.time()
-            if not self.pending:
+            if not self.pending and not self._closing():  # (a released one's cancelled runs: it's still unloading)
                 self.state, self.message = "ready", ""
                 if self.yielding:
                     self._stop()
@@ -290,8 +296,8 @@ class SandboxManager:
         """Send the worker on ``gpu`` a command (started there if needed). One on another GPU is stopped first, and
         one unloading (its stdin already closed) is let finish: either way a new one starts once it has exited."""
         with self.lock:
-            old = self.proc if self.alive() and (self.gpu != gpu or self.state == "stopping") else None
-            if old is not None and self.state != "stopping":
+            old = self.proc if self.alive() and (self.gpu != gpu or self._closing()) else None
+            if old is not None and not self._closing():
                 self._stop()
         if old is not None:  # wait outside the lock (the event reader needs it)
             try:

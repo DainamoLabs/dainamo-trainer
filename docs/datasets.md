@@ -5,6 +5,16 @@
 A dataset is a folder of images, videos or songs. Link an existing folder or
 upload files. Each file's caption is a `.txt` file next to it with the same
 name. To write captions with a vision LLM, see [Captions](captions.md).
+Uploading never replaces a file: one whose name is taken in the folder is saved
+with a number added ("photo 2.png"), together with its caption from the same
+upload. Caption files uploaded on their own are for the files of that name
+already there: a file without a caption gets one, and a file that has one keeps
+it unless **Uploaded captions replace existing ones** is ticked. Captions in
+another encoding than UTF-8 (Windows-1252) are read as they are.
+
+While you edit a caption, the page doesn't replace what you type. If something
+else, such as Auto-Caption, rewrites that caption meanwhile, a note says so.
+Saving keeps yours, and Escape keeps the new one.
 
 A dataset's page shows its files in one of two views, and remembers the one
 you chose:
@@ -16,8 +26,9 @@ you chose:
 
 **Search** matches file names and captions, and **Missing captions** shows the
 files without one. On an uploaded dataset, **Select** (or a card's checkbox)
-picks files to delete together. A linked folder's files are only deleted in the
-folder itself. **Tools**, beside Auto-Caption, holds Split into clips (Edit
+picks files to delete together. A file's caption and loss mask are deleted with
+it, unless another file of the same name (a.png beside a.jpg) still uses them.
+A linked folder's files are only deleted in the folder itself. **Tools**, beside Auto-Caption, holds Split into clips (Edit
 clips on a split's copy), Upscale small images, Export and Delete dataset.
 
 Captioning, a split, a download or an upscale shows its progress on the page,

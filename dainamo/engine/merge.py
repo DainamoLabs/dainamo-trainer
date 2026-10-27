@@ -98,6 +98,15 @@ def _bare(stem: str) -> str:
     return next((stem[len(p):] for p in LORA_PREFIXES if stem.startswith(p)), stem)
 
 
+def _by_layer(index: dict[str, dict[str, str]]) -> dict[str, dict[str, str]]:
+    """``_index`` keyed by the model's layer name (prefix stripped), so inputs that spell one layer differently
+    (``diffusion_model.``, ``transformer.``, bare, kohya) are merged together rather than overwriting each other."""
+    out: dict[str, dict[str, str]] = {}
+    for stem, keys in index.items():
+        out.setdefault(_bare(stem), {}).update(keys)
+    return out
+
+
 def describe(path: str, layers: Layers) -> dict:
     """What a LoRA file holds, from its header: how many layers it changes and how many of them this model has (at
     that size), the kinds of change and LoRA ranks among those, and its trigger words. ``changes`` is
@@ -197,7 +206,7 @@ def merge(loras: list[tuple[str, float]], out: str, rank: int, layers: Layers, d
     worst: tuple[float, str] | None = None
     with contextlib.ExitStack() as stack:
         files = [(stack.enter_context(safe_open(p, "pt", device="cpu")), float(s)) for p, s in loras]
-        indexes = [_index(f, layers) for f, _ in files]
+        indexes = [_by_layer(_index(f, layers)) for f, _ in files]
         stems = sorted({stem for index in indexes for stem in index})
         for n, stem in enumerate(stems):
             if check and n % 16 == 0:

@@ -174,6 +174,25 @@ def test_projection_takes_each_datasets_size_and_kind(tmp_path):
     assert activations({"resolution": [512, 1024]}) == pytest.approx(64 * 64 * 9 + 256)
 
 
+def test_projection_samples_the_largest_prompt_card(tmp_path):
+    path = write_model(tmp_path / "m.safetensors")
+    base = {"batch_size": 1, "rank": 4, "num_frames": 9, "sample_width": 64, "sample_height": 64, "sample_frames": 1}
+
+    def working(cards):
+        p = memory.project(TinyVideoDriver, {"diffusion_model": path}, {**base, "sample_prompts": cards})
+        return dict(next(ph for ph in p["phases"] if ph["id"] == "sampling")["parts"])["Working memory"]
+
+    still = working([{"prompt": "a", "frames": ""}])
+    assert still == working([])  # blank fields take the defaults
+    assert working([{"prompt": "a", "frames": "9"}]) > working([{"prompt": "a", "frames": "5"}]) > still
+    assert working([{"prompt": "a", "width": 128, "height": "128"}]) > still
+    assert working([{"prompt": "", "frames": 9}]) == still  # an empty card isn't rendered
+    assert working([{"prompt": "a", "frames": "9e"}]) == still  # a half-typed field is skipped, not an error
+    assert working([{"prompt": "a", "frames": "1e999"}]) == still  # so is one too big to be a number
+    # sized as training renders it: rounded down to the model's multiple (16)
+    assert working([{"prompt": "a", "width": 79, "height": 64}]) == still
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_offloaded_load_streams_the_last_blocks_and_matches(tmp_path):
     path = write_model(tmp_path / "m.safetensors")

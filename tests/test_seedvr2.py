@@ -678,6 +678,10 @@ def test_tiles():
     torch.testing.assert_close(V.tiled(lambda p: p, x, (24, 32), 8, 8, 1), x)  # blends back exactly
     up = V.tiled(lambda p: F.interpolate(p, scale_factor=(1, 2, 2)), x, 16, 8, 8, 2)
     torch.testing.assert_close(up, F.interpolate(x, scale_factor=(1, 2, 2)))
+    # a fixed tile much larger than its step: three tiles cover some rows, and the blend still sums to 1 there
+    for n, tile in [(912, 512), (1440, 768)]:
+        x = torch.randn(1, 1, 1, n, 64)
+        torch.testing.assert_close(V.tiled(lambda p: p, x, (tile, 64), 128, 8, 1), x)
     assert V.fit_tiles(1088, 1920, 3e6, 128, 16) is None
     for area in (2e5, 4e5, 7.3e5, 1.5e6):
         th, tw = V.fit_tiles(1088, 1920, area, 128, 16)

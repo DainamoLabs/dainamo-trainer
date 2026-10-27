@@ -30,7 +30,9 @@ from . import db, procs
 JOBS_DIR = os.path.join(db.DATA_DIR, "jobs")
 CACHE_DIR = os.path.join(db.DATA_DIR, "cache")  # encoded items and captions, shared by jobs (``engine.cache``)
 EXIT_CODES = {"completed": 0, "stopped": 3}
-STOP_GRACE = 180  # seconds a job asked to stop has to save its state before it's killed
+# seconds a job asked to stop may go without any sign of work (``last_activity``) before it's killed: a save or a
+# sample in progress keeps writing, a hung process doesn't
+STOP_GRACE = 180
 
 
 _folders: dict[str, str] = {}  # job id -> its folder's name, which never changes
@@ -60,6 +62,25 @@ def read_status(job_id: str) -> dict:
             return json.load(f)
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def last_activity(job_id: str) -> float:
+    """When the job last wrote anything: its status file and log, and the newest file of its state and output
+    folders (a save in progress)."""
+    d = job_dir(job_id)
+    paths = [os.path.join(d, "status.json"), os.path.join(d, "log.txt")]
+    for sub in ("state", "output", "samples"):
+        try:
+            paths += [e.path for e in os.scandir(os.path.join(d, sub))]
+        except OSError:
+            pass
+    latest = 0.0
+    for p in paths:
+        try:
+            latest = max(latest, os.path.getmtime(p))
+        except OSError:
+            pass
+    return latest
 
 
 def end_evaluation(job_id: str, cfg: dict, unrecorded: str = "failed") -> str | None:
@@ -146,18 +167,21 @@ class Scheduler:
             code = proc.poll()
             if code is None:
                 deadline = self.stop_deadline.get(job_id)
-                if deadline and time.time() > deadline:
+                # the grace runs from when it was asked or, if later, from the last thing it wrote
+                if deadline and time.time() > max(deadline, last_activity(job_id) + STOP_GRACE):
                     procs.kill_tree(proc.pid)
                 continue
             del self.procs[job_id]
             asked_to_stop = self.stop_deadline.pop(job_id, None) is not None
             cfg = (db.query_one("SELECT config FROM jobs WHERE id=?", (job_id,)) or {}).get("config") or {}
             if "evaluate" in cfg:
-                killed = code in procs.KILLED or asked_to_stop
+                killed = asked_to_stop  # (stopped, or forced to; killed unasked, it failed)
                 notify.evaluation_ended(job_id, end_evaluation(job_id, cfg, "stopped" if killed else "failed"))
                 continue
             status = {0: "completed", 3: "stopped"}.get(code, "failed")
-            if code in procs.KILLED or (asked_to_stop and code != 0):
+            # killed because it was asked to stop (by the grace running out, or Force stop): stopped. Killed
+            # unasked (the out-of-memory killer) it failed, and the notification says so
+            if asked_to_stop and code != 0:
                 status = "stopped"
             db.execute("UPDATE jobs SET status=?, exit_code=?, finished=?, pid=NULL WHERE id=?",
                        (status, code, db.now(), job_id))
@@ -243,7 +267,7 @@ class Scheduler:
                 return
             if job["status"] == "queued" and "evaluate" in (job["config"] or {}):
                 end_evaluation(job_id, job["config"])  # cancelled before it started
-            elif job["status"] == "queued":
+            elif job["status"] in ("queued", "ready"):  # cancelled before it ran
                 db.execute("UPDATE jobs SET status='stopped' WHERE id=?", (job_id,))
             elif job["status"] == "running":
                 send_control(job_id, "stop")

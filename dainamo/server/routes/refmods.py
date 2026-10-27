@@ -120,7 +120,7 @@ def refmod_check(body: RefModIn):
     except HTTPException:
         gpu = None
     stats = next((g for g in hardware.gpus() if g["index"] == gpu), None)
-    if stats:
+    if stats and stats["mem_total"] is not None and stats["mem_used"] is not None:  # (unreported: no estimate)
         loaded = sbx.sandbox.alive() and sbx.sandbox.gpu == gpu
         need = memory.encode_bytes(F, profile["data"], plan["pixels"], loaded=loaded)
         free = (stats["mem_total"] - stats["mem_used"]) * 1024**2

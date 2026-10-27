@@ -48,8 +48,10 @@ from .model import FLOW_MAP_KEY, Flux3Config, Flux3KleinDiT, Pack
 HF_REPO, HF_REV = "black-forest-labs/flux-3-image-klein-comfy", "feef60b0aaf63a4773ace96636ebbcf43b881312"
 
 OUTPUT_LAYERS = (4, 8, 12, 16, 20, 24, 28, 32)  # Qwen3-VL-4B hidden states the DiT reads
-CAPTION_TOKENS = 512  # tokens a caption may use: the health check's limit, and where encoding cuts a caption off
-MAX_TEXT_TOKENS = CAPTION_TOKENS  # the reference reads up to 4096, template included; 512 keeps caches and VRAM bounded
+# tokens a caption may use: the health check's limit, and where encoding cuts a caption off (before the chat
+# template goes round it, which stays whole). The reference reads up to 4096, template included; 512 keeps caches
+# and VRAM bounded
+CAPTION_TOKENS = 512
 PAD_MULTIPLE = 80
 IMAGE_ROPE_SCALE = 0.5  # image rows and columns step RoPE by half a position
 ALPHA = 16.0  # the schedule's shift, at every size
@@ -114,6 +116,17 @@ def prepare_reference(img: Image.Image, target_pixels: int, count: int = 1, flip
     if flip:
         img = ImageOps.mirror(img)
     return torch.from_numpy(np.asarray(img, dtype=np.float32) / 127.5 - 1.0).permute(2, 0, 1)[None]
+
+
+def templated(tok, prompt: str) -> tuple[str, int]:
+    """The prompt in the reference's chat template (one user turn, the generation prompt), its first
+    ``CAPTION_TOKENS`` tokens only, and the tokens it's padded to: a multiple of ``PAD_MULTIPLE``."""
+    ids = tok(prompt, add_special_tokens=False)["input_ids"]
+    if len(ids) > CAPTION_TOKENS:
+        prompt = tok.decode(ids[:CAPTION_TOKENS])
+    text = tok.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True)
+    real = len(tok(text)["input_ids"])
+    return text, math.ceil(real / PAD_MULTIPLE) * PAD_MULTIPLE
 
 
 class Flux3KleinDriver(FamilyDriver):
@@ -254,15 +267,17 @@ class Flux3KleinDriver(FamilyDriver):
         self.stream_text_encoder(model).eval()
         self.tokenizer, self.text_encoder = tokenizer, model
 
+    def cache_inputs(self, kind: str, settings: dict) -> dict:
+        inputs = super().cache_inputs(kind, settings)
+        # captions encoded before a long one was cut ahead of the template (``templated``) are encoded again
+        return {**inputs, "caption_cut": "before template"} if kind == "text" else inputs
+
     @torch.no_grad()
     def encode_prompt(self, prompt: str) -> torch.Tensor:
         """-> (L, 20480) bf16, L the templated prompt's tokens rounded up to a multiple of 80 (padding included)."""
         tok = self.tokenizer
-        text = tok.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False,
-                                       add_generation_prompt=True)
-        real = len(tok(text, truncation=True, max_length=MAX_TEXT_TOKENS)["input_ids"])
-        length = min(math.ceil(real / PAD_MULTIPLE) * PAD_MULTIPLE, MAX_TEXT_TOKENS)
-        enc = tok(text, return_tensors="pt", padding="max_length", truncation=True, max_length=length)
+        text, length = templated(tok, prompt)
+        enc = tok(text, return_tensors="pt", padding="max_length", max_length=length)
         ids = enc["input_ids"].to(self.device)
         mask = enc["attention_mask"].to(self.device)
         positions = (mask.long().cumsum(-1) - 1).masked_fill(mask == 0, 1)

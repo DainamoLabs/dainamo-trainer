@@ -8,6 +8,7 @@ import io
 import os
 import sys
 import tempfile
+import time
 
 if "dainamo.server.db" not in sys.modules:
     os.environ["DAINAMO_DATA"] = tempfile.mkdtemp(prefix="dainamo-test-")
@@ -77,7 +78,8 @@ def test_workflows_follow_the_model(profiles, tmp_path, monkeypatch):
 
 
 class FakeProc:
-    stdin = io.StringIO()
+    def __init__(self):
+        self.stdin = io.StringIO()  # its own: a stopped one's is closed
 
     def poll(self):
         return None
@@ -281,6 +283,31 @@ def test_prompt_encodings_keep_the_most_recently_used(monkeypatch):
     assert encoded[-1] == "p1" and "p0" in session.texts and "p2" not in session.texts
 
 
+def test_a_failed_encode_still_parks_the_text_encoder(monkeypatch):
+    """An encode that raises (out of memory, a bad reference image) moves the text encoder off the GPU as one that
+    worked does: left marked "gpu", later requests skipped parking and ran it beside the diffusion model."""
+    from dainamo.engine import sandbox
+
+    monkeypatch.setattr(sandbox, "emit", lambda *a, **kw: None)
+    session = sandbox.Session()
+
+    class Driver:
+        def encode_condition(self, prompt, images):
+            raise RuntimeError("CUDA out of memory")
+
+    session.driver, session.te_where = Driver(), "gpu"
+    parked = []
+
+    def park():
+        parked.append(True)
+        session.te_where = "cpu"
+
+    monkeypatch.setattr(session, "_park_text_encoder", park)
+    with pytest.raises(RuntimeError, match="out of memory"):
+        session.encode({"p": ("p", None)})
+    assert parked == [True] and session.te_where == "cpu" and "p" not in session.texts
+
+
 def test_another_model_file_reloads_what_came_from_the_last_one(monkeypatch):
     """A request's ``model`` in place of the profile's: the diffusion model reloads, and so do a text encoder and VAE
     bundled in its file (YuE2's), with what that text encoder encoded; a family with its own files keeps them."""
@@ -451,6 +478,31 @@ def test_what_is_sent_while_the_sandbox_unloads_runs_in_a_new_worker(monkeypatch
     m.state = "ready"  # one that's running takes the next as it is
     m.submit({"id": "r2", "params": {}}, 0, {"id": "p", "family": "krea2", "data": {}})
     assert started == [0, 0] and m.pending == ["m1", "r2"]
+
+
+def test_generate_right_after_release_runs_in_a_new_worker(monkeypatch):
+    """Release cancels what's queued and closes the worker's stdin; the "cancelled" events it answers with don't
+    make it "ready" again (Generate then wrote to the closed stdin, and the run failed when it exited)."""
+    import json
+
+    m = sbx.SandboxManager()
+    started = []
+
+    def start(gpu):
+        m.proc, m.gpu, m.state = Worker(), gpu, "starting"
+        started.append(gpu)
+
+    monkeypatch.setattr(m, "_start", start)
+    monkeypatch.setattr(db, "execute", lambda *a, **kw: None)  # (the runs' rows)
+    old = Worker()
+    m.proc, m.gpu, m.state, m.pending = old, 0, "ready", ["r0"]
+    m.release()
+    assert old.stdin.closed and m.state == "stopping"
+    m._on_event({"event": "cancelled", "id": "r0"})
+    assert m.state == "stopping" and not m.pending
+    m.submit({"id": "r1", "params": {}}, 0, {"id": "p", "family": "krea2", "data": {}})
+    assert old.code == 0 and started == [0]  # waited for the released one to exit, then started a new one
+    assert json.loads(m.proc.stdin.getvalue())["id"] == "r1"
 
 
 def test_checkpoint_grids_are_checked_and_labelled(profiles, monkeypatch, tmp_path):
@@ -643,7 +695,7 @@ def test_the_sandbox_makes_refmods(client, profiles, monkeypatch, tmp_path):
 
     monkeypatch.setattr(sbx, "gpu_count", lambda: 2)
     for k, v in (("proc", FakeProc()), ("gpu", 1), ("refmod", None), ("pending", []), ("current", None),
-                 ("state", "ready"), ("message", ""), ("progress", None), ("last_used", 0.0)):
+                 ("state", "ready"), ("message", ""), ("progress", None), ("last_used", time.time())):  # (not idle)
         monkeypatch.setattr(sbx.sandbox, k, v)
     monkeypatch.setattr(hardware, "gpus", lambda: [{"index": 1, "name": "RTX", "mem_used": 22000, "mem_total": 24576,
                                                     "util": 0, "temp": 40}])
@@ -1191,6 +1243,25 @@ def test_the_hires_fix_renders_again_bigger_from_the_upscaled_first_pass(gen_wor
     assert {(e["image"], e["steps"]) for e in progress} == {(1, 4), (2, 3)}
     assert any("upscaling to 128×96 with 4x" in (e.get("message") or "") for e in progress)
     assert events[-1]["event"] == "done"
+
+
+def test_the_hires_fix_samples_its_second_pass_with_a_condition_for_its_size(gen_worker, tmp_path, monkeypatch):
+    """An edit model's references are sized for the render (Qwen-Image Edit): the hi-res fix's second pass is
+    sampled with a condition made for its own size, not the first pass's (that failed on pass 2)."""
+    session, d, profile, *_ = gen_worker
+    d.sample_condition = lambda spec: (spec["prompt"], [f"refs for {spec['width']}x{spec['height']}"])
+    monkeypatch.setattr(session, "encode",
+                        lambda conds: session.texts.update({k: images[0] for k, (_, images) in conds.items()}))
+    used = []
+    sample = d.sample
+    d.sample = lambda model, cond, *a, **kw: used.append(cond) or sample(model, cond, *a, **kw)
+    hires = {"factor": 2, "model": "resize", "model_name": "Resize", "strength": 0.35, "steps": 3, "width": 128,
+             "height": 96}
+    msg = {"id": "g", "out_dir": str(tmp_path / "g"), "profile": profile,
+           "params": {"workflow": "t2i", "prompt": "a cat", "width": 64, "height": 48, "steps": 4, "seed": 5,
+                      "count": 1, "cfg": 1.0, "hires": hires}}
+    session.generate(msg, lambda: False)
+    assert used == ["refs for 64x48", "refs for 128x96"]
 
 
 def test_image_to_image_starts_from_the_input_and_compares_with_the_hires_fix_on_both(gen_worker, tmp_path):

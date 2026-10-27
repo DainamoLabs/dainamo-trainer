@@ -70,6 +70,8 @@ def sampling_sigmas(steps: int, seq_len: int, turbo: bool = False) -> list[float
     sigma lands on 0.02, then 0. Turbo uses its fixed schedule."""
     if turbo:
         return TURBO_SIGMAS + [0.0]
+    if steps <= 1:  # nothing to stretch: one step from noise straight to the image
+        return [1.0, 0.0]
     s = time_shift(mu_for(seq_len), torch.from_numpy(np.linspace(1.0, 1.0 / steps, steps)).float())
     one_minus = 1.0 - s
     s = 1.0 - one_minus / (one_minus[-1] / (1.0 - SHIFT_TERMINAL))

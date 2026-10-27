@@ -24,7 +24,8 @@ psutil.cpu_percent(None)  # the first reading starts the count: the next one is 
 
 
 def gpus() -> list[dict]:
-    """[{index, name, mem_used, mem_total (MiB), util (%), temp (°C)}] for each NVIDIA GPU; [] without any."""
+    """[{index, name, mem_used, mem_total (MiB), util (%), temp (°C)}] for each NVIDIA GPU; [] without any. A value
+    nvidia-smi doesn't report ("[N/A]": a GPU without a sensor, or one sharing system memory) is None."""
     global _gpu_cache
     with _gpu_lock:
         at, cached = _gpu_cache
@@ -37,13 +38,23 @@ def gpus() -> list[dict]:
                                  capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL,
                                  creationflags=subprocess.CREATE_NO_WINDOW if WINDOWS else 0).stdout
             for line in out.strip().splitlines():
-                i, name, used, total, util, temp = [x.strip() for x in line.split(",")]
-                found.append({"index": int(i), "name": name, "mem_used": int(used), "mem_total": int(total),
-                              "util": int(util), "temp": int(temp)})
-        except (OSError, subprocess.SubprocessError, ValueError):
+                fields = [x.strip() for x in line.split(",")]
+                if len(fields) != 6 or not fields[0].isdigit():
+                    continue  # not a GPU's line (a warning nvidia-smi printed)
+                i, name, used, total, util, temp = fields
+                found.append({"index": int(i), "name": name, "mem_used": _number(used), "mem_total": _number(total),
+                              "util": _number(util), "temp": _number(temp)})
+        except (OSError, subprocess.SubprocessError):
             found = []
         _gpu_cache = (time.monotonic(), found)
         return found
+
+
+def _number(v: str) -> int | None:
+    try:
+        return int(float(v))
+    except ValueError:
+        return None
 
 
 def short_cpu_name(name: str) -> str:

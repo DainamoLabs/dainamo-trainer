@@ -618,6 +618,21 @@ def test_encode_prompt_matches_the_reference_text_encoder(tmp_path, monkeypatch)
     assert d.encode_prompt("").shape[0] == 80
 
 
+def test_a_long_caption_is_cut_before_the_template_goes_round_it():
+    """A caption over CAPTION_TOKENS loses its end, not the chat template's (the whole templated text was cut at
+    512, dropping the turn's end and the generation prompt, at a length that isn't a multiple of 80)."""
+    from dainamo.engine.hf_assets import qwen3vl_tokenizer_and_config
+
+    tok, _ = qwen3vl_tokenizer_and_config()
+    tail = tok.apply_chat_template([{"role": "user", "content": "x"}], tokenize=False,
+                                   add_generation_prompt=True).split("x")[-1]
+    for words in (5, 2000):
+        text, length = D.templated(tok, "a red apple " * words)
+        n = len(tok(text)["input_ids"])
+        assert text.endswith(tail) and length % D.PAD_MULTIPLE == 0 and n <= length < n + D.PAD_MULTIPLE
+    assert len(tok(text)["input_ids"]) < D.CAPTION_TOKENS + 40  # the caption cut at 512, plus the template
+
+
 # --- files --------------------------------------------------------------------------------------------------------
 def test_distilled_and_unfused_files_are_refused(tmp_path):
     d = Flux3KleinDriver({"diffusion_model": "x.safetensors"}, CPU)

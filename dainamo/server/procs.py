@@ -21,8 +21,11 @@ def detached() -> dict:
 
 
 def worker_env(gpu: int | None) -> dict:
-    """The environment for a worker on ``gpu`` (None: no GPU, the CPU only)."""
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES="" if gpu is None else str(gpu), PYTHONUNBUFFERED="1",
+    """The environment for a worker on ``gpu`` (None: no GPU, the CPU only). ``gpu`` is nvidia-smi's index, which
+    is in PCI bus order: CUDA numbers GPUs fastest first unless told otherwise, so on mixed GPUs the worker would
+    run on another card than the one the UI shows."""
+    env = dict(os.environ, CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES="" if gpu is None else str(gpu),
+               PYTHONUNBUFFERED="1",
                PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
     env.pop("DAINAMO_PASSWORD", None)
     if not WINDOWS:  # PyTorch doesn't support expandable segments on Windows and warns about it

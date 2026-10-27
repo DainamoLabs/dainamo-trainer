@@ -119,7 +119,9 @@ def send(cfg: dict, msg: dict) -> None:
     """Deliver one message; raises with a readable reason on failure."""
     url, kind = cfg["url"], cfg.get("kind", "ntfy")
     text = msg["body"] or msg["title"]
-    with httpx.Client(timeout=10, follow_redirects=True) as c:
+    # no redirects, and no reply text in the error: a webhook URL is any address the user types, and the test
+    # button would otherwise read back pages of services on this machine or network
+    with httpx.Client(timeout=10, follow_redirects=False) as c:
         if kind == "ntfy":
             params = {"title": msg["title"], "tags": NTFY_TAGS.get(msg["status"], "")}
             if msg["status"] in ("failed", "interrupted"):
@@ -137,8 +139,11 @@ def send(cfg: dict, msg: dict) -> None:
         else:
             r = c.post(url, json={"event": msg.get("event", f"job_{msg['status']}"), "title": msg["title"], "message": msg["body"],
                                   "url": msg["url"], "job_id": msg["job_id"], "status": msg["status"]})
+    if r.is_redirect:
+        raise RuntimeError(f"{r.status_code} {r.reason_phrase}: the webhook URL moved to {r.headers.get('location')}; "
+                           "use that address")
     if r.status_code >= 400:
-        raise RuntimeError(f"{r.status_code} {r.reason_phrase}: {_clip(r.text, 200)}")
+        raise RuntimeError(f"{r.status_code} {r.reason_phrase}")
 
 
 def _send_logged(cfg: dict, msg: dict) -> None:

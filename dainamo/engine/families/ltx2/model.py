@@ -61,6 +61,8 @@ def time_shift(mu: float, sigma):
 def shifted_sigmas(steps: int, video_tokens: int, shift: float | None = None) -> list[float]:
     """The non-distilled schedule: linear from 1 to 1/steps, shifted (by the token count's mu, or e^mu =
     ``shift``), stretched so the last step is SHIFT_TERMINAL, then 0."""
+    if steps <= 1:  # nothing to stretch: one step from noise straight to the image
+        return [1.0, 0.0]
     mu = math.log(shift) if shift is not None else mu_for(video_tokens)
     base = [1.0 - i * (1.0 - 1.0 / steps) / max(1, steps - 1) for i in range(steps)]
     s = [time_shift(mu, x) for x in base]

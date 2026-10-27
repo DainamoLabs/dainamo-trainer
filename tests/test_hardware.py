@@ -88,6 +88,18 @@ def test_gpus_come_from_nvidia_smi_once_a_second(monkeypatch):
     assert hardware.gpus() == []  # no NVIDIA GPU or driver
 
 
+def test_a_value_nvidia_smi_doesnt_report_leaves_the_gpu_listed(monkeypatch):
+    """One "[N/A]" (a GPU without a fan or temperature sensor, or one sharing system memory) emptied the whole list."""
+    out = ("0, NVIDIA GeForce RTX 3090, 596, 24576, 37, 61\n"
+           "1, NVIDIA GB10, [N/A], [N/A], 5, [N/A]\n"
+           "WARNING: infoROM is corrupted at gpu 0000:02:00.0\n")
+    monkeypatch.setattr(hardware.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout=out))
+    monkeypatch.setattr(hardware, "_gpu_cache", (0.0, []))
+    assert hardware.gpus() == [
+        {"index": 0, "name": "NVIDIA GeForce RTX 3090", "mem_used": 596, "mem_total": 24576, "util": 37, "temp": 61},
+        {"index": 1, "name": "NVIDIA GB10", "mem_used": None, "mem_total": None, "util": 5, "temp": None}]
+
+
 def test_the_api_reports_gpus_cpu_and_ram():
     from fastapi.testclient import TestClient
 
@@ -100,3 +112,12 @@ def test_the_api_reports_gpus_cpu_and_ram():
     assert cpu["name"] and 0 <= cpu["percent"] <= 100 and cpu["threads"] >= cpu["cores"] >= 1
     assert cpu["temp"] is None or 0 < cpu["temp"] < 130
     assert 0 < ram["used_gb"] < ram["total_gb"] and abs(ram["used_gb"] + ram["available_gb"] - ram["total_gb"]) < 1e-6
+
+
+def test_workers_number_gpus_as_nvidia_smi_does():
+    """nvidia-smi lists GPUs in PCI bus order and CUDA fastest first: a worker told GPU 1 must run on the card the UI
+    shows as GPU 1 when the cards differ."""
+    from dainamo.server import procs
+
+    env = procs.worker_env(1)
+    assert (env["CUDA_DEVICE_ORDER"], env["CUDA_VISIBLE_DEVICES"]) == ("PCI_BUS_ID", "1")

@@ -34,6 +34,7 @@ def test_frames_schedules_and_audio_length():
     s = M.shifted_sigmas(30, 4096)
     assert len(s) == 31 and s[0] == pytest.approx(1.0) and s[-2] == pytest.approx(M.SHIFT_TERMINAL) and s[-1] == 0
     assert all(a > b for a, b in zip(s, s[1:]))
+    assert M.shifted_sigmas(1, 4096) == [1.0, 0.0]  # one step: noise to image (it divided by zero)
     d = LTX25Driver({"variant": "distilled"}, torch.device("cpu"))
     assert d._schedule("default", 8, 4096, None) == M.DISTILLED_SIGMAS + [0.0]
     assert (d.sample_steps(), d.cfg_scale(None)) == (8, 1.0)

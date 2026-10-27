@@ -60,14 +60,16 @@ export type GpuTarget = { label: string; totalGb: number } | null;
 
 /** The GPU a job or generation is compared against: the chosen one, else the smallest. */
 export function gpuTarget(gpus: Gpu[] | undefined, chosen: string | number | null | undefined): GpuTarget {
-  if (!gpus?.length) return null;
+  // a GPU whose memory isn't reported has nothing to compare against
+  const known = (gpus || []).filter((g): g is Gpu & { mem_total: number } => g.mem_total != null);
+  if (!known.length) return null;
   const pick = chosen === "auto" || chosen == null || chosen === ""
-    ? gpus.reduce((a, b) => (b.mem_total < a.mem_total ? b : a))
-    : gpus.find((g) => g.index === Number(chosen));
+    ? known.reduce((a, b) => (b.mem_total < a.mem_total ? b : a))
+    : known.find((g) => g.index === Number(chosen));
   if (!pick) return null;
   const name = pick.name.replace("NVIDIA GeForce ", "").replace("NVIDIA ", "");
   const auto = chosen === "auto" || chosen == null || chosen === "";
-  return { label: `GPU ${pick.index} · ${name}${auto && gpus.length > 1 ? " (the smallest)" : ""}`, totalGb: pick.mem_total / 1024 };
+  return { label: `GPU ${pick.index} · ${name}${auto && known.length > 1 ? " (the smallest)" : ""}`, totalGb: pick.mem_total / 1024 };
 }
 
 const MARGIN_GB = 0.75; // headroom "Fit to GPU" leaves for estimate error and other processes

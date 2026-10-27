@@ -90,6 +90,7 @@ export default function App() {
   const [tasks] = usePoll<BackgroundTask[]>(ready ? "/api/tasks" : null, 4000);
   useJobAlerts(jobs, (id) => go("queue", id));
   const waiting = jobs?.filter((j) => j.status === "queued").length || 0;
+  const readyJobs = jobs?.filter((j) => j.status === "ready").length || 0; // added, waiting for Start
   const families = system?.families || [];
 
   if (!auth) return null;
@@ -97,7 +98,7 @@ export default function App() {
 
   return (
     <div className="app">
-      <TopBar tab={route.tab} arg={route.arg} jobs={jobs} gpus={system?.gpus || []} ram={system?.ram} waiting={waiting} tasks={tasks || []} />
+      <TopBar tab={route.tab} arg={route.arg} jobs={jobs} gpus={system?.gpus || []} ram={system?.ram} waiting={waiting} ready={readyJobs} tasks={tasks || []} />
       <main className="main">
         <PageError key={route.tab}>
           {route.tab === "create" && <CreateJob families={families} />}

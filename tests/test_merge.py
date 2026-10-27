@@ -121,6 +121,22 @@ def test_a_kohya_lora_merges_as_the_same_lora_in_peft_keys(tmp_path, layers):
     assert merge.describe(kohya, layers)["matched"] == len(LINEARS)
 
 
+def test_loras_that_spell_a_layer_differently_are_merged_together(tmp_path, layers):
+    """A kohya (``lora_unet_``) and a ``diffusion_model.`` LoRA name the same layers: each layer's changes stack,
+    rather than one input's overwriting the other's."""
+    a = lora(tmp_path / "a.safetensors", 4, 4.0, 1)
+    b = lora(tmp_path / "b.safetensors", 2, 2.0, 2, kohya=True)
+    out = str(tmp_path / "m.safetensors")
+    made = merge.merge([(a, 1.0), (b, 0.5)], out, 0, layers, "cpu")
+    assert made["layers"] == len(LINEARS) and made["kept"] == 1.0
+    assert load_file(out)["diffusion_model.blocks.0.attn.lora_A.weight"].shape == (6, D)
+    same_b = lora(tmp_path / "b_peft.safetensors", 2, 2.0, 2)  # b's tensors under PEFT keys, as change() reads them
+    want, got = summed((a, 1.0), (same_b, 0.5)), change(out)
+    assert set(got) == set(want)
+    for k in want:
+        assert torch.allclose(got[k], want[k], atol=2e-3 * want[k].abs().max())
+
+
 def test_a_lokr_merges_only_at_a_rank(tmp_path, layers):
     g = torch.Generator().manual_seed(4)
     sd = {}

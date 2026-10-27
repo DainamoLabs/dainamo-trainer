@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import traceback
 
 import httpx
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -307,8 +308,14 @@ class CaptionJob:
                     if self.cancelled:
                         break
                     self.current = f
+                    if not self.overwrite and read_caption(f):  # captioned by hand since the run began: kept
+                        self.done += 1
+                        continue
                     try:
                         cap = apply_trigger(caption_file(f, cfg, client, self.span, heard.get(f)), self.trigger)
+                        if not self.overwrite and read_caption(f):  # or while the LLM wrote this one
+                            self.done += 1
+                            continue
                         with open(caption_path(f), "w", encoding="utf-8") as fh:
                             fh.write(cap)
                     except httpx.ConnectError:
@@ -323,6 +330,10 @@ class CaptionJob:
         except LlamaError as e:
             if not self.cancelled:
                 self.errors.append(str(e))
+        except Exception as e:  # anything else ends the run, said in the UI rather than only the server's console
+            traceback.print_exc()
+            if not self.cancelled:
+                self.errors.append(f"{type(e).__name__}: {e}")
         finally:
             self.running = False
             self.current = ""

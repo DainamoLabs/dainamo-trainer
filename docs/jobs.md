@@ -7,7 +7,10 @@
 ## New job
 
 Pick a profile, the datasets and the training settings, then add the job to the
-queue. The sidebar sums up the run (its datasets, epochs, saves and file size)
+queue. **Add to queue** leaves it there ready to start, until you press
+**Start** on it (or **Start all** when several are ready), so you can line up
+jobs and check them first; **Add and start** queues it to run at once. The
+sidebar sums up the run (its datasets, epochs, saves and file size)
 and estimates its memory; when **Add to queue** is greyed out, the line under it
 says what's missing.
 
@@ -47,7 +50,9 @@ Besides a LoRA, a job can make:
   ([RefMods](refmods.md)).
 
 **Sample prompts** are cards. Width, height, seed and LoRA strength left blank
-use the Sampling defaults. **Likeness score** (on by default for image and
+use the Sampling defaults. A video model's card also has **Frames**: blank is
+the family's default, shown in the field, and 1 renders a still image. The VRAM
+projection counts the largest card. **Likeness score** (on by default for image and
 video models) measures how much each sample looks like the training images,
 from 0% (the base model's render of the card) to 100% (as alike as the training
 images are to each other), and flags a sample that's a near copy of one training
@@ -76,7 +81,9 @@ of these settings, it has EMA weights and the noise range.
 
 ## Queue
 
-Each job's card shows a small loss curve once it has 10 steps, so you can spot a
+New jobs sit under **Ready to start** until you start them; a started job goes
+behind the jobs already waiting. Merges and LoRA extractions, resumes and
+restarts join the queue straight away. Each job's card shows a small loss curve once it has 10 steps, so you can spot a
 run going wrong without opening it. **Settings** sets the queue mode (one job at
 a time, several on one GPU, or spread across GPUs) and which GPUs to use. Jobs
 start in order; one pinned to a GPU that's busy or held by the Sandbox lets the
@@ -100,12 +107,17 @@ A job's files are in `data/jobs/<name>_<id>/`, named when the job is added;
 renaming the job later doesn't move them. Jobs added before folders had names
 keep `data/jobs/<id>/`.
 
-On its page you can stop a job (it saves its state), cancel it while it waits,
+On its page you can stop a job (it saves its state), start it when it's ready, cancel it while it waits,
 force a stopping one to stop now, resume it from its last save or restart it
 from step 0 (after asking), take samples or a checkpoint now, duplicate its
 settings into a new job, or delete it. A job with no save to resume from offers
 only Restart. A finetune's page also extracts a LoRA from one of its
 checkpoints ([Merge and extract](merge-and-extract.md)).
+
+A stopping job finishes the sample or save it's in first. It's forced to stop
+only after three minutes in which it writes nothing, so a slow disk doesn't cut
+a save short. A job the system kills unasked, such as by running out of memory,
+is marked failed and sends the failure notification.
 
 **Edit** opens a job that isn't running in the New job form. Before it has
 trained, anything can change. After that, it carries on from its last save with
@@ -117,7 +129,10 @@ optimizer and slider can't change, since the saved state wouldn't fit them.
 While the checkpoint picker or concept bleed is on, what it scores can't change
 either (for the picker: datasets, resolution, clip length, seed, timestep
 sampling, noise range and masked loss). Changing one of these restarts the job
-from step 0, after asking.
+from step 0, after asking. The model is the profile's family, diffusion model
+file, training adapter and variant: renaming the profile, or picking another
+profile with the same model and other sampling settings, carries on. The job
+keeps training with the model files it started with.
 
 **Continue training** gives a finished job more steps, picking up with the same
 optimizer state. Its final LoRA so far is kept as `name_002000.safetensors`,
@@ -186,4 +201,6 @@ The server can also post to **ntfy**, **Discord**, **Slack**, or any URL as
 **JSON** (`{event, title, message, url, job_id, status}`), for the endings you
 choose: finished, failed (or interrupted), stopped. Messages carry the step,
 average loss, duration and LoRA file name, or the error. Set the app's address
-to link to the job. **Send a test** checks the setup.
+to link to the job. **Send a test** checks the setup. It reports the reply's
+status, not its text, and a webhook URL that redirects isn't followed: the
+error names the new address to use instead.

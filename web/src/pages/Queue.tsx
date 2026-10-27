@@ -13,7 +13,7 @@ import { IconCamera, IconCheck, IconCopy, IconDatabase, IconDown, IconDownload, 
 import { AudioCard, ConfirmDialog, Empty, Lightbox, LoadError, Modal, SelectBar, StatusPill, fmtSize, someNames, usePoll, useSelection, useToast, type Selection } from "../components/ui";
 import { SamplesPanel } from "../components/Samples";
 import { Terminal } from "../components/Terminal";
-import { CLONE_KEY, formOf } from "./CreateJob";
+import { CLONE_KEY, formOf, jobProfile } from "./CreateJob";
 
 export const PHASES: Record<string, string> = {
   starting: "Starting", preparing: "Scanning datasets", caching_text: "Encoding captions", caching_latents: "Encoding training files",
@@ -36,6 +36,7 @@ function useJobAction(): [(job: Acting, action: string, after?: () => void) => v
       const msg: Record<string, string> = {
         stop: job.evaluating ? (job.status === "queued" ? "Checkpoint evaluation cancelled" : "Stopping the checkpoint evaluation")
           : job.status === "queued" ? "Cancelled" : job.status === "stopping" ? "Forcing it to stop" : again ? "Stopping" : "Stopping: saving its state first",
+        start: "Started: it's queued for a free GPU",
         sample: "Sample requested", save: "Save requested", resume: again || "Queued to resume from its last save",
         restart: again || "Queued to train again from step 0",
       };
@@ -162,7 +163,7 @@ function JobRow({ j, reload, queuedIndex, queuedCount, size, sel }: { j: Job; re
           {j.assigned_gpu != null && active && <span>GPU {j.assigned_gpu}</span>}
           {j.gpu !== "auto" && !active && <span>pinned GPU {j.gpu}</span>}
           <span>{j.evaluating ? (j.status === "queued" ? "checkpoint evaluation queued" : "evaluating checkpoints")
-            : j.status === "queued" ? `queued ${fmtTime(j.created)}` : j.finished ? `finished ${fmtTime(j.finished)}` : j.started ? `started ${fmtTime(j.started)}` : ""}</span>
+            : j.status === "queued" ? `queued ${fmtTime(j.created)}` : j.status === "ready" ? `added ${fmtTime(j.created)}` : j.finished ? `finished ${fmtTime(j.finished)}` : j.started ? `started ${fmtTime(j.started)}` : ""}</span>
           {j.recommended && <span className="rec-meta">★ step {j.recommended.step} recommended</span>}
           {size ? <span title="On disk">{fmtSize(size)}</span> : null}
         </div>
@@ -193,13 +194,14 @@ function JobRow({ j, reload, queuedIndex, queuedCount, size, sel }: { j: Job; re
           <button className="btn icon" title="Move up" disabled={queuedIndex === 0} onClick={() => act(j, "up", reload)}><IconUp /></button>
           <button className="btn icon" title="Move down" disabled={queuedIndex === queuedCount - 1} onClick={() => act(j, "down", reload)}><IconDown /></button>
         </>}
+        {j.status === "ready" && <button className="btn primary" title="Queue it to run when a GPU is free" onClick={() => act(j, "start", reload)}><IconPlay /> Start</button>}
         {(j.status === "running" || j.status === "queued") && <button className="btn" onClick={() => act(j, "stop", reload)}><IconStop /> {j.status === "queued" ? "Cancel" : "Stop"}</button>}
         {j.status === "stopping" && <button className="btn danger" onClick={() => act(j, "stop", reload)}>Force stop</button>}
         {["stopped", "failed", "interrupted"].includes(j.status) && (once
           ? <button className="btn primary" onClick={() => act(j, "restart", reload)}><IconRefresh /> {j.refmod ? "Make again" : j.extract ? "Extract again" : "Merge again"}</button>
           : j.resumable ? <button className="btn primary" onClick={() => act(j, "resume", reload)}><IconPlay /> Resume</button>
           : <button className="btn primary" title="It saved no training state to resume from" onClick={() => act(j, "restart", reload)}><IconRefresh /> Restart</button>)}
-        {!active && j.status !== "queued" && !j.extract && !j.merge && <button className="btn icon" title="Duplicate settings into a new job" onClick={() => cloneJob(j.id)}><IconCopy /></button>}
+        {!active && j.status !== "queued" && j.status !== "ready" && !j.extract && !j.merge && <button className="btn icon" title="Duplicate settings into a new job" onClick={() => cloneJob(j.id)}><IconCopy /></button>}
         {!active && <button className="btn icon danger" title="Delete" onClick={() => setConfirmDel(true)}><IconTrash /></button>}
       </div>}
       {confirmDel && (
@@ -414,7 +416,7 @@ function MergeCard({ job, made }: { job: JobDetail; made?: MergeMade }) {
 
 // a training job's page shows one of these below its status, chosen by the tabs (and kept in the URL)
 type View = "samples" | "loss" | "checkpoints" | "log";
-const VIEWS: [View, string][] = [["samples", "Samples"], ["loss", "Loss"], ["checkpoints", "Checkpoints"], ["log", "Log"]];
+const VIEWS: [View, string][] = [["log", "Log"], ["samples", "Samples"], ["loss", "Loss"], ["checkpoints", "Checkpoints"]];
 const isView = (v?: string): v is View => VIEWS.some(([k]) => k === v);
 
 function JobDetailView({ id, view, families }: { id: string; view?: string; families: Family[] }) {
@@ -448,8 +450,9 @@ function JobDetailView({ id, view, families }: { id: string; view?: string; fami
   const made = st.refmod;
   const jobPath = `${job.dir}/output/`;
   const checkpoints = st.checkpoints || [];
-  // until a tab is picked: a failed job opens on its log, which says why
-  const tab: View = picked || (["failed", "interrupted"].includes(job.status) ? "log" : "samples");
+  // until a tab is picked: a job opens on its log, which shows what it's doing now (or why it failed);
+  // a completed one opens on its samples, the result
+  const tab: View = picked || (job.status === "completed" ? "samples" : "log");
   const pickTab = (v: View) => {
     setPicked(v);
     // in place: Back still leaves the job page rather than stepping through its tabs
@@ -487,6 +490,7 @@ function JobDetailView({ id, view, families }: { id: string; view?: string; fami
             </>}
             <button className="btn" onClick={() => act({ ...job, refmod, extract, merge }, "stop", reload)}><IconStop /> Stop</button>
           </>}
+          {job.status === "ready" && <button className="btn primary" title="Queue it to run when a GPU is free" onClick={() => act(job, "start", reload)}><IconPlay /> Start</button>}
           {job.status === "queued" && !evaluating && <button className="btn" onClick={() => act(job, "stop", reload)}><IconStop /> Cancel</button>}
           {job.status === "stopping" && <button className="btn danger" title="Stop it now, without waiting for it to save" onClick={() => act(job, "stop", reload)}>Force stop</button>}
           {evaluating && ["queued", "running"].includes(job.status) && (
@@ -583,7 +587,7 @@ function JobDetailView({ id, view, families }: { id: string; view?: string; fami
         ))}
       </div>
 
-      {tab === "samples" && <SamplesPanel jobId={job.id} samples={st.samples || []} slider={slider} datasets={job.datasets} />}
+      {tab === "samples" && <SamplesPanel jobId={job.id} samples={st.samples || []} slider={slider} datasets={(job.config?.datasets || []).map((d: { id: string }) => d.id)} />}
 
       {tab === "loss" && (
         <div className="card card-pad" style={{ marginBottom: 16 }}>
@@ -642,7 +646,7 @@ function JobDetailView({ id, view, families }: { id: string; view?: string; fami
       {evaluate && <EvaluateDialog job={job} onClose={() => setEvaluate(false)} onQueued={() => { reload(); pickTab("checkpoints"); }} />}
       {extend && <ContinueDialog job={job} onClose={() => setExtend(false)} onQueued={reload} />}
       {extractFrom && family && (profiles || profilesErr) && (
-        <ExtractLora family={family} profile={profiles?.find((p) => p.name === job.config?.profile_name) || null}
+        <ExtractLora family={family} profile={(profiles && jobProfile(job.config, profiles)) || null}
           start={{ jobId: job.id, file: extractFrom.file }} dialog={{ onClose: () => setExtractFrom(null) }} />
       )}
       {deleting && (
@@ -722,6 +726,25 @@ function QueueList({ jobs, reload, error }: { jobs: Job[] | null; reload: () => 
   const shared = disk?.shared_cache || { total: 0, in_use: 0 };
   const running = jobs?.filter((j) => j.status === "running" || j.status === "stopping") || [];
   const queued = jobs?.filter((j) => j.status === "queued") || [];
+  // added and waiting for Start, oldest first (Start all queues them in that order)
+  const ready = (jobs?.filter((j) => j.status === "ready") || []).sort((a, b) => a.created - b.created);
+  const [starting, setStarting] = useState(false);
+  const startAll = async () => {
+    setStarting(true);
+    let started = 0;
+    const failed: string[] = [];
+    for (const j of ready) {
+      try {
+        await api.post(`/api/jobs/${j.id}/action`, { action: "start" });
+        started++;
+      } catch (e: any) {
+        failed.push(`${j.name}: ${e.message}`);
+      }
+    }
+    toast(`Started ${started} job${started === 1 ? "" : "s"}${failed.length ? `; couldn't start ${failed.join("; ")}` : ""}`, failed.length > 0);
+    setStarting(false);
+    reload();
+  };
   // Select: several jobs deleted at once (not running ones)
   const sel = useSelection();
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -747,7 +770,7 @@ function QueueList({ jobs, reload, error }: { jobs: Job[] | null; reload: () => 
     reloadDisk();
   };
   const queuedChosen = chosen.filter((j) => j.status === "queued").length;
-  const done = (jobs?.filter((j) => !["running", "stopping", "queued"].includes(j.status)) || []).sort((a, b) => (b.finished || b.created) - (a.finished || a.created));
+  const done = (jobs?.filter((j) => !["running", "stopping", "queued", "ready"].includes(j.status)) || []).sort((a, b) => (b.finished || b.created) - (a.finished || a.created));
   return (
     <div className="page">
       <div className="page-head">
@@ -762,7 +785,8 @@ function QueueList({ jobs, reload, error }: { jobs: Job[] | null; reload: () => 
       {error && !jobs && <LoadError what="the jobs" error={error} onRetry={reload} />}
       {jobs && jobs.length === 0 && (
         <Empty icon={<IconServer />} title="No jobs yet" action={<a className="btn primary lg" href="#/create"><IconPlus /> New job</a>}>
-          Start one with New job: it waits here for a free GPU, and its samples, loss and log show on its page.
+          Make one with New job: it waits here until you press Start, then for a free GPU, and its samples, loss
+          and log show on its page.
         </Empty>
       )}
       {sel.on && (
@@ -778,10 +802,16 @@ function QueueList({ jobs, reload, error }: { jobs: Job[] | null; reload: () => 
             {queuedChosen > 0 && ` ${queuedChosen === chosen.length ? (queuedChosen === 1 ? "It's" : "They're") : `${queuedChosen} of them ${queuedChosen === 1 ? "is" : "are"}`} queued, and won't run.`}</>}
           checkbox={`Also delete their files from disk (${fmtSize(chosen.reduce((n, j) => n + (disk?.jobs[j.id]?.total || 0), 0))}): LoRAs or finetuned models, samples and training state`} />
       )}
-      {[["In progress", running], ["Queued", queued], ["Finished", done]].map(([title, list]) =>
+      {[["In progress", running], ["Ready to start", ready], ["Queued", queued], ["Finished", done]].map(([title, list]) =>
         (list as Job[]).length > 0 && (
           <div key={title as string} className="job-group">
-            <div className="section-title">{title as string} · {(list as Job[]).length}</div>
+            <div className="section-title row">
+              <span>{title as string} · {(list as Job[]).length}</span>
+              {list === ready && ready.length > 1 && !sel.on && <>
+                <span className="spacer" />
+                <button className="btn sm primary" disabled={starting} onClick={startAll}><IconPlay /> {starting ? "Starting…" : "Start all"}</button>
+              </>}
+            </div>
             <div className="stack" style={{ gap: 10 }}>
               {(list as Job[]).map((j, i) => <JobRow key={j.id} j={j} reload={reload} queuedIndex={i} queuedCount={(list as Job[]).length} size={disk?.jobs[j.id]?.total} sel={sel} />)}
             </div>

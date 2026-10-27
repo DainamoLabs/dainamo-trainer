@@ -39,7 +39,7 @@ def test_job_settings_validated(client, tmp_path):
     did = client.post("/api/datasets", json={"name": "d", "path": str(tmp_path)}).json()["id"]
     base = {"name": "j", "profile_id": pid, "datasets": [{"id": did}], "gpu": "auto"}
     for bad in ({"rank": 0}, {"steps": -5}, {"learning_rate": "abc"}, {"optimizer": "sgd"}, {"offload": 101},
-                {"offload": -1}):
+                {"offload": -1}, {"dropout": 1}, {"dropout": 1.5}, {"caption_dropout": 1.5}):
         r = client.post("/api/jobs", json={**base, "settings": bad})
         assert r.status_code == 400, bad
     assert client.post("/api/jobs", json={**base, "gpu": "1; rm -rf", "settings": {}}).status_code == 400
@@ -280,7 +280,11 @@ def test_job_folders_are_named_after_the_job(client, tmp_path):
                                            "settings": {}}).json() for name in ("My LoRA: v1/2", "My LoRA: v1/2", "日本")]
     assert [os.path.basename(job_dir(j["id"])) for j in jobs] == \
         [f"My_LoRA_v1_2_{jobs[0]['id']}", f"My_LoRA_v1_2_{jobs[1]['id']}", jobs[2]["id"]]  # same name, own folder
-    assert client.get(f"/api/jobs/{jobs[0]['id']}").json()["dir"] == job_dir(jobs[0]["id"])
+    detail = client.get(f"/api/jobs/{jobs[0]['id']}").json()
+    assert detail["dir"] == job_dir(jobs[0]["id"])
+    # the job page reads what the Queue lists (its media, recommendation, datasets...) beside the config
+    assert detail["media"] == ["image"] and detail["recommended"] is None and detail["datasets"] == ["jf"]
+    assert detail["config"]["datasets"][0]["id"] == did and detail["resumable"] is False
     # renaming a job leaves its files where they are
     edit = {"name": "renamed", "profile_id": pid, "datasets": [{"id": did}], "settings": {}}
     assert client.put(f"/api/jobs/{jobs[0]['id']}", json=edit).status_code == 200
@@ -425,6 +429,9 @@ def test_sign_in_guards_the_api():
         link = TestClient(app)
         r = link.get("/sandbox?key=hunter2&x=1", follow_redirects=False)
         assert r.status_code == 303 and r.headers["location"] == "/sandbox?x=1"  # the key leaves the address bar
+        for key in ("hunter2", "wrong"):  # never to another site, signed in or not
+            r = TestClient(app).get("http://testserver//evil.example/x?key=" + key, follow_redirects=False)
+            assert r.status_code == 303 and r.headers["location"] == "/evil.example/x"
         assert link.get("/api/settings").status_code == 200
         auth.enable("changed")  # a new password signs every browser out
         assert c.get("/api/settings").status_code == 401 and link.get("/api/settings").status_code == 401
@@ -434,6 +441,19 @@ def test_sign_in_guards_the_api():
     finally:
         auth.enable(None)
     assert TestClient(app).get("/api/settings").status_code == 200
+
+
+def test_requests_from_other_websites_are_refused(client):
+    release = "/api/sandbox/release"
+    assert client.post(release, headers={"sec-fetch-site": "cross-site"}).status_code == 403
+    assert client.post(release, headers={"sec-fetch-site": "same-site"}).status_code == 403  # another port
+    assert client.post(release, headers={"sec-fetch-site": "same-origin"}).status_code == 200
+    assert client.post(release).status_code == 200  # a script
+    # a browser that doesn't send Sec-Fetch-Site: its Origin must be this server
+    assert client.post(release, headers={"origin": "https://evil.example"}).status_code == 403
+    assert client.post(release, headers={"origin": "http://testserver"}).status_code == 200
+    # reading is never refused (a link or an image from another page is harmless)
+    assert client.get("/api/settings", headers={"sec-fetch-site": "cross-site"}).status_code == 200
 
 
 @pytest.fixture
@@ -448,6 +468,11 @@ def hook():
         def do_POST(self):
             body = self.rfile.read(int(self.headers.get("content-length", 0)))
             got.append({"path": self.path, "body": body, "type": self.headers.get("content-type", "")})
+            if "moved" in self.path:
+                self.send_response(301)
+                self.send_header("location", "https://elsewhere.example/hook")
+                self.end_headers()
+                return
             self.send_response(404 if "fail" in self.path else 200)
             self.end_headers()
             self.wfile.write(b"no such hook" if "fail" in self.path else b"ok")
@@ -477,7 +502,10 @@ def test_notification_settings_and_test_messages(client, hook):
     client.post("/api/notifications/test", json={"url": f"{url}/discord", "kind": "discord"})
     assert json.loads(got[-1]["body"])["content"].startswith("**Dainamo Trainer test**")
     r = client.post("/api/notifications/test", json={"url": f"{url}/fail", "kind": "json"}).json()
-    assert not r["ok"] and "404" in r["error"]
+    assert not r["ok"] and "404" in r["error"] and "no such hook" not in r["error"]  # the reply isn't read back
+    r = client.post("/api/notifications/test", json={"url": f"{url}/moved", "kind": "json"}).json()
+    assert not r["ok"] and "https://elsewhere.example/hook" in r["error"]  # not followed
+    assert not any("elsewhere" in g["path"] for g in got)
     client.put("/api/settings", json={"notifications": {"link": ""}})
 
 
@@ -610,7 +638,7 @@ def test_checkpoint_evaluation_queues_and_puts_the_job_back(client, hook, tmp_pa
         def poll(self):
             return self.code
 
-    def run_to_end(code, evaluation, phase="evaluating"):
+    def run_to_end(code, evaluation, phase="evaluating", asked_to_stop=False):
         """Queue it, pretend it ran (writing ``evaluation`` like the trainer would; a trainer that finished
         has put the job's phase back), and reap it."""
         evaluate(picker_enabled=True, val_dataset=val)
@@ -620,6 +648,8 @@ def test_checkpoint_evaluation_queues_and_puts_the_job_back(client, hook, tmp_pa
             json.dump({**training, **running, "evaluation": {"started_at": time.time(), **evaluation}}, f)
         with scheduler._lock:
             scheduler.procs[jid] = Exited(code)
+            if asked_to_stop:
+                scheduler.stop_deadline[jid] = time.time()
             scheduler._reap()
         return client.get(f"/api/jobs/{jid}").json()
 
@@ -635,11 +665,14 @@ def test_checkpoint_evaluation_queues_and_puts_the_job_back(client, hook, tmp_pa
     assert next(x for x in client.get("/api/jobs").json() if x["id"] == jid)["recommended"] == rec
 
     # killed (force stop): the status file gets its phase and message back, and the evaluation is marked stopped
-    j = run_to_end(-9, {"state": "running", "evals": [{"step": 0, "file": None, "val_loss": 0.2}]})
+    j = run_to_end(-9, {"state": "running", "evals": [{"step": 0, "file": None, "val_loss": 0.2}]}, asked_to_stop=True)
     st = j["status_detail"]
     assert j["status"] == "completed" and st["phase"] == "completed" and st["message"] == "Done in 1.0 min"
     assert st["evaluation"]["state"] == "stopped" and st["evaluation"]["evals"][0]["val_loss"] == 0.2
     assert len(got) == 1  # stopping isn't sent unless asked for
+    # killed when nobody asked (the out-of-memory killer): it failed
+    j = run_to_end(-9, {"state": "running", "evals": []})
+    assert j["status"] == "completed" and j["status_detail"]["evaluation"]["state"] == "failed"
     client.put("/api/settings", json={"notifications": {"url": ""}})
 
 
@@ -698,11 +731,11 @@ def test_editing_a_job(client, tmp_path, monkeypatch):
                                                     "datasets": datasets, "settings": {**cfg["settings"], **(settings or {})},
                                                     **job})
 
-    # before it trains it takes any change, and keeps its place in the queue
+    # before it trains it takes any change, and stays ready to start
     r = edit({"steps": 4000, "rank": 16}, name="ed v1", gpu="1")
     assert r.status_code == 200
     j = r.json()
-    assert (j["status"], j["name"], j["gpu"], j["config"]["name"]) == ("queued", "ed v1", "1", "ed v1")
+    assert (j["status"], j["name"], j["gpu"], j["config"]["name"]) == ("ready", "ed v1", "1", "ed v1")
     assert (j["config"]["settings"]["steps"], j["config"]["settings"]["rank"]) == (4000, 16)
 
     d = job_dir(jid)
@@ -714,6 +747,19 @@ def test_editing_a_job(client, tmp_path, monkeypatch):
 
     # once it has trained, its own settings sent back change nothing, and most changes carry on from its last save,
     # each noted in its log: how long it trains, what it saves and samples, how it learns, what it learns from
+    assert edit().status_code == 200
+    # the model is what it is, not its profile's name: renamed, it carries on; another family's profile given the
+    # old name (or another model file) is another model
+    client.put(f"/api/profiles/{pid}", json={"name": "ed renamed", "family": "krea2", "data": {}})
+    assert edit().status_code == 200
+    other = client.post("/api/profiles", json={"name": "ed", "family": "flux2_klein", "data": {}}).json()["id"]
+    r = edit(profile_id=other)
+    assert r.status_code == 409 and "the model" in r.json()["detail"]
+    moved = client.post("/api/profiles", json={"name": "ed 2", "family": "krea2",
+                                               "data": {"diffusion_model": "/m/other.safetensors"}}).json()["id"]
+    assert edit(profile_id=moved).status_code == 409
+    same = client.post("/api/profiles", json={"name": "ed 3", "family": "krea2", "data": {"sample_steps": 4}}).json()
+    assert edit(profile_id=same["id"]).status_code == 200  # the same model, other sampling settings
     assert edit().status_code == 200
     r = edit({"steps": 5000, "sample_every": 100, "offload": 20, "learning_rate": 3.3e-5, "num_frames": 49},
              datasets=[{"id": did, "repeats": 3}])
@@ -896,14 +942,158 @@ def test_a_job_stopping_when_the_server_restarted_is_still_forced(client, monkey
     db.execute("DELETE FROM jobs WHERE id=?", (jid,))
 
 
+def test_a_job_killed_unasked_failed_and_one_still_saving_isnt_forced(client, monkeypatch, tmp_path):
+    """The out-of-memory killer's SIGKILL is a failure (it was recorded as stopped, so no failure was sent); Stop's
+    grace runs from the job's last write, so a long save or sample isn't killed while it works."""
+    import time
+
+    from dainamo.server import db, procs
+    from dainamo.server.queue import STOP_GRACE, job_dir, scheduler
+
+    class Proc:
+        def __init__(self, code=None):
+            self.code, self.pid = code, 4242
+
+        def poll(self):
+            return self.code
+
+    def job(name):
+        jid = db.new_id()
+        db.execute("INSERT INTO jobs (id, name, status, family, gpu, position, created, pid, config) VALUES "
+                   "(?,?,?,?,?,?,?,?,?)", (jid, name, "running", "krea2", "99", 0.0, db.now(), 4242, "{}"))
+        return jid
+
+    killed = []
+    monkeypatch.setattr(procs, "kill_tree", killed.append)
+    oom, asked, saving = job("oom"), job("asked"), job("saving")
+    os.makedirs(os.path.join(job_dir(saving), "state"), exist_ok=True)
+    with scheduler._lock:
+        scheduler.procs.update({oom: Proc(-9), asked: Proc(-9), saving: Proc()})
+        scheduler.stop_deadline[asked] = time.time()
+        scheduler.stop_deadline[saving] = time.time() - 1  # its grace from Stop is over...
+        with open(os.path.join(job_dir(saving), "state", "last.pt.tmp"), "wb") as f:
+            f.write(b"still writing")  # ...but it's writing its state
+        scheduler._reap()
+        assert killed == []
+        past = time.time() - STOP_GRACE - 1
+        os.utime(os.path.join(job_dir(saving), "state", "last.pt.tmp"), (past, past))
+        scheduler._reap()
+        assert killed == [4242]  # quiet for the whole grace: forced
+        del scheduler.procs[saving], scheduler.stop_deadline[saving]
+    status = {j: db.query_one("SELECT status FROM jobs WHERE id=?", (j,))["status"] for j in (oom, asked)}
+    assert status == {oom: "failed", asked: "stopped"}
+    for j in (oom, asked, saving):
+        db.execute("DELETE FROM jobs WHERE id=?", (j,))
+
+
 def test_a_missing_file_or_a_folder_in_a_dataset(client):
     d = client.post("/api/datasets", json={"name": "uploads"}).json()  # uploaded files: deleted from disk
     folder = os.path.join(d["path"], "sub")
     os.makedirs(folder)
-    assert client.delete("/api/media", params={"path": folder}).status_code == 400 and os.path.isdir(folder)
+    assert client.delete("/api/media", params={"path": folder}).status_code == 403 and os.path.isdir(folder)
+    named_like_media = os.path.join(d["path"], "sub.png")
+    os.makedirs(named_like_media)
+    assert client.delete("/api/media", params={"path": named_like_media}).status_code == 400
     assert client.get("/api/thumb", params={"path": os.path.join(d["path"], "gone.png")}).status_code == 404
-    assert client.get("/api/thumb", params={"path": folder}).status_code == 404
+    assert client.get("/api/thumb", params={"path": folder}).status_code == 403
     client.delete(f"/api/datasets/{d['id']}", params={"delete_files": True})
+
+
+def test_only_a_datasets_media_is_read_or_captioned(client, tmp_path):
+    folder = tmp_path / "linked"
+    folder.mkdir()
+    (folder / "notes.cfg").write_text("secret")
+    (folder / "a.png").write_bytes(b"png")
+    d = client.post("/api/datasets", json={"name": "linked", "path": str(folder)}).json()
+    assert client.get("/api/media", params={"path": str(folder / "notes.cfg")}).status_code == 403
+    assert client.get("/api/media", params={"path": str(folder / "a.png")}).status_code == 200
+    # a caption is written only beside a file the dataset holds, as that file's caption
+    assert client.put("/api/caption", json={"path": str(folder / "anything"), "caption": "x"}).status_code == 403
+    assert client.put("/api/caption", json={"path": str(folder / "gone.png"), "caption": "x"}).status_code == 404
+    assert not (folder / "anything.txt").exists() and not (folder / "gone.txt").exists()
+    assert client.put("/api/caption", json={"path": str(folder / "a.png"), "caption": "a cat"}).status_code == 200
+    assert (folder / "a.txt").read_text() == "a cat"
+    client.delete(f"/api/datasets/{d['id']}")
+
+
+def test_uploads_never_replace_a_file(client):
+    d = client.post("/api/datasets", json={"name": "uploads"}).json()
+    folder = d["path"]
+    with open(os.path.join(folder, "a.png"), "wb") as f:
+        f.write(b"ORIGINAL")
+    with open(os.path.join(folder, "a.txt"), "w") as f:
+        f.write("the original's caption")
+    files = [("files", ("a.png", b"NEW", "image/png")), ("files", ("a.txt", b"the new one's caption", "text/plain")),
+             ("files", ("b.png", b"B", "image/png")), ("files", ("A.JPG", b"J", "image/jpeg"))]
+    r = client.post(f"/api/datasets/{d['id']}/upload", files=files).json()
+    assert r["saved"] == 4 and r["renamed"] == [["a", "a 2"]]
+    assert open(os.path.join(folder, "a.png"), "rb").read() == b"ORIGINAL"
+    assert open(os.path.join(folder, "a.txt")).read() == "the original's caption"
+    assert open(os.path.join(folder, "a 2.png"), "rb").read() == b"NEW"
+    assert open(os.path.join(folder, "a 2.txt")).read() == "the new one's caption"  # still its caption
+    assert open(os.path.join(folder, "a 2.JPG"), "rb").read() == b"J"  # "A" is "a" on Windows and macOS
+    assert os.path.exists(os.path.join(folder, "b.png"))
+    client.delete(f"/api/datasets/{d['id']}", params={"delete_files": True})
+
+
+def test_captions_uploaded_alone_pair_with_the_files_there(client):
+    """Captions sent without their files are for the files already there (they were renamed "a 2.txt", pairing
+    with nothing): one a file hasn't is added, one it has is replaced only when asked."""
+    d = client.post("/api/datasets", json={"name": "captions"}).json()
+    folder = d["path"]
+    for name in ("a.png", "B.png", "c.png"):
+        with open(os.path.join(folder, name), "wb") as f:
+            f.write(b"x")
+    with open(os.path.join(folder, "a.txt"), "w") as f:
+        f.write("typed by hand")
+
+    def send(names, **form):
+        files = [("files", (n, f"caption for {n}".encode(), "text/plain")) for n in names]
+        return client.post(f"/api/datasets/{d['id']}/upload", files=files, data=form).json()
+
+    r = send(["a.txt", "b.txt", "new.txt"])
+    assert (r["saved"], r["renamed"], r["captions_kept"]) == (2, [], ["a"])
+    assert open(os.path.join(folder, "a.txt")).read() == "typed by hand"  # kept: overwriting is off
+    assert open(os.path.join(folder, "B.txt")).read() == "caption for b.txt"  # named as its image is
+    assert os.path.exists(os.path.join(folder, "new.txt"))  # nothing of that name: saved as it is
+    r = send(["a.txt"], overwrite_captions="true")
+    assert (r["saved"], r["captions_kept"]) == (1, [])
+    assert open(os.path.join(folder, "a.txt")).read() == "caption for a.txt"
+    assert sorted(os.listdir(folder)) == ["B.png", "B.txt", "a.png", "a.txt", "c.png", "new.txt"]
+    client.delete(f"/api/datasets/{d['id']}", params={"delete_files": True})
+
+
+def test_deleting_a_file_keeps_the_caption_another_file_shares(client):
+    d = client.post("/api/datasets", json={"name": "uploads"}).json()
+    folder = d["path"]
+    for name in ("a.png", "a.jpg", "b.png"):
+        with open(os.path.join(folder, name), "wb") as f:
+            f.write(b"x")
+    for name in ("a.txt", "b.txt"):
+        with open(os.path.join(folder, name), "w") as f:
+            f.write("caption")
+    assert client.delete("/api/media", params={"path": os.path.join(folder, "a.jpg")}).status_code == 200
+    assert os.path.exists(os.path.join(folder, "a.txt"))  # a.png still uses it
+    assert client.delete("/api/media", params={"path": os.path.join(folder, "a.png")}).status_code == 200
+    assert not os.path.exists(os.path.join(folder, "a.txt"))
+    assert client.delete("/api/media", params={"path": os.path.join(folder, "b.png")}).status_code == 200
+    assert not os.path.exists(os.path.join(folder, "b.txt"))
+    client.delete(f"/api/datasets/{d['id']}", params={"delete_files": True})
+
+
+def test_a_caption_in_another_encoding_is_read(client, tmp_path):
+    folder = tmp_path / "latin"
+    folder.mkdir()
+    (folder / "a.png").write_bytes(b"x")
+    (folder / "a.txt").write_bytes("café au lait".encode("cp1252"))
+    (folder / "b.png").write_bytes(b"x")
+    (folder / "b.txt").write_bytes("\ufeffa bom".encode("utf-8"))
+    d = client.post("/api/datasets", json={"name": "latin", "path": str(folder)}).json()
+    r = client.get(f"/api/datasets/{d['id']}/items")
+    assert r.status_code == 200
+    assert {os.path.basename(i["path"]): i["caption"] for i in r.json()} == {"a.png": "café au lait", "b.png": "a bom"}
+    assert client.get(f"/api/datasets/{d['id']}/check").status_code == 200
+    client.delete(f"/api/datasets/{d['id']}")
 
 
 def test_clearing_the_shared_cache_spares_what_running_jobs_use(client):
@@ -1317,6 +1507,53 @@ def test_auto_caption_never_saves_a_cut_off_or_empty_caption(client, llm, tmp_pa
     finally:
         client.put("/api/settings", json={"captioner": {"endpoint": "http://127.0.0.1:8080/v1"}})
 
+def test_auto_caption_keeps_captions_written_while_it_runs(client, llm, tmp_path, monkeypatch):
+    from PIL import Image
+
+    from dainamo.server import captioner
+
+    url, got, replies = llm
+    for name in ("a", "b", "c"):
+        Image.new("RGB", (32, 32)).save(tmp_path / f"{name}.png")
+    real = captioner.caption_file
+
+    def by_hand_meanwhile(f, *args, **kw):
+        if f.endswith("a.png"):  # the user types a's caption while the LLM writes one, and b's before b's turn
+            (tmp_path / "a.txt").write_text("mine, typed meanwhile")
+            (tmp_path / "b.txt").write_text("mine, typed earlier")
+        return real(f, *args, **kw)
+
+    monkeypatch.setattr(captioner, "caption_file", by_hand_meanwhile)
+    client.put("/api/settings", json={"captioner": {"endpoint": f"{url}/v1"}})
+    did = client.post("/api/datasets", json={"name": "meanwhile", "path": str(tmp_path), "trigger": ""}).json()["id"]
+    try:
+        replies.extend(["An LLM caption.", "An LLM caption."])
+        _, status = _run_caption(client, did, overwrite=False)
+        assert (tmp_path / "a.txt").read_text() == "mine, typed meanwhile"
+        assert (tmp_path / "b.txt").read_text() == "mine, typed earlier"
+        assert (tmp_path / "c.txt").read_text() == "An LLM caption."
+        assert status["done"] == 3 and status["errors"] == []
+        assert len(got) == 2  # b was never sent
+    finally:
+        client.put("/api/settings", json={"captioner": {"endpoint": "http://127.0.0.1:8080/v1"}})
+
+
+def test_an_unexpected_error_ends_auto_caption_with_a_message(client, tmp_path, monkeypatch):
+    from PIL import Image
+
+    from dainamo.server import captioner
+
+    Image.new("RGB", (32, 32)).save(tmp_path / "a.png")
+
+    def broken(*_args, **_kw):
+        raise OSError("the dataset's disk went away")
+
+    monkeypatch.setattr(captioner, "list_media", broken)
+    did = client.post("/api/datasets", json={"name": "broken", "path": str(tmp_path), "trigger": ""}).json()["id"]
+    _, status = _run_caption(client, did)
+    assert status["errors"] == ["OSError: the dataset's disk went away"] and not status["running"]
+
+
 def _clip(path, seconds=2, audio=True):
     import subprocess
 
@@ -1501,6 +1738,48 @@ def _wait_for_state(client, state, timeout=10.0):
     assert client.get("/api/llm").json()["state"] == state
 
 
+def test_a_new_job_waits_for_start(client, tmp_path, monkeypatch):
+    """Add to queue makes a job ready, not queued: the queue doesn't run it until it's started, and then it goes
+    behind the jobs already waiting."""
+    from dainamo.server import db
+    from dainamo.server.queue import scheduler
+
+    spawned = []
+
+    def spawn(job, gpu):  # taken off the queue, so the queue's own thread can't launch it again
+        spawned.append(job["id"])
+        db.execute("UPDATE jobs SET status='stopped' WHERE id=?", (job["id"],))
+
+    monkeypatch.setattr(scheduler, "_spawn", spawn)
+    client.put("/api/settings", json={"queue": {"gpus": [5]}})
+    pid = client.post("/api/profiles", json={"name": "rd", "family": "krea2", "data": {}}).json()["id"]
+    did = client.post("/api/datasets", json={"name": "rd", "path": str(tmp_path)}).json()["id"]
+    body = {"name": "rd", "profile_id": pid, "datasets": [{"id": did}], "settings": {}}
+    try:
+        first, second = (client.post("/api/jobs", json=body).json() for _ in range(2))
+        assert first["status"] == second["status"] == "ready"
+        with scheduler._lock:
+            scheduler._launch()
+        assert spawned == []  # ready isn't queued
+        assert client.put(f"/api/jobs/{first['id']}", json={**body, "name": "rd v2", "gpu": "auto"}).json()["status"] == "ready"
+        r = client.post(f"/api/jobs/{second['id']}/action", json={"action": "start"})
+        assert r.status_code == 200 and r.json()["status"] == "queued"
+        assert "ready to start" in client.post(f"/api/jobs/{second['id']}/action", json={"action": "start"}).json()["detail"]
+        with scheduler._lock:
+            scheduler._launch()
+        assert spawned == [second["id"]]  # by the queue's thread or the launch above
+        # cancelled while ready: stopped, and it can be queued again like any stopped job
+        client.post(f"/api/jobs/{first['id']}/action", json={"action": "stop"})
+        assert client.get(f"/api/jobs/{first['id']}").json()["status"] == "stopped"
+        # Add and start: queued at once, and the flag isn't kept in its config
+        with scheduler.paused():
+            third = client.post("/api/jobs", json={**body, "start": True}).json()
+            assert third["status"] == "queued" and "start" not in third["config"]
+    finally:
+        client.put("/api/settings", json={"queue": {"gpus": [99]}})
+        db.execute("UPDATE jobs SET status='stopped' WHERE name LIKE 'rd%'")
+
+
 def test_training_takes_the_gpu_from_the_llama_server(client, fake_llama, tmp_path, monkeypatch):
     import time
 
@@ -1519,6 +1798,7 @@ def test_training_takes_the_gpu_from_the_llama_server(client, fake_llama, tmp_pa
             assert llama.occupies(7)
             jid = client.post("/api/jobs", json={"name": "lg", "profile_id": pid, "datasets": [{"id": did}],
                                                  "settings": {}}).json()["id"]
+            client.post(f"/api/jobs/{jid}/action", json={"action": "start"})
             scheduler.tick()
             assert spawned == [] and llama.alive() and llama.yielding == "a training job"
         end = time.time() + 10

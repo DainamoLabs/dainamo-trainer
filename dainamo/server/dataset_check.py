@@ -18,7 +18,7 @@ import numpy as np
 from PIL import Image
 
 from ..engine.dataset import (IMAGE_EXTS, MASKS_DIR, ORIGINALS_DIR, REFS_DIR, SMALL, caption_path, inside, list_media,
-                              mask_path, media_kind, nested_sources, paired_source, probe_audio, probe_video,
+                              mask_path, media_kind, nested_sources, paired_source, probe_audio, probe_video, read_text,
                               reference_images, refers_to, source_index, split_clips, split_lyrics, trains_small)
 
 DUPLICATE_BITS = 4  # difference hashes this close (of 64 bits) are near-duplicates: resized, re-saved, lightly edited
@@ -342,8 +342,7 @@ def check(root: str, trigger: str = "", resolution: list[int] | None = None, div
     if shared:
         add("shared_caption", "warning", f"{_plural(len(shared), 'caption file')} shared by two files",
             "Files with the same name and different extensions (a.png and a.jpg) both use a.txt.", groups=shared)
-    captions = {f: open(caption_path(f), encoding="utf-8").read().strip() if os.path.exists(caption_path(f)) else None
-                for f in used}
+    captions = {f: read_text(caption_path(f)).strip() if os.path.exists(caption_path(f)) else None for f in used}
     missing = [f for f in used if captions[f] is None]
     if missing:
         add("no_caption", "warning", f"{_plural(len(missing), 'file')} without a caption",

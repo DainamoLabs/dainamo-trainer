@@ -40,6 +40,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="Dainamo Trainer", lifespan=lifespan)
 
 app.add_middleware(auth.AuthMiddleware)
+app.add_middleware(auth.CrossSiteGuard)
 # The API can browse the filesystem, so only answer requests addressed to this machine by name;
 # this blocks DNS-rebinding from web pages. ``--host 0.0.0.0`` sets this to "*" (and turns on sign-in).
 _hosts = [h.strip() for h in os.environ.get("DAINAMO_ALLOWED_HOSTS", "127.0.0.1,localhost").split(",") if h.strip()]

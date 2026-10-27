@@ -15,11 +15,12 @@ import hmac
 import json
 import os
 import secrets
-from urllib.parse import parse_qsl, urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
+from starlette.datastructures import Headers
 
 from . import db
 
@@ -114,13 +115,43 @@ class AuthMiddleware:
                 return await JSONResponse({"detail": "Sign in to continue"}, status_code=401)(scope, receive, send)
         elif "key" in request.query_params:
             query = [(k, v) for k, v in parse_qsl(scope.get("query_string", b"").decode()) if k != "key"]
-            target = path + (f"?{urlencode(query)}" if query else "")
+            # one leading slash: "//evil.example/x" would send the browser to another site
+            target = "/" + path.lstrip("/\\") + (f"?{urlencode(query)}" if query else "")
             response = RedirectResponse(target, status_code=303)
             if _matches(request.query_params["key"]):
                 _set_cookie(response)
             else:
                 await asyncio.sleep(1)
             return await response(scope, receive, send)
+        return await self.app(scope, receive, send)
+
+
+SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
+
+
+class CrossSiteGuard:
+    """Refuses requests that change something (POST, PUT, DELETE...) when a browser says another site sent them.
+    Without it, any web page open on this machine could make the browser start, stop and upload here: the host check
+    doesn't stop that, and with sign-in off there's no cookie to withhold. ``Sec-Fetch-Site`` is what browsers say
+    (a reverse proxy doesn't change it); for one that doesn't send it, ``Origin`` must name this server. Scripts and
+    curl send neither, and are let through as before."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["method"] not in SAFE_METHODS and scope["path"].startswith("/api/"):
+            headers = Headers(scope=scope)
+            site = headers.get("sec-fetch-site")
+            if site is not None:
+                refused = site not in ("same-origin", "none")
+            else:
+                origin = headers.get("origin")
+                hosts = {headers.get("host"), headers.get("x-forwarded-host")} - {None}
+                refused = origin is not None and urlsplit(origin).netloc not in hosts
+            if refused:
+                response = JSONResponse({"detail": "Requests from other websites aren't accepted"}, status_code=403)
+                return await response(scope, receive, send)
         return await self.app(scope, receive, send)
 
 

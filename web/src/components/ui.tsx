@@ -149,24 +149,35 @@ export function TaskProgress({ icon, label, done, total, pct, detail, running, b
 export function usePoll<T>(url: string | null, ms: number, deps: unknown[] = [], fresh = false): [T | null, () => void, string | null] {
   const [data, setData] = useState<{ url: string; v: T } | null>(null);
   const [err, setErr] = useState<{ url: string; msg: string } | null>(null);
-  const tick = useRef(0);
+  // requests are numbered: an answer is shown when it's newer than the one shown (an older one arriving late is dropped)
+  const sent = useRef(0);
+  const shown = useRef(0);
   const load = useCallback(() => {
-    if (!url) return;
-    const my = ++tick.current;
-    api.get<T>(url).then(
-      (d) => { if (my === tick.current) { setData({ url, v: d }); setErr(null); } },
-      (e) => my === tick.current && setErr({ url, msg: String(e.message || e) }),
+    if (!url) return Promise.resolve();
+    const my = ++sent.current;
+    const newest = () => my > shown.current && ((shown.current = my), true);
+    return api.get<T>(url).then(
+      (d) => { if (newest()) { setData({ url, v: d }); setErr(null); } },
+      (e) => { if (newest()) setErr({ url, msg: String(e.message || e) }); },
     );
   }, [url]);
   useEffect(() => {
-    load();
+    // a poll waits for the last one: a server slower than ``ms`` isn't sent requests faster than it answers
+    let busy = false;
+    const poll = () => {
+      if (busy) return;
+      busy = true;
+      load().finally(() => { busy = false; });
+    };
+    poll();
     if (!ms) return;
-    const t = setInterval(load, ms);
+    const t = setInterval(poll, ms);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [load, ms, ...deps]);
+  const reload = useCallback(() => { load(); }, [load]);
   const mine = (x: { url: string } | null) => !!x && (!fresh || x.url === url);
-  return [mine(data) ? data!.v : null, load, mine(err) ? err!.msg : null];
+  return [mine(data) ? data!.v : null, reload, mine(err) ? err!.msg : null];
 }
 
 // ---- file browser ----------------------------------------------------------

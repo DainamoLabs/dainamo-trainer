@@ -45,8 +45,10 @@ def check_settings(s: dict, div: int, audio: bool = False) -> dict:
                           ("audio_loss_weight", float, 0), ("offload", float, 0)):
         if key in s:
             num(key, kind, lo)
+    # dropout 1 zeroes every LoRA layer's input (it trains nothing), and a share above 1 fails once the model has
+    # loaded: checked here, before the job is queued
     for key, hi in (("num_frames", MAX_FRAMES), ("sample_frames", MAX_FRAMES), ("i2v_probability", 1),
-                    ("offload", 100)):
+                    ("offload", 100), ("caption_dropout", 1), ("dropout", 0.9)):
         if key in s and s[key] > hi:
             raise HTTPException(400, f"Setting {key!r}={s[key]} is out of range (max {hi})")
     for key in ("train_audio", "keep_alpha", "low_vram", "auto_frames"):

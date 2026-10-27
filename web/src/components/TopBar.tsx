@@ -59,8 +59,8 @@ function Ring({ pct }: { pct: number }) {
 /** The pages on the left; on the right, what the trainer is doing (the running job, or the last one if it failed, or
  * idle), a dataset task going (captioning, a split, a download, an upscale: its page isn't the only place it shows),
  * each GPU's memory and temperature, Settings and New job. On a phone the pages move to ``TabBar``. */
-export function TopBar({ tab, arg, jobs, gpus, ram, waiting, tasks }: {
-  tab: Tab; arg: string; jobs: Job[] | null; gpus: Gpu[]; ram?: SystemRam; waiting: number; tasks: BackgroundTask[];
+export function TopBar({ tab, arg, jobs, gpus, ram, waiting, ready = 0, tasks }: {
+  tab: Tab; arg: string; jobs: Job[] | null; gpus: Gpu[]; ram?: SystemRam; waiting: number; ready?: number; tasks: BackgroundTask[];
 }) {
   const page = pageOf(tab);
   const running = (jobs || []).filter((j) => j.status === "running" || j.status === "stopping").sort((a, b) => (a.started || 0) - (b.started || 0));
@@ -129,21 +129,24 @@ export function TopBar({ tab, arg, jobs, gpus, ram, waiting, tasks }: {
               <span className="tb-idle" aria-hidden="true" />
               <span className="tb-text">
                 <span className="tb-name">Idle</span>
-                <span className="tb-meta">{waiting ? `${waiting} waiting` : last?.finished ? `Last job finished ${ago(last.finished)}` : "Nothing queued"}</span>
+                <span className="tb-meta">{waiting ? `${waiting} waiting` : ready ? `${ready} ready to start` : last?.finished ? `Last job finished ${ago(last.finished)}` : "Nothing queued"}</span>
               </span>
             </div>
           )}
           {gpus.length > 0 && (
             <div className="tb-gpus">
               {gpus.map((g) => {
-                const pct = g.mem_total ? (100 * g.mem_used) / g.mem_total : 0;
+                const pct = g.mem_total && g.mem_used != null ? (100 * g.mem_used) / g.mem_total : 0;
+                // (a value nvidia-smi doesn't report is left out)
+                const busy = g.util != null ? ` · ${g.util}% busy` : "";
+                const mem = g.mem_used != null && g.mem_total != null ? ` · ${(g.mem_used / 1024).toFixed(1)} of ${(g.mem_total / 1024).toFixed(0)} GB` : "";
                 return (
                   <div className="tb-gpu" key={g.index}
-                    title={`GPU ${g.index} · ${g.name.replace(/^NVIDIA (GeForce )?/, "")} · ${g.util}% busy · ${(g.mem_used / 1024).toFixed(1)} of ${(g.mem_total / 1024).toFixed(0)} GB`}>
+                    title={`GPU ${g.index} · ${g.name.replace(/^NVIDIA (GeForce )?/, "")}${busy}${mem}`}>
                     <span className="tb-gpu-top"><span>GPU {g.index}</span><span className="tb-temp"><Temp c={g.temp} /></span></span>
                     <span className="tb-gpu-mem">
                       <span className={`tb-meter${pct > 10 ? " on" : ""}`}><span style={{ width: `${pct}%` }} /></span>
-                      {(g.mem_used / 1024).toFixed(1)} GB
+                      {g.mem_used != null ? `${(g.mem_used / 1024).toFixed(1)} GB` : "—"}
                     </span>
                   </div>
                 );

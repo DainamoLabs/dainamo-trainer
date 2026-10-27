@@ -424,11 +424,23 @@ def ramp_weights(parts: list[tuple[int, int]], n: int, scale: float) -> list[Ten
 
 def tiled(fn, x: Tensor, tile: int | tuple[int, int], overlap: int, align: int, factor: float, check=None) -> Tensor:
     """``fn`` on overlapping spatial tiles of (B, C, T, H, W) (each at most ``tile``, or (height, width)), its
-    outputs (``factor`` x the size) blended with linear ramps across the overlaps. Accumulated in fp32."""
+    outputs (``factor`` x the size) blended with linear ramps across the overlaps. Accumulated in fp32.
+
+    The sum is divided by the total weight: when a tile's overlaps with the tiles on either side meet (tiles much
+    larger than their step), three tiles cover some rows and the ramps alone sum to more than 1 there."""
     h, w = x.shape[3:]
     th, tw = (tile, tile) if isinstance(tile, int) else tile
     ys, xs = spans(h, th, overlap, align), spans(w, tw, overlap, align)
     wy, wx = ramp_weights(ys, h, factor), ramp_weights(xs, w, factor)
+
+    def total(parts, weights, n):
+        t = torch.zeros(round(n * factor))
+        for (a, _), wt in zip(parts, weights):
+            o = round(a * factor)
+            t[o:o + len(wt)] += wt
+        return t
+
+    norm = total(ys, wy, h)[:, None] * total(xs, wx, w)[None, :]
     out = None
     for (y0, y1), my in zip(ys, wy):
         for (x0, x1), mx in zip(xs, wx):
@@ -442,7 +454,7 @@ def tiled(fn, x: Tensor, tile: int | tuple[int, int], overlap: int, align: int, 
             mask = (my[:, None] * mx[None, :]).to(part.device)
             out[:, :, :, oy:oy + part.shape[3], ox:ox + part.shape[4]] += part.float() * mask
             del part
-    return out
+    return out.div_(norm.to(out.device))
 
 
 def frames_for_latents(latent_frames: int) -> int:

@@ -177,7 +177,7 @@ def _job_config(body: JobIn, old: dict | None = None) -> dict:
         d = _dataset(settings["val_dataset"], kept)
         val_dsets.append({"id": d["id"], "name": d["name"], "path": d["path"], "trigger": d["trigger"], "repeats": 1})
     return {"name": body.name.strip() or "job", "output_name": body.output_name.strip(),
-            "family": prof["family"], "profile_name": prof["name"], "profile": prof["data"],
+            "family": prof["family"], "profile_id": prof["id"], "profile_name": prof["name"], "profile": prof["data"],
             "datasets": dsets, "validation_datasets": val_dsets, "settings": settings}
 
 
@@ -214,12 +214,20 @@ def _sources(d: dict, ids: list[str], info, kept: dict[str, dict]) -> list[dict]
     return out
 
 
+class JobNew(JobIn):
+    start: bool = False  # Add and start: queued at once instead of ready
+
+
 @router.post("/jobs")
-def create_job(body: JobIn):
+def create_job(body: JobNew):
+    """A new job from the Create Job form. It's "ready": in the Queue, but the queue doesn't run it until it's
+    started (the "start" action), so it can be looked over, edited, or set up beside others first. With ``start``
+    it's queued at once, behind the jobs already waiting."""
     jid = db.new_id()
     config = {"id": jid, **_job_config(body)}
+    status = "queued" if body.start else "ready"
     db.execute("INSERT INTO jobs (id, name, status, family, profile_name, gpu, position, created, config, folder) "
-               "VALUES (?,?,?,?,?,?,?,?,?,?)", (jid, config["name"], "queued", config["family"], config["profile_name"],
+               "VALUES (?,?,?,?,?,?,?,?,?,?)", (jid, config["name"], status, config["family"], config["profile_name"],
                                                 body.gpu, db.now(), db.now(), json.dumps(config),
                                                 job_folder(config["name"], jid)))
     return job_or_404(jid)
@@ -257,7 +265,7 @@ def _restart_reasons(old: dict, new: dict) -> list[str]:
     ``old`` doesn't have, from before they existed, aren't compared; it trained without masked loss, EMA, a noise
     range or loss weighting, so those are their defaults)."""
     o, n = {**LOSS_AND_EMA_DEFAULTS, **old.get("settings", {})}, new["settings"]
-    reasons = ["the model"] if old.get("profile_name") != new["profile_name"] else []
+    reasons = [] if _same_model(old, new) else ["the model"]
     if bool(o.get("refmod_enabled")) != bool(n.get("refmod_enabled")):
         reasons.append("what it makes (a LoRA or a RefMod)")
     if bool(o.get("finetune_enabled")) != bool(n.get("finetune_enabled")):
@@ -278,6 +286,21 @@ def _restart_reasons(old: dict, new: dict) -> list[str]:
     if n.get("bleed_enabled") and (not o.get("bleed_enabled") or changed(BLEED_INPUTS)):
         reasons.append("the concept bleed check")
     return reasons
+
+
+# a profile's fields that make the model a job trains: another file or variant is another model (the text encoder
+# and VAE may be another file of the same one, such as another precision, and the rest are sampling settings)
+MODEL_FIELDS = ("diffusion_model", "training_adapter", "variant")
+
+
+def _same_model(old: dict, new: dict) -> bool:
+    """Whether config ``new``'s profile is the model config ``old`` trained (by what it is, not its profile's name:
+    a renamed profile is the same model, another family's profile of the same name isn't)."""
+    def field(c, k):
+        v = (c.get("profile") or {}).get(k)
+        return os.path.normpath(os.path.expanduser(str(v))) if k != "variant" and v else v or None
+
+    return old.get("family") == new.get("family") and all(field(old, k) == field(new, k) for k in MODEL_FIELDS)
 
 
 def _dataset_choices(c: dict) -> list[tuple]:
@@ -354,7 +377,7 @@ def edit_job(jid: str, body: JobEdit):
         db.execute("UPDATE jobs SET name=?, family=?, profile_name=?, gpu=?, config=? WHERE id=?",
                    (config["name"], config["family"], config["profile_name"], body.gpu, json.dumps(config), jid))
         # a RefMod is quick to make, so one that's been made (or failed) is made again with any change
-        remake = (bool(old["settings"].get("refmod_enabled")) and j["status"] != "queued"
+        remake = (bool(old["settings"].get("refmod_enabled")) and j["status"] not in ("queued", "ready")
                   and {k: v for k, v in old.items() if k != "id"} != new)
         if restart or remake:
             _clear_progress(jid)
@@ -395,10 +418,14 @@ def estimate(body: EstimateIn):
 
 @router.get("/jobs/{jid}")
 def get_job(jid: str):
+    """The job as the Queue lists it (``_job_summary``: its progress, recommendation, media, ...), with its config,
+    full status and folder."""
     j = job_or_404(jid)
+    config = j.get("config")
+    j = _job_summary(j)
+    j["config"] = config
     j["status_detail"] = read_status(jid)
     j["dir"] = job_dir(jid)
-    j["resumable"] = os.path.exists(os.path.join(job_dir(jid), "state", "last.pt"))  # can train on from its last step
     return j
 
 
@@ -503,7 +530,11 @@ class ActionIn(BaseModel):
 def job_action(jid: str, body: ActionIn):
     j = job_or_404(jid)
     a = body.action
-    if a == "stop":
+    if a == "start":  # a ready job joins the queue, behind the jobs already waiting
+        if j["status"] != "ready":
+            raise HTTPException(400, "Only a job that's ready to start can be started")
+        db.execute("UPDATE jobs SET status='queued', position=? WHERE id=? AND status='ready'", (db.now(), jid))
+    elif a == "stop":
         scheduler.stop(jid)
     elif a in ("sample", "save"):
         if j["status"] != "running":
@@ -569,7 +600,9 @@ def sample_in_sandbox(jid: str, step: int, index: int):
     snapshot = cfg["profile"]
     profiles = db.query("SELECT * FROM profiles WHERE family=? ORDER BY updated DESC", (cfg["family"],))
     model = os.path.expanduser(str(snapshot.get("diffusion_model") or ""))
-    profile = next((p for p in profiles if p["name"] == cfg.get("profile_name")), None) or \
+    # the profile it trained with (by id; a job from before ids were kept, by name), else one with its model file
+    profile = next((p for p in profiles if cfg.get("profile_id") and p["id"] == cfg["profile_id"]), None) or \
+        next((p for p in profiles if not cfg.get("profile_id") and p["name"] == cfg.get("profile_name")), None) or \
         next((p for p in profiles if os.path.expanduser(str(p["data"].get("diffusion_model") or "")) == model), None)
     if profile is None:
         raise HTTPException(400, f"The {cfg.get('profile_name')} profile this job trained with is gone; create a "
@@ -646,7 +679,7 @@ def _cache_files(jid: str) -> set[str]:
 def _cache_in_use() -> set[str]:
     """The shared cache's files that queued and running jobs use."""
     return set().union(*(_cache_files(r["id"])
-                         for r in db.query("SELECT id FROM jobs WHERE status IN ('queued','running','stopping')")))
+                         for r in db.query("SELECT id FROM jobs WHERE status IN ('ready','queued','running','stopping')")))
 
 
 def _size(path: str) -> int:
@@ -837,16 +870,18 @@ def extract_lora(jid: str, body: ExtractIn):
                 "extract_base": base, "extract_from": {"job_id": jid, "job_name": j["name"], "file": body.file,
                                                        "folder": os.path.basename(job_dir(jid)),
                                                        "step": int(c.get("step") or 0), "trigger": trigger}}
-    return queue_made(name, cfg["family"], cfg["profile_name"], cfg["profile"], settings, body.gpu)
+    return queue_made(name, cfg["family"], cfg["profile_name"], cfg["profile"], settings, body.gpu,
+                      cfg.get("profile_id"))
 
 
-def queue_made(name: str, family: str, profile_name: str, profile: dict, settings: dict, gpu: str) -> dict:
+def queue_made(name: str, family: str, profile_name: str, profile: dict, settings: dict, gpu: str,
+               profile_id: str | None = None) -> dict:
     """Queue a job that trains nothing but makes a file (an extracted or merged LoRA), with no datasets."""
     if gpu not in ("auto", "") and not gpu.isdigit():
         raise HTTPException(400, f"Invalid GPU {gpu!r}")
     new = db.new_id()
-    config = {"id": new, "name": name, "output_name": name, "family": family, "profile_name": profile_name,
-              "profile": profile, "datasets": [], "validation_datasets": [], "settings": settings}
+    config = {"id": new, "name": name, "output_name": name, "family": family, "profile_id": profile_id,
+              "profile_name": profile_name, "profile": profile, "datasets": [], "validation_datasets": [], "settings": settings}
     db.execute("INSERT INTO jobs (id, name, status, family, profile_name, gpu, position, created, config, folder) "
                "VALUES (?,?,?,?,?,?,?,?,?,?)", (new, name, "queued", family, profile_name, gpu or "auto", db.now(),
                                                 db.now(), json.dumps(config), job_folder(name, new)))

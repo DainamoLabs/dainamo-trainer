@@ -330,6 +330,10 @@ class _Hub(http.server.BaseHTTPRequestHandler):
             return
         start = 0
         m = re.fullmatch(r"bytes=(\d+)-", self.headers.get("Range", ""))
+        if m and int(m.group(1)) >= len(data):  # as the CDN answers a range from the end of the file
+            self.send_response(416)
+            self.end_headers()
+            return
         if m:
             start = int(m.group(1))
             self.send_response(206)
@@ -408,6 +412,21 @@ def test_download_pauses_resumes_and_checks_the_file(client, hub, tmp_path):
     assert r.status_code == 400 and "already there" in r.json()["detail"]
     assert client.delete(f"/api/models/downloads/{t['id']}").status_code == 200
     assert (folder / d.name).exists()  # clearing a finished download keeps its file
+
+
+def test_a_download_whose_part_is_complete_is_checked_not_fetched(client, hub, tmp_path):
+    """Stopped while it was being checked, a part is the whole file: it's verified and kept (a request for the
+    range from its end was refused every time, so Resume never got further)."""
+    d, data = hub
+    _Hub.slow = set()
+    folder = tmp_path / "models" / "loras"
+    folder.mkdir(parents=True)
+    (folder / (d.name + ".part")).write_bytes(data)
+    t = client.post("/api/models/downloads", json={"id": d.id, "folder": str(folder)}).json()
+    t = _wait(client, t["id"])
+    assert t["state"] == "done", t["error"]
+    assert (folder / d.name).read_bytes() == data
+    client.delete(f"/api/models/downloads/{t['id']}")
 
 
 def test_a_bad_download_is_thrown_away(client, hub, tmp_path, monkeypatch):

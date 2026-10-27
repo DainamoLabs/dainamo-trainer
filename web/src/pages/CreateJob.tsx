@@ -154,11 +154,16 @@ function load<T>(k: string): T | null {
   try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch { return null; }
 }
 
-/** What the form starts from to duplicate or edit a job: its config's names, profile (found by name), settings
+/** The profile a job trained with: by its id, or by name for a job from before configs kept the id. */
+export function jobProfile(cfg: any, profiles: Profile[]): Profile | undefined {
+  return cfg?.profile_id ? profiles.find((p) => p.id === cfg.profile_id) : profiles.find((p) => p.name === cfg?.profile_name);
+}
+
+/** What the form starts from to duplicate or edit a job: its config's names, profile (``jobProfile``), settings
  * and datasets. */
 export function formOf(cfg: any, profiles: Profile[]) {
   return {
-    name: cfg.name, output_name: cfg.output_name || "", profile_id: profiles.find((p) => p.name === cfg.profile_name)?.id,
+    name: cfg.name, output_name: cfg.output_name || "", profile_id: jobProfile(cfg, profiles)?.id,
     settings: cfg.settings,
     // jobs from before per-dataset settings use the job's resolution, flip and dropout for every dataset
     datasets: cfg.datasets.map((d: any) => ({
@@ -323,23 +328,33 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
 
   const profile = profiles?.find((p) => p.id === profileId);
   const family = families.find((f) => f.id === profile?.family);
-  // switching to a profile of another model family applies that family's recommended settings;
-  // on first load only an unsupported timestep mode is corrected, so remembered settings survive
+  // the model family's recommended settings go in when the form first shows a family its settings aren't from (a
+  // first job, or the last job's profile gone, or another family's), and on switching to another family. Settings
+  // remembered from the last job of this family stay (the timestep mode corrected if the model hasn't it), and so do
+  // an edited or duplicated job's
   const lastFamily = useRef<string | null>(null);
   useEffect(() => {
     if (!family) return;
     const modes = family.timestep_modes.map((m) => m[0]);
-    if (lastFamily.current !== null && lastFamily.current !== family.id) {
+    const remembered = !clone && load<any>(STORE);
+    // (a job remembered before the family was kept with it: its profile's)
+    const mine = !!clone || (!!remembered && (remembered.family ? remembered.family === family.id : remembered.profile_id === profileId));
+    if (lastFamily.current !== null ? lastFamily.current !== family.id : !mine) {
       const d = family.training_defaults;
       // the strength sweep brackets the strength the model's LoRAs are used at
       const sweep = [0.6, 0.8, 1, 1.2].map((x) => +(x * (family.lora_strength || 1)).toFixed(2)).join(", ");
       setS((x) => ({ ...x, offload: 0, sweep_strengths: sweep, ...d,
+        ...(!modes.includes(String(d.timestep_sampling ?? x.timestep_sampling)) ? { timestep_sampling: modes[0] } : {}),
         ...(x.network_type === "lokr" && d.learning_rate != null ? { learning_rate: Number(d.learning_rate) * LOKR_LR_SCALE } : {}),
         ...(x.finetune_enabled && family.finetune ? family.finetune : {}) }));
       const res = family.training_defaults.resolution as DsCard["resolution"] | undefined;
       if (res != null) setDsCards((cs) => cs.map((c) => ({ ...c, resolution: res })));
-    } else if (!modes.includes(s.timestep_sampling)) {
-      setS((x) => ({ ...x, timestep_sampling: modes[0] }));
+    } else {
+      // the form has no field for the samples' frame count (blank cards render it): a new job takes the model's,
+      // not one remembered from the last job; an edited or duplicated job keeps its own
+      const frames = family.training_defaults.sample_frames;
+      setS((x) => ({ ...x, ...(!modes.includes(x.timestep_sampling) ? { timestep_sampling: modes[0] } : {}),
+        ...(!clone && frames != null ? { sample_frames: frames } : {}) }));
     }
     lastFamily.current = family.id;
   }, [family?.id]);
@@ -452,21 +467,23 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
       ? x.refmod_concept : list[0][0] };
   });
 
-  const submit = async (restart = false) => {
-    // the first dataset's resolution, flip and dropout are remembered as the starting point for new ones
-    const first = chosen[0];
-    const settings = {
-      ...s, sample_prompts: fromCards(cards), slider_enabled: slider, network_type: lokr ? "lokr" : "lora", grad_accum: accum,
-      refmod_enabled: refmod, finetune_enabled: finetune, ...(refmod ? { picker_enabled: false, bleed_enabled: false } : {}),
-      masked_loss: maskable && !!s.masked_loss, ema_enabled: ema,
-      ...(slider ? { loss_weighting: "none" } : {}),  // a slider's loss is its own, in the noise range
-      ...(finetune ? { bleed_enabled: false, sweep_enabled: false, optimizer: finetuneOptimizer } : {}),
-      ...(isAudio ? { bleed_enabled: false } : {}),
-      likeness_enabled: !isAudio && !slider && !refmod && s.likeness_enabled !== false,
-      ...(slider ? { picker_enabled: false, ...(keepLayout ? { slider_preserve: [] } : {}) } : {}),
-      ...(first ? { resolution: first.resolution, flip: first.flip, caption_dropout: first.caption_dropout }
-        : rendered ? { resolution: dsCards[0].resolution } : {}),
-    };
+  // the job's settings as they're submitted, built once: the VRAM projection reads these same values
+  // the first dataset's resolution, flip and dropout are remembered as the starting point for new ones
+  const first = chosen[0];
+  const settings = {
+    ...s, sample_prompts: fromCards(cards), slider_enabled: slider, network_type: lokr ? "lokr" : "lora", grad_accum: accum,
+    refmod_enabled: refmod, finetune_enabled: finetune, ...(refmod ? { picker_enabled: false, bleed_enabled: false } : {}),
+    masked_loss: maskable && !!s.masked_loss, ema_enabled: ema,
+    ...(slider ? { loss_weighting: "none" } : {}),  // a slider's loss is its own, in the noise range
+    ...(finetune ? { bleed_enabled: false, sweep_enabled: false, optimizer: finetuneOptimizer } : {}),
+    ...(isAudio ? { bleed_enabled: false } : {}),
+    likeness_enabled: !isAudio && !slider && !refmod && s.likeness_enabled !== false,
+    ...(slider ? { picker_enabled: false, ...(keepLayout ? { slider_preserve: [] } : {}) } : {}),
+    ...(first ? { resolution: first.resolution, flip: first.flip, caption_dropout: first.caption_dropout }
+      : rendered ? { resolution: dsCards[0].resolution } : {}),
+  };
+
+  const submit = async (restart = false, start = false) => {
     const job = {
       name: name.trim() || `${profile?.name || "job"} ${new Date().toLocaleDateString()}`,
       output_name: outName.trim(),
@@ -481,13 +498,13 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
       if (edit) {
         await api.put(`/api/jobs/${edit.id}`, { ...job, restart });
         toast(restart ? "Saved; the job starts again from step 0"
-          : refmod && edit.status !== "queued" ? "Saved; it's queued to be made again"
+          : refmod && !["queued", "ready"].includes(edit.status) ? "Saved; it's queued to be made again"
           : edit.done > 0 ? `Changes saved; it carries on from step ${edit.done}` : "Changes saved");
         go("queue", edit.id);
       } else {
-        await api.post("/api/jobs", job);
-        localStorage.setItem(STORE, JSON.stringify({ profile_id: profileId, gpu, settings }));
-        toast("Job added to the queue");
+        await api.post("/api/jobs", { ...job, start });
+        localStorage.setItem(STORE, JSON.stringify({ profile_id: profileId, family: profile?.family, gpu, settings }));
+        toast(start ? "Job added and queued for a free GPU" : "Job added: press Start when you're ready to run it");
         go("queue");
       }
     } catch (e: any) {
@@ -513,18 +530,17 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
   const sourcesInfo = family?.sources && forVariant(family.sources) ? family.sources : null;
   const pairing = !!sourcesInfo && !refmod && !slider ? sourcesInfo : null;
   const lowVram = !!s.low_vram && !!family?.streams_text_encoder;
-  // what the VRAM projection depends on
+  // the VRAM projection: the job's settings as submitted, and what only the projection takes, which the server
+  // works out from the datasets for the job itself: every dataset's resolution and kind, the clip length an Auto
+  // length trains at, and low VRAM where the model can't stream its text encoder
   const vram = useVramProjection(profileId || undefined, {
+    ...settings,
     resolution: resolutions.length ? resolutions : s.resolution,
     datasets: chosen.map((c) => ({ resolution: c.resolution, video: c.d.videos > 0, refs: pairing ? paired[c.id]?.most ?? c.sources.filter(Boolean).length : 0 })),
-    batch_size: s.batch_size, rank: s.rank, optimizer: s.optimizer,
-    network_type: kind === "lokr" ? "lokr" : "lora", lokr_factor: s.lokr_factor, finetune_enabled: finetune,
-    gradient_checkpointing: s.gradient_checkpointing, sample_width: s.sample_width, sample_height: s.sample_height,
     low_vram: lowVram,
-    // low VRAM samples without the VAE, unless a card's images (a first frame, references) need it
-    sample_prompts: lowVram ? fromCards(cards).filter((c) => c.images).map((c) => ({ images: c.images })) : [],
-    ...(isVideo ? { num_frames: clipFrames, sample_frames: s.sample_frames } : {}),
-    ...(isAudio ? { clip_seconds: s.clip_seconds, sample_seconds: s.sample_seconds } : {}),
+    // each card's size, frames and images; its prompt only marked, so typing one doesn't project again
+    sample_prompts: settings.sample_prompts.map(({ width, height, frames, images }) => ({ prompt: "x", width, height, frames, images })),
+    ...(isVideo ? { num_frames: clipFrames } : {}),
   }, "train");
   const target = gpuTarget(sys?.gpus, gpu);
   // why the job can't be added yet
@@ -551,7 +567,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
           <div style={{ minWidth: 0 }}>
             <div className="small"><a href="#/queue">Queue</a> <span className="faint">/</span> <a href={`#/queue/${edit.id}`}>{edit.job.name}</a> <span className="faint">/</span></div>
             <h1>Edit job</h1>
-            <p>{refmod ? (edit.status === "queued" ? "Change its settings before it's made."
+            <p>{refmod ? (["queued", "ready"].includes(edit.status) ? "Change its settings before it's made."
                 : "Saving makes the RefMod again with your changes, replacing the one it made.")
               : edit.done > 0
               ? `It has trained ${plural(edit.done, "step")}, and carries on from its last save with your changes. Changing its model, network (LoRA or LoKr, rank, alpha, or a finetune), optimizer or slider starts it again from step 0 instead, as does changing what the checkpoint picker or concept bleed check scores while it's on (with the picker on, that includes the datasets, resolution, clip length, seed, timestep sampling, noise range and masked loss).`
@@ -937,7 +953,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
                 {!finetune && <Num label="Gradient accumulation" info={INFO.gradAccum} v={s.grad_accum} on={set("grad_accum")} min={1} />}
                 <Sel label="Timestep sampling" info={INFO.timesteps} v={s.timestep_sampling} on={set("timestep_sampling")} opts={family?.timestep_modes || [["shift", "Resolution shift"]]} />
                 {!finetune && <>
-                  <Num label="LoRA dropout" info={INFO.dropout} v={s.dropout} on={set("dropout")} step={0.01} min={0} />
+                  <Num label="LoRA dropout" info={INFO.dropout} v={s.dropout} on={set("dropout")} step={0.01} min={0} max={0.9} />
                   <Num label="Max grad norm" info={INFO.maxGradNorm} v={s.max_grad_norm} on={set("max_grad_norm")} step={0.1} min={0} />
                 </>}
                 <Num label="Weight decay" info={INFO.weightDecay} v={s.weight_decay} on={set("weight_decay")} step={0.001} min={0} />
@@ -1009,7 +1025,6 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
                 <Num label="Height" v={s.sample_height} on={set("sample_height")} step={16} />
               </>}
               <Num label="Seed" v={s.sample_seed} on={set("sample_seed")} />
-              {isVideo && <Num label="Frames" v={s.sample_frames} on={set("sample_frames")} min={1} help="1 renders a still image." />}
             </div>
             <div className="row wrap" style={{ gap: 22, marginTop: 12 }}>
               <label className="check"><input type="checkbox" checked={s.sample_at_start} onChange={(e) => set("sample_at_start")(e.target.checked)} /> Sample before training (step 0)<Info text={INFO.sampleAtStart} /></label>
@@ -1173,9 +1188,16 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
               lowVram={family?.streams_text_encoder ? { on: lowVram, onChange: set("low_vram") } : null} finetune={finetune} />
           )}
           </div>
-          <button className="btn primary create-submit" disabled={busy || !!blocked} onClick={() => submit()}>
-            {edit ? <><IconSave /> Save changes</> : <><IconPlay /> Add to queue</>}
-          </button>
+          {edit ? (
+            <button className="btn primary create-submit" disabled={busy || !!blocked} onClick={() => submit()}><IconSave /> Save changes</button>
+          ) : (
+            <div className="create-actions">
+              <button className="btn create-submit" disabled={busy || !!blocked} onClick={() => submit()}
+                title="Add it to the Queue as ready: it runs when you press Start there"><IconPlus /> Add to queue</button>
+              <button className="btn primary create-submit" disabled={busy || !!blocked} onClick={() => submit(false, true)}
+                title="Add it and queue it to run on the next free GPU"><IconPlay /> Add and start</button>
+            </div>
+          )}
           {edit && <button className="btn ghost" style={{ width: "100%" }} onClick={() => go("queue", edit.id)}>Cancel</button>}
           {blocked && <div className="help create-blocked">{blocked}</div>}
         </div>

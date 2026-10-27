@@ -11,13 +11,13 @@ import subprocess
 import time
 from urllib.parse import quote, urlsplit
 
-from fastapi import APIRouter, HTTPException, UploadFile
+from fastapi import APIRouter, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 
 from ...engine.dataset import (MASKS_DIR, REFS_DIR, caption_path, inside, list_media, mask_path, media_kind,
-                               nested_sources, read_caption, resolutions, split_clips)
+                               nested_sources, read_caption, read_text, resolutions, split_clips)
 from ...engine.families import get_family
 from ...engine.media import spectrogram
 from ...engine.transcribe import MODELS as WHISPER_MODELS
@@ -146,18 +146,63 @@ def dataset_items(did: str):
 
 
 @router.post("/datasets/{did}/upload")
-def upload(did: str, files: list[UploadFile]):  # sync: file copies run in the threadpool
+def upload(did: str, files: list[UploadFile], overwrite_captions: bool = Form(False)):  # sync: copies run in the threadpool
+    """Files sent from the browser, saved into the dataset's folder. No image, video or song there is overwritten:
+    one whose name (stem) is taken is saved under a free one ("photo 2.png"), with its caption and any other file of
+    that stem in the same upload, so they stay paired. Captions sent on their own (a.txt) are for the files of their
+    name already there: saved beside them, replacing a caption they have only with ``overwrite_captions``.
+    Returns {saved, renamed: [[old stem, new stem]], captions_kept: [stems whose caption was left as it was]}."""
+    from ...fsutil import replace
+
     d = dataset_or_404(did)
-    saved = 0
+    folder = d["path"]
+    # stems in any case: Windows and macOS file systems don't tell "a.png" from "A.png"
+    names = os.listdir(folder) if os.path.isdir(folder) else []
+    taken = {os.path.splitext(f)[0].lower() for f in names}
+    media_stems = {os.path.splitext(f)[0].lower(): os.path.splitext(f)[0] for f in names if media_kind(f)}
+    captions = {os.path.splitext(f)[0].lower(): f for f in names if f.lower().endswith(".txt")}
+    groups: dict[str, list[tuple[str, UploadFile]]] = {}
     for uf in files:
         name = os.path.basename(uf.filename or "")
         if not name or not (media_kind(name) or name.lower().endswith(".txt")):
             continue
-        dest = os.path.join(d["path"], name)
-        with open(dest, "wb") as out:
-            shutil.copyfileobj(uf.file, out)
-        saved += 1
-    return {"saved": saved}
+        groups.setdefault(os.path.splitext(name)[0].lower(), []).append((name, uf))
+    saved, renamed, kept = 0, [], []
+    for key, group in groups.items():
+        if not any(media_kind(name) for name, _ in group) and key in taken:
+            # a caption for what's there: written as that file's caption is named (its stem's spelling)
+            name, uf = group[0]
+            existing = captions.get(key)
+            if existing and not overwrite_captions:
+                kept.append(os.path.splitext(name)[0])
+                continue
+            target = os.path.join(folder, existing or (media_stems.get(key, os.path.splitext(name)[0]) + ".txt"))
+            with open(target + ".tmp", "wb") as out:
+                shutil.copyfileobj(uf.file, out)
+            replace(target + ".tmp", target)
+            saved += 1
+            continue
+        stem = os.path.splitext(group[0][0])[0]
+        new, n = stem, 1
+        while new.lower() in taken or (new != stem and new.lower() in groups):
+            n += 1
+            new = f"{stem} {n}"
+        if new != stem:
+            renamed.append([stem, new])
+        taken.add(new.lower())
+        written = set()
+        for name, uf in group:
+            out_name = new + os.path.splitext(name)[1]
+            if out_name.lower() in written:  # the same file twice in one upload
+                continue
+            written.add(out_name.lower())
+            try:
+                with open(os.path.join(folder, out_name), "xb") as out:  # never over a file made meanwhile
+                    shutil.copyfileobj(uf.file, out)
+            except FileExistsError:
+                continue
+            saved += 1
+    return {"saved": saved, "renamed": renamed, "captions_kept": kept}
 
 
 def _in_dataset(path: str) -> dict:
@@ -168,6 +213,26 @@ def _in_dataset(path: str) -> dict:
     raise HTTPException(403, "File is not inside a dataset")
 
 
+def _dataset_file(path: str) -> dict:
+    """The dataset an image, video or song at ``path`` is in: only the files datasets hold are read or changed
+    through these routes, not anything else a linked folder has in it."""
+    d = _in_dataset(path)
+    if not media_kind(path):
+        raise HTTPException(403, "Only a dataset's images, videos and songs are read here")
+    return d
+
+
+def _shares_stem(path: str) -> bool:
+    """Whether another image, video or song beside ``path`` has its name (stem), and so its caption and mask."""
+    folder, base = os.path.split(path)
+    stem = os.path.splitext(base)[0]
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return False
+    return any(f != base and os.path.splitext(f)[0] == stem and media_kind(f) for f in names)
+
+
 class CaptionIn(BaseModel):
     path: str
     caption: str
@@ -175,7 +240,9 @@ class CaptionIn(BaseModel):
 
 @router.put("/caption")
 def put_caption(c: CaptionIn):
-    _in_dataset(c.path)
+    _dataset_file(c.path)
+    if not os.path.isfile(c.path):
+        not_found("File not found")
     with open(caption_path(c.path), "w", encoding="utf-8") as f:
         f.write(c.caption.strip())
     return {"ok": True}
@@ -183,12 +250,14 @@ def put_caption(c: CaptionIn):
 
 @router.delete("/media")
 def delete_media(path: str):
-    d = _in_dataset(path)
+    d = _dataset_file(path)
     if not d["managed"]:
         raise HTTPException(400, "Files in linked folders are not deleted from disk; remove them yourself")
     if os.path.isdir(path):
         raise HTTPException(400, "That's a folder: only files are deleted here")
-    for p in (path, caption_path(path), mask_path(path) or ""):  # its caption and loss mask go with it
+    # its caption and loss mask go with it, unless another file of its name (a.png beside a.jpg) still uses them
+    extras = () if _shares_stem(path) else (caption_path(path), mask_path(path) or "")
+    for p in (path, *extras):
         if p and os.path.exists(p):
             os.remove(p)
     return {"ok": True}
@@ -196,7 +265,7 @@ def delete_media(path: str):
 
 @router.get("/media")
 def media(path: str):
-    _in_dataset(path)
+    _dataset_file(path)
     if not os.path.isfile(path):
         not_found("File not found")
     return FileResponse(path)
@@ -204,7 +273,7 @@ def media(path: str):
 
 @router.get("/thumb")
 def thumb(path: str, size: int = 384):
-    _in_dataset(path)
+    _dataset_file(path)
     if not os.path.isfile(path):  # removed since the page listed it
         not_found("File not found")
     st = os.stat(path)
@@ -368,8 +437,7 @@ def _caption_or_none(path: str) -> str | None:
     p = caption_path(path)
     if not os.path.exists(p):
         return None
-    with open(p, encoding="utf-8") as f:
-        return f.read().strip()
+    return read_text(p).strip()
 
 
 @router.post("/datasets/{did}/captions/bulk")

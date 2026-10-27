@@ -340,3 +340,19 @@ def test_a_failed_video_leaves_nothing_behind(tmp_path):
     with pytest.raises(ValueError, match="no frames"):
         VideoWriter(str(tmp_path), "empty", 24).close()
     assert os.listdir(tmp_path) == []
+
+
+def test_a_seedvr2_dit_finds_its_vae_in_the_models_vae_folder(tmp_path):
+    """The worker identifies a DiT from its path alone: its VAE is found where the listing finds it (the models
+    folder's ``vae``), not only beside the DiT."""
+    from safetensors.torch import save_file
+
+    for folder in ("diffusion_models", "vae", "upscale_models"):
+        (tmp_path / folder).mkdir()
+    dit = tmp_path / "diffusion_models" / "seedvr2_3b.safetensors"
+    save_file({k: torch.zeros(1) for k in upscale.SEEDVR2_KEYS}, str(dit))
+    vae = tmp_path / "vae" / "seedvr2_ema_vae.safetensors"
+    save_file({k: torch.zeros(1) for k in upscale.SEEDVR2_VAE_KEYS}, str(vae))
+    info = upscale.identify(str(dit))
+    assert info.kind == "seedvr2" and info.companion == str(vae) and info.error is None
+    assert [i.companion for i in upscale.list_models(str(tmp_path))] == [str(vae)]  # as the listing found it

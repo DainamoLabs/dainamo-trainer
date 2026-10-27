@@ -250,6 +250,9 @@ class BlockSwapper:
             event, tensors = self.prefetched.pop(i)
             current.wait_event(event)
         else:
+            if self.stream is not None:
+                # a finetune's write-back of this block to RAM is queued on the side stream: read it after that
+                current.wait_stream(self.stream)
             tensors = self._copy_in(i, current)
         for (mod, kind, name, _), t in zip(self.cpu[i], tensors):
             _assign(mod, kind, name, t)

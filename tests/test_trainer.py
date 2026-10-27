@@ -281,3 +281,45 @@ def test_a_job_with_ema_saves_the_average_and_carries_it_on(tmp_path, monkeypatc
     assert state["ema"]["num_updates"] == 9
     _, plain = run("plain", 9, True)
     assert plain["ema"]["num_updates"] == 3
+
+
+def test_a_resumed_job_trains_on_as_if_it_never_stopped(tmp_path, monkeypatch):
+    """Stopped at step 3 and resumed, a job draws the same batches, caption dropout and noise as one that ran
+    straight through (it reseeded from the job's seed, replaying the first steps' draws); a stop before the saved
+    state loads keeps what it made listed."""
+    from safetensors.torch import load_file
+
+    monkeypatch.setattr(trainer_mod, "get_family", lambda name: TinyFamily)
+    _images(str(tmp_path / "train"), [(200, 30, 30), (190, 40, 20), (60, 160, 60), (20, 20, 200)])
+    job = {"name": "t", "family": "tiny", "profile": {},
+           "datasets": [{"path": str(tmp_path / "train"), "trigger": "", "repeats": 1, "resolution": 64,
+                         "flip": True, "caption_dropout": 0.4}],
+           "settings": {"steps": 6, "rank": 2, "alpha": 2, "resolution": 64, "seed": 1, "optimizer": "adamw",
+                        "learning_rate": 0.01, "save_every": 0, "sample_every": 0, "sample_at_start": False,
+                        "sample_at_end": False}}
+
+    def run(name, stop_at=None):
+        job_dir = tmp_path / name
+        job_dir.mkdir(exist_ok=True)
+        (job_dir / "job.json").write_text(json.dumps(job))
+        t = trainer_mod.Trainer(str(job_dir))
+        if stop_at is not None:
+            read = t.read_control
+            t.read_control = lambda: {"action": "stop"} if t.status["step"] >= stop_at else read()
+        return t.run(), job_dir
+
+    assert run("straight")[0] == "completed"
+    assert run("resumed", stop_at=3)[0] == "stopped"
+    # stopped again before its saved state loads: the checkpoint it made stays listed
+    job_dir = tmp_path / "resumed"
+    t = trainer_mod.Trainer(str(job_dir))
+    t.write_status(force=True)
+    assert [c["step"] for c in json.loads((job_dir / "status.json").read_text())["checkpoints"]] == [3]
+    assert run("resumed")[0] == "completed"
+
+    def losses(name):
+        return [json.loads(line)["loss"] for line in (tmp_path / name / "metrics.jsonl").read_text().splitlines()]
+
+    assert losses("resumed") == pytest.approx(losses("straight"))
+    a, b = (load_file(str(tmp_path / n / "output" / "t.safetensors")) for n in ("straight", "resumed"))
+    assert all(torch.allclose(a[k], b[k]) for k in a)
