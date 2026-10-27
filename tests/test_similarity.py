@@ -7,6 +7,7 @@ stood in for by a fake that reads a feature vector off each image's colour.
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 import torch
@@ -63,13 +64,37 @@ def test_a_concept_scores_images_between_the_floor_and_its_own_images(dataset):
     assert r["nearest"]["path"] in dataset and r["nearest"]["sim"] == pytest.approx(0.8, abs=1e-3)
     assert not r["near_copy"]
     # with the base render (red, cosine 0) as the floor the number is the same here; a floor half way halves it
-    assert c.score(blue, floor=0.0)["likeness"] == pytest.approx(80.0, abs=0.1)
-    assert c.score(blue, floor=0.6)["likeness"] == pytest.approx(50.0, abs=0.1)
+    red = emb([Image.new("RGB", (4, 4), (255, 0, 0))])[0]
+    assert c.score(blue, red)["likeness"] == pytest.approx(80.0, abs=0.1) and c.score(blue, red)["floor"] == 0.0
+    assert c.score(blue, torch.tensor([0.8, 0.0, 0.6]))["likeness"] == pytest.approx(50.0, abs=0.1)
     # clamped to 0–100
     green = emb([Image.new("RGB", (4, 4), (0, 255, 0))])[0]
-    assert c.score(green, floor=0.5)["likeness"] == 0.0
+    assert c.score(green, torch.tensor([0.866, 0.0, 0.5]))["likeness"] == 0.0
     yellow = emb([Image.new("RGB", (4, 4), (255, 255, 0))])[0]
     assert c.score(yellow)["likeness"] == 100.0
+    # a base render within MIN_GAP of the target leaves too narrow a scale to read: the floor is FLOOR instead
+    close = F.normalize(torch.tensor([0.1, 0.0, 1.0]), dim=0)
+    r = c.score(blue, close)
+    assert r["floor"] is None and r["base_sim"] == pytest.approx(0.995, abs=1e-3)
+    assert r["likeness"] == pytest.approx(80.0, abs=0.1)
+
+
+def test_an_image_is_scored_against_the_part_of_a_varied_dataset_it_looks_like():
+    """A dataset of two unlike kinds of image has a centre neither is near; an image of one kind is measured against
+    its own kind, so the LoRA moving a sample towards it reads as rising likeness, not falling."""
+    kind_a = [[1.0, 0.1 * i, 0.0] for i in range(3)]
+    kind_b = [[0.0, 0.1 * i, 1.0] for i in range(3)]
+    emb = F.normalize(torch.tensor(kind_a + kind_b), dim=-1)
+    c = sim.Concept.of([f"{i}.png" for i in range(6)], emb)
+    assert sim.neighbours(6) == 3 and c.self_sim < 0.75
+    base = F.normalize(torch.tensor([1.0, 0.0, 1.0]), dim=0)  # the plain model: between the two
+    early = F.normalize(torch.tensor([1.0, 0.1, 0.6]), dim=0)
+    late = F.normalize(torch.tensor([1.0, 0.1, 0.1]), dim=0)  # trained: well into kind A
+    # against the dataset's centre the trained sample scores lower than the base render did
+    assert float(late @ c.centroid) < float(base @ c.centroid)
+    r_early, r_late = c.score(early, base), c.score(late, base)
+    assert {Path(t["path"]).stem for t in c.score(late, top=3)["top"]} == {"0", "1", "2"}
+    assert 0 < r_early["likeness"] < r_late["likeness"] and r_late["likeness"] > 80
 
 
 def test_a_near_copy_of_a_training_image_is_flagged(dataset):

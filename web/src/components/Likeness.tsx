@@ -154,9 +154,11 @@ export function CompareDialog({ target, onClose }: { target: CompareTarget; onCl
                 {r.near_copy ? <> · <span style={{ color: "var(--danger)" }}>a near copy of one training image</span></> : ""}</span>
             </div>
             <div className="muted small" style={{ lineHeight: 1.5 }}>
-              Similarity to the dataset's centre {r.similarity.toFixed(2)}; its own {r.dataset.count} images score {r.dataset.self_sim.toFixed(2)} (100%).{" "}
-              {r.floor
+              Measured against the {r.neighbours} training images closest to it: they score {r.target.toFixed(2)} against their centre (100%), this image {r.similarity.toFixed(2)}.{" "}
+              {r.floor?.used
                 ? <>0% is the same seed rendered without LoRAs ({r.floor.similarity.toFixed(2)}): the number says how much of the way from the base model to the dataset this image went.</>
+                : r.floor
+                ? <>0% is an unrelated image: the same seed rendered without LoRAs already scores {r.floor.similarity.toFixed(2)}, too near 100% to measure from.</>
                 : <>0% is an unrelated image. Compare an output that was rendered with and without LoRAs (<em>Compare without LoRAs</em>), or a training sample after step 0, and 0% becomes the base model's own render.</>}
             </div>
             <div>

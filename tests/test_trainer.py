@@ -323,3 +323,61 @@ def test_a_resumed_job_trains_on_as_if_it_never_stopped(tmp_path, monkeypatch):
     assert losses("resumed") == pytest.approx(losses("straight"))
     a, b = (load_file(str(tmp_path / n / "output" / "t.safetensors")) for n in ("straight", "resumed"))
     assert all(torch.allclose(a[k], b[k]) for k in a)
+
+
+class SamplingFamily(TinyFamily):
+    """The tiny family with a sampler: the latents' noise, stepped by the prediction, decoded by upscaling."""
+
+    def prepare_sampling(self, model, cond, uncond, width, height, cfg, seed, images=None):
+        g = torch.Generator().manual_seed(int(seed))
+        x = torch.randn(1, 3, height // 16, width // 16, generator=g).to(self.device)
+        return x, lambda x, s: self.predict(model, x, torch.full((1,), s, device=self.device), [cond]) * 0.1
+
+    def decode_latents(self, latents):
+        return F.interpolate(latents.float(), scale_factor=16).clamp(-1, 1)
+
+
+def test_a_job_resumed_after_a_crash_keeps_its_checkpoints_samples_and_its_time(tmp_path, monkeypatch, capsys):
+    """A checkpoint's samples are made after its state is saved: a job that dies then and resumes from that state
+    still lists them; the time it took counts every run; a sample prompt that's a training caption is noted."""
+    monkeypatch.setattr(trainer_mod, "get_family", lambda name: SamplingFamily)
+    data = tmp_path / "train"
+    _images(str(data), [(200, 30, 30), (190, 40, 20)])
+    for i in range(2):
+        (data / f"{i}.txt").write_text(f"photo {i}")
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    (job_dir / "job.json").write_text(json.dumps({
+        "name": "t", "family": "tiny", "profile": {},
+        "datasets": [{"path": str(data), "trigger": "", "repeats": 1, "resolution": 64}],
+        "settings": {"steps": 6, "rank": 2, "alpha": 2, "resolution": 64, "seed": 1, "optimizer": "adamw",
+                     "learning_rate": 0.01, "save_every": 3, "sample_every": 3, "sample_at_start": False,
+                     "sample_steps": 2, "sample_width": 64, "sample_height": 64, "likeness_enabled": False,
+                     "sample_prompts": [{"prompt": "Photo 0."}, {"prompt": "a photo nobody took"}]}}))
+
+    t = trainer_mod.Trainer(str(job_dir))
+    read = t.read_control
+
+    def crash():
+        if t.status["step"] >= 4:
+            raise RuntimeError("out of memory")
+        return read()
+    t.read_control = crash
+    with pytest.raises(RuntimeError):
+        t.run()
+    assert [s["step"] for s in json.loads((job_dir / "status.json").read_text())["samples"]] == [3, 3]
+    out = capsys.readouterr().out
+    assert "Note: sample prompt 1 is the caption of 0.png" in out and "sample prompt 2" not in out
+
+    # the state records the time to reach it; say the first run took an hour
+    state_file = job_dir / "state" / "last.pt"
+    state = torch.load(state_file, weights_only=False)
+    assert "run_seconds" in state["status"]
+    state["status"]["run_seconds"] = 3600.0
+    torch.save(state, state_file)
+
+    assert trainer_mod.Trainer(str(job_dir)).run() == "completed"
+    status = json.loads((job_dir / "status.json").read_text())
+    assert [s["step"] for s in status["samples"]] == [3, 3, 6, 6]
+    assert all(os.path.exists(job_dir / "samples" / s["file"]) for s in status["samples"])
+    assert "Done in 1h 00m (" in capsys.readouterr().out and status["run_seconds"] >= 3600

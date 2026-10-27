@@ -5,15 +5,23 @@ Every image (a clip stands in as its first frame) becomes a unit vector of DINOv
 it's drawn rather than what a caption would say). A dataset is a ``Concept``: its images' vectors, their mean (the
 centroid) and ``self_sim``, how alike the images are to each other (the mean cosine of each to the centroid).
 
-An image is scored against a concept by its cosine to the centroid (``sim``), given as a **likeness**:
+An image is scored against its **neighbourhood**: the ``neighbours(n)`` training images closest to it, their mean
+(the local centre) and how alike they are to it (``target``, the mean cosine of each to the local centre). Its cosine
+to the local centre (``sim``) is given as a **likeness**:
 
-    likeness = (sim - floor) / (self_sim - floor)   as a percentage, 0 to 100
+    likeness = (sim - floor) / (target - floor)   as a percentage, 0 to 100
 
-100% means the image is as close to the dataset as the dataset's own images are, 0% no closer than the floor. The
+100% means the image is as close to that part of the dataset as its own images are, 0% no closer than the floor. The
 floor is the base model's render of the same prompt and seed when there is one (a training sample's step-0 render, a
-Sandbox run's render without LoRAs): then likeness says how much of the gap between the plain model and the dataset
-the LoRA closed, which is the number to watch over training. Without a base render the floor is ``FLOOR``, what an
-unrelated image scores against a dataset's centroid (about 0, measured: see ``docs/likeness.md``).
+Sandbox run's render without LoRAs), scored against the same neighbourhood: then likeness says how much of the gap
+between the plain model and the dataset the LoRA closed, which is the number to watch over training. Without a base
+render, or when the base render is already within ``MIN_GAP`` of the target (the prompt alone gets there, and a scale
+that narrow reads 0 or 100 on noise), the floor is ``FLOOR``, what an unrelated image scores (about 0, measured: see
+``docs/likeness.md``).
+
+The neighbourhood is what makes a varied dataset work: one of Creepers, golems and villages has a centroid that no
+single picture is near (its images score 0.47 against it), and a sample of a Creeper rightly moves away from it as it
+moves towards the Creepers.
 
 The **nearest** training image (the highest cosine to any single one) tells memorisation from likeness: above
 ``NEAR_COPY`` the image is a near copy of that training image, however the likeness reads.
@@ -45,6 +53,7 @@ DINO_REPO = "facebook/dinov2-small"
 # one prompt from a distilled model 0.5 to 0.98; unrelated images score about 0 against a dataset's centroid.
 NEAR_COPY = 0.97  # cosine to one training image above which the image is flagged as a near copy of it
 FLOOR = 0.0  # what an unrelated image scores against a dataset's centroid: the floor without a base render
+MIN_GAP = 0.05  # the least a base render may score below the target for it to be the floor (else FLOOR is)
 DUPLICATE = 0.98  # cosine above which two dataset images count as duplicates (copies and re-encodes)
 MAX_IMAGES = 2000  # dataset images a concept is built from (a random sample of bigger datasets)
 BATCH = 16
@@ -129,10 +138,16 @@ def embed_files(embedder: Embedder, paths: list[str], progress=None, check=None)
     return (torch.cat(vecs) if vecs else torch.zeros(0, 384)), kept
 
 
-def likeness(sim: float, self_sim: float, floor: float) -> float:
-    """``sim`` as a share of the way from ``floor`` to ``self_sim``, in percent, 0 to 100."""
-    gap = max(self_sim - floor, 1e-3)
+def likeness(sim: float, target: float, floor: float) -> float:
+    """``sim`` as a share of the way from ``floor`` to ``target``, in percent, 0 to 100."""
+    gap = max(target - floor, 1e-3)
     return round(min(100.0, max(0.0, 100 * (sim - floor) / gap)), 1)
+
+
+def neighbours(n: int) -> int:
+    """How many training images an image is scored against: about the square root of the dataset's size, 3 to 10
+    (all of a smaller one)."""
+    return min(n, max(3, min(10, round(n ** 0.5))))
 
 
 @dataclass
@@ -160,17 +175,26 @@ class Concept:
         emb, kept = embed_files(embedder, paths, progress, check)
         return cls.of(kept, emb)
 
-    def score(self, e: torch.Tensor, floor: float | None = None, top: int = 1) -> dict:
-        """One image's vector against the concept: {sim (to the centroid), likeness (floor: ``FLOOR`` without a base
-        render), nearest: {path, sim} (the closest training image), top: the ``top`` closest, near_copy}."""
+    def score(self, e: torch.Tensor, base: torch.Tensor | None = None, top: int = 1) -> dict:
+        """One image's vector against its neighbourhood of the concept: {sim (to the local centre), target (the
+        neighbourhood's own, 100%), floor (the base render ``base``'s; None: ``FLOOR``, as there's no base render or
+        it's within ``MIN_GAP`` of the target), base_sim (the base render's, used or not), likeness, nearest: {path,
+        sim} (the closest training image), top: the ``top`` closest, near_copy}."""
         if not self.paths:
-            return {"sim": None, "likeness": None, "nearest": None, "top": [], "near_copy": False}
+            return {"sim": None, "target": None, "floor": None, "base_sim": None, "likeness": None, "nearest": None,
+                    "top": [], "near_copy": False}
         e = e.float()
-        sim = float(e @ self.centroid)
         sims = self.emb @ e
-        order = sims.argsort(descending=True)[:max(1, top)].tolist()
-        best = [{"path": self.paths[k], "sim": round(float(sims[k]), 4)} for k in order]
-        return {"sim": round(sim, 4), "likeness": likeness(sim, self.self_sim, FLOOR if floor is None else floor),
+        order = sims.argsort(descending=True)
+        hood = self.emb[order[:neighbours(len(self.paths))]]
+        centre = F.normalize(hood.mean(0), dim=-1)
+        sim, target = float(e @ centre), float((hood @ centre).mean())
+        base_sim = float(base.float() @ centre) if base is not None else None
+        floor = base_sim if base_sim is not None and target - base_sim >= MIN_GAP else None
+        best = [{"path": self.paths[k], "sim": round(float(sims[k]), 4)} for k in order[:max(1, top)].tolist()]
+        return {"sim": round(sim, 4), "target": round(target, 4), "floor": None if floor is None else round(floor, 4),
+                "base_sim": None if base_sim is None else round(base_sim, 4),
+                "likeness": likeness(sim, target, FLOOR if floor is None else floor),
                 "nearest": best[0], "top": best, "near_copy": best[0]["sim"] >= NEAR_COPY}
 
     def duplicates(self, threshold: float = DUPLICATE) -> list[dict]:
@@ -275,8 +299,9 @@ class LikenessMeter:
             self.log(f"Likeness: embedding {len(paths)} training image(s) with DINOv2")
             self.concept = Concept.build(self.embed, paths)
             self._save()
-        self.log(f"Likeness: the training images score {self.concept.self_sim:.2f} against their own centre; a sample "
-                 "at 100% is as alike to them as they are to each other")
+        k = neighbours(len(self.concept.paths))
+        self.log(f"Likeness: each sample is scored against the {k} training image(s) closest to it; at 100% it's as "
+                 "alike to them as they are to each other, at 0% no more than the base model's render")
 
     def _save(self):
         os.makedirs(os.path.dirname(self.state_file) or ".", exist_ok=True)
@@ -314,16 +339,16 @@ class LikenessMeter:
         self._save()
 
     def score(self, spec: dict, media, step: int) -> dict:
-        """{likeness, similarity, floor, nearest: {file, sim}, near_copy} for one sample, or {} for sound."""
+        """{likeness, similarity, target, floor, base_sim, nearest: {file, sim}, near_copy} for one sample (see
+        ``Concept.score``), or {} for sound."""
         img = media_image(media)
         if img is None or self.concept is None or not self.concept.paths:
             return {}
         e = self.embed([img])[0]
-        base = self.base_for(spec, step, e)
-        floor = float(base @ self.concept.centroid) if base is not None else None
-        r = self.concept.score(e, floor)
+        r = self.concept.score(e, self.base_for(spec, step, e))
         near = r["nearest"]
-        return {"likeness": r["likeness"], "similarity": r["sim"], "floor": round(floor, 4) if floor is not None else None,
+        return {"likeness": r["likeness"], "similarity": r["sim"], "target": r["target"], "floor": r["floor"],
+                "base_sim": r["base_sim"],
                 "nearest": {"file": os.path.basename(near["path"]), "path": near["path"], "sim": near["sim"]},
                 "near_copy": r["near_copy"]}
 
@@ -341,7 +366,8 @@ def summarise(entries: list[dict]) -> dict | None:
 def run(request: dict, embedder: Embedder | None = None, progress=None) -> dict:
     """The server's requests. ``request``: {concept: {paths, cache}, images: [paths], floors: [path | null] (one
     per image, the base render it's measured from), top: how many nearest images, duplicates: threshold | null}
-    -> {count (images in the concept), self_sim, results: [{sim, likeness, floor, nearest, top, near_copy}],
+    -> {count (images in the concept), self_sim, results: [{sim, target, floor, base_sim, likeness, nearest, top,
+        near_copy}] (see ``Concept.score``),
         duplicates: [{a, b, sim}]}."""
     embedder = embedder or Embedder("cuda" if torch.cuda.is_available() else "cpu")
     c = request.get("concept") or {}
@@ -351,11 +377,8 @@ def run(request: dict, embedder: Embedder | None = None, progress=None) -> dict:
     floors = request.get("floors") or [None] * len(images)
     for path, floor_path in zip(images, floors):
         e = embedder([load_image(path)])[0]
-        floor = None
-        if floor_path:
-            floor = float(embedder([load_image(floor_path)])[0] @ concept.centroid)
-        r = concept.score(e, floor, int(request.get("top") or 1))
-        out["results"].append({**r, "floor": round(floor, 4) if floor is not None else None})
+        base = embedder([load_image(floor_path)])[0] if floor_path else None
+        out["results"].append(concept.score(e, base, int(request.get("top") or 1)))
     if request.get("duplicates") is not None:
         out["duplicates"] = concept.duplicates(float(request["duplicates"]))
     return out

@@ -34,7 +34,8 @@ def engine(monkeypatch):
     def run(request):
         asked.append(request)
         paths = request["concept"]["paths"]
-        results = [{"sim": 0.8, "likeness": 80.0, "floor": 0.0 if f else None, "nearest": {"path": paths[0], "sim": 0.8},
+        results = [{"sim": 0.8, "target": 1.0, "likeness": 80.0, "floor": 0.0 if f else None,
+                    "base_sim": 0.0 if f else None, "nearest": {"path": paths[0], "sim": 0.8},
                     "top": [{"path": p, "sim": 0.8 - 0.1 * i} for i, p in enumerate(paths[:5])], "near_copy": False}
                    for f in (request.get("floors") or [None] * len(request.get("images") or []))]
         dups = [{"a": paths[0], "b": paths[1], "sim": 0.99}] if request.get("duplicates") is not None and len(paths) > 1 else []
@@ -77,7 +78,8 @@ def test_a_runs_output_is_compared_with_its_render_without_loras_as_the_floor(cl
     assert r.status_code == 200, r.text
     out = r.json()
     assert out["likeness"] == 80.0 and out["dataset"]["count"] == 3 and out["dataset"]["self_sim"] == 0.9
-    assert out["floor"] == {"url": f"/api/sandbox/file/{rid}/0_base.png", "similarity": 0.0}
+    assert out["floor"] == {"url": f"/api/sandbox/file/{rid}/0_base.png", "similarity": 0.0, "used": True}
+    assert out["target"] == 1.0 and out["neighbours"] == 3
     assert out["image"]["kind"] == "run" and out["image"]["url"] == f"/api/sandbox/file/{rid}/0_lora.png"
     assert [n["name"] for n in out["nearest"]] == ["cat_0.png", "cat_1.png", "cat_2.png"]
     assert out["nearest"][0]["url"].startswith("/api/thumb?path=")

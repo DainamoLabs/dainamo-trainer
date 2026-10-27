@@ -148,10 +148,12 @@ def check_image(body: CompareIn) -> tuple[str, str | None, dict]:
 @router.post("/similarity/compare")
 def compare(body: CompareIn):
     """How much an image looks like a dataset: {dataset: {id, name, count, self_sim}, image: {kind, label, url},
-    likeness (%), similarity (cosine to the dataset's centre), floor ({url, similarity}: the base model's render of
-    the same prompt and seed, when there is one; else null, and the floor is 0), nearest: [{path, name, url, sim}] (the
-    ``TOP`` closest training images), near_copy (the closest is at least ``NEAR_COPY`` alike: a near copy of it)}."""
-    from ...engine.similarity import FLOOR, NEAR_COPY
+    likeness (%), similarity (cosine to the centre of its closest training images, ``neighbours`` of them), target
+    (theirs to it: 100%), floor ({url, similarity, used}: the base model's render of the same prompt and seed, when
+    there is one, and whether it's the floor: not when it's within ``MIN_GAP`` of the target; else null, and the floor
+    is 0), nearest: [{path, name, url, sim}] (the ``TOP`` closest training images), near_copy (the closest is at least
+    ``NEAR_COPY`` alike: a near copy of it)}."""
+    from ...engine.similarity import FLOOR, NEAR_COPY, neighbours
 
     d = dataset_or_404(body.dataset_id)
     path, floor, image = check_image(body)
@@ -163,8 +165,9 @@ def compare(body: CompareIn):
     r = out["results"][0]
     return {"dataset": {"id": d["id"], "name": d["name"], "count": out["count"], "self_sim": out["self_sim"]},
             "image": {k: image[k] for k in ("kind", "label", "url")},
-            "likeness": r["likeness"], "similarity": r["sim"],
-            "floor": {"url": image["floor_url"], "similarity": r["floor"]} if r.get("floor") is not None else None,
+            "likeness": r["likeness"], "similarity": r["sim"], "target": r["target"], "neighbours": neighbours(out["count"]),
+            "floor": {"url": image["floor_url"], "similarity": r["base_sim"], "used": r["floor"] is not None}
+            if r.get("base_sim") is not None else None,
             "floor_default": FLOOR, "near_copy_at": NEAR_COPY,
             "nearest": [{**_file(t["path"], d["path"]), "sim": t["sim"]} for t in r.get("top") or []],
             "near_copy": bool(r.get("near_copy"))}

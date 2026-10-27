@@ -118,6 +118,7 @@ class Trainer:
         self.finetune = bool(self.s.get("finetune_enabled"))  # the whole model trains, not a LoRA
         self._last_status_write = 0.0
         self._progress_open = False
+        self.time_before: float | None = 0.0  # seconds earlier runs of a resumed job took (None: not recorded)
         old = self.read_status()
         self.evaluating = bool(self.job.get("evaluate"))
         if self.evaluating:
@@ -403,6 +404,8 @@ class Trainer:
             weights = {"lora": network.state_dict(torch.float32)}
             if self.ema is not None:
                 weights["ema"] = self.ema.state_dict()
+        if self.time_before is not None:  # the time the job has taken to get here, over all its runs
+            self.status["run_seconds"] = round(self.time_before + time.time() - self.status["started_at"], 1)
         # written beside it and then swapped in, so a kill, OOM or full disk mid-save keeps the last good state
         path = os.path.join(self.job_dir, "state", "last.pt")
         torch.save({"step": step, **weights, "opt": opt.state_dict(), "sched": sched.state_dict(),
@@ -863,6 +866,22 @@ class Trainer:
             can_render_base=not self.finetune)
         self.likeness.setup([it.path for it in items])
 
+    def note_recall_samples(self, items):
+        """A note for each sample prompt that is a training caption word for word: its samples show how well the LoRA
+        recalls that image, not how it does on a prompt it hasn't seen."""
+        if self.evaluating or self.slider:
+            return
+        def norm(text):
+            return " ".join(text.lower().split()).strip(" .,")
+        captions = {}
+        for it in items:
+            captions.setdefault(norm(it.caption), it.path)
+        for i, sp in enumerate(self.sample_specs()):
+            if (path := captions.get(norm(sp["prompt"]))) and norm(sp["prompt"]):
+                self.log(f"Note: sample prompt {i + 1} is the caption of {os.path.basename(path)}, so its samples show "
+                         "how well the LoRA recalls that image, not how it carries over to new prompts; add a prompt "
+                         "the dataset doesn't have to see that")
+
     def run_evaluation(self) -> str:
         """Score a finished job's saved checkpoints, as asked from its page (``job["evaluate"]``): the base
         model, then each checkpoint, with the checkpoint picker and/or concept bleed settings chosen then,
@@ -1153,7 +1172,13 @@ class Trainer:
                 g.update(initial_lr=lr, weight_decay=wd, lr=lr * sched.lr_lambdas[0](sched.last_epoch))
             start = st["step"]
             for k in ("samples", "checkpoints", "evals", "likeness"):
-                self.status[k] = st["status"].get(k, [])
+                kept = st["status"].get(k, [])
+                # a checkpoint's samples are made after its state is saved, so the state doesn't list them: they're
+                # in the status as it was left (the files are there) unless the state has that step's own
+                made_after = [] if any(x.get("step") == start for x in kept) else \
+                    [x for x in self.status.get(k, []) if x.get("step") == start]
+                self.status[k] = kept + made_after
+            self.time_before = st["status"].get("run_seconds")
             for k in ("recommended", "sweep"):
                 self.status[k] = st["status"].get(k)
             self.log(f"Resumed from step {start}")
@@ -1168,6 +1193,7 @@ class Trainer:
             items, payload_files = self.render_slider_images(driver, model, network)
         self.make_evaluators(driver, model, network, items, val_keys, val_payload_files, bleed_prompts,
                              base_weights=resume_from is None)
+        self.note_recall_samples(items)
         slider_conds = [{k: self.text_emb(p) for k, p in prompts.items()} for prompts in self.slider.prompt_sets()] \
             if self.slider else []
         if self.slider:
@@ -1202,7 +1228,7 @@ class Trainer:
         if start:
             self.restore_rng(rng_saved, batches)
         ema_loss = None
-        t0, step_times = time.time(), []
+        step_times = []
         step = start
         told = False  # logged what the activation offload holds
         try:
@@ -1306,7 +1332,13 @@ class Trainer:
             self.strength_sweep(model, network)
         self.save_state(network, opt, sched, step, batches)
         self.status["phase"] = "completed"
-        self.log(f"Done in {(time.time() - t0) / 60:.1f} min")
+        took = time.time() - self.status["started_at"]
+        if not start:
+            self.log(f"Done in {fmt_eta(took)}")
+        elif self.time_before is None:
+            self.log(f"Done in {fmt_eta(took)} since resuming at step {start} (earlier runs' time wasn't recorded)")
+        else:
+            self.log(f"Done in {fmt_eta(self.time_before + took)} ({fmt_eta(took)} since resuming at step {start})")
         return "completed"
 
 

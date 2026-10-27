@@ -13,21 +13,35 @@ picture and how it's drawn, not what a caption would say: two photos of the same
 dog score high, a painting and a photo of a dog less so. A clip stands in as its
 first frame.
 
-A dataset is the vectors of its images (a random 2000 of a bigger one), their
-mean (the centre) and how alike the images are to each other: the average cosine
-of each to the centre, which is what a perfect sample would score. An image's
-**similarity** is its cosine to the centre, and its likeness puts that on a
-scale:
+A dataset is the vectors of its images (a random 2000 of a bigger one). An
+image is measured against its **neighbourhood**: the training images closest to
+it (about the square root of the dataset's size, 3 to 10; all of a dataset of 3
+or fewer), their mean (the local centre), and how alike they are to each other,
+the average cosine of each to that centre, which is what a perfect sample would
+score. An image's **similarity** is its cosine to the local centre, and its
+likeness puts that on a scale:
 
-- **100%** is as alike to the dataset as its own images are to each other.
-- **0%** is the **floor**: the base model's render of the same prompt and seed
-  when there is one, else an unrelated image (which scores about 0 against a
-  dataset's centre).
+- **100%** is as alike to that part of the dataset as its own images are to each
+  other.
+- **0%** is the **floor**: the base model's render of the same prompt and seed,
+  measured against the same neighbourhood, when there is one; else an unrelated
+  image (which scores about 0).
 
 With the base model's render as the floor, the number says how much of the way
 from the plain model to the dataset the LoRA took the image. That's the number
 to watch over training: the prompt alone already puts a render some way toward
-a dataset of the thing it names, and the floor takes that out.
+a dataset of the thing it names, and the floor takes that out. When the base
+render is already within 0.05 of 100%, the prompt alone gets there and a scale
+that narrow would read 0 or 100 on noise, so the floor is an unrelated image
+instead (the Sandbox's comparison says so).
+
+Why a neighbourhood and not the whole dataset's centre: a varied dataset has a
+centre no single picture is near. A set of found-footage Minecraft photos
+(Creepers, Iron Golems, villages) scored only 0.47 against its own centre, the
+base model's Creeper already 0.46, and as training pulled the Creeper sample
+towards the Creeper photos it moved *away* from the centre (to 0.44). Measured
+against the five photos nearest it, the same samples read 0% at step 0 and
+46–80% from step 250 on.
 
 Beside it, the **closest training image** is the one whose cosine with the image
 is highest. At 0.97 or more the image is flagged a **near copy** of it: the LoRA
@@ -46,7 +60,7 @@ Measured on renders of one prompt at six seeds, and on their copies:
 | a mirrored copy | 0.91–0.94 |
 | two renders of one prompt at different seeds | 0.51–0.98 |
 | an image against an unrelated dataset's centre | −0.03–0.05 |
-| a dataset's own images against its centre | 0.74–0.97 |
+| a dataset's own images against its centre | 0.74–0.97 (0.47 for a varied one) |
 
 Renders of one prompt from a distilled model are very alike (the cat set scored
 0.89–0.98 between seeds), so with a dataset of them the near-copy flag can go

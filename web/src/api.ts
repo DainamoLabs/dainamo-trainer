@@ -105,9 +105,10 @@ export type Sample = {
   width?: number; height?: number; seed?: number; lora_scale?: number; // absent on jobs from before prompt cards
   kind?: MediaKind; poster?: string; frames?: number; images?: string[];
   seconds?: number; lyrics?: string; score?: string; // music: the song's length and lyrics, and its score (ABC) file
-  // its likeness to the training images (see components/Likeness.tsx): the percentage, the cosine to their centre,
-  // the floor (the base model's render of the card; null: none), the closest training image, and whether it's a near copy
-  likeness?: number | null; similarity?: number; floor?: number | null;
+  // its likeness to the training images (see components/Likeness.tsx): the percentage, the cosine to the centre of
+  // the closest ones and theirs (target: 100%), the floor (the base model's render of the card; null: none, or too
+  // near the target to be one), the closest training image, and whether it's a near copy
+  likeness?: number | null; similarity?: number; target?: number; floor?: number | null;
   nearest?: { file: string; path: string; sim: number }; near_copy?: boolean;
 };
 // one step's likeness: the mean of its samples, and the closest any came to one training image (cosine)
@@ -116,8 +117,9 @@ export type LikenessPoint = { step: number; likeness: number; nearest: number; n
 export type LikenessCompare = {
   dataset: { id: string; name: string; count: number; self_sim: number };
   image: { kind: "run" | "sample" | "file"; label: string; url: string | null };
-  likeness: number; similarity: number;
-  floor: { url: string | null; similarity: number } | null; // the same prompt and seed rendered by the base model
+  likeness: number; similarity: number; target: number; neighbours: number; // to the centre of its closest training images
+  // the same prompt and seed rendered by the base model; used: it's the floor (not when it's nearly at the target)
+  floor: { url: string | null; similarity: number; used: boolean } | null;
   floor_default: number; near_copy_at: number;
   nearest: { path: string; name: string; url: string; sim: number }[];
   near_copy: boolean;
