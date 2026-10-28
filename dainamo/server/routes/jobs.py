@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from ...engine.dataset import resolutions
 from ...engine.families import get_family
 from ...engine.families.base import takes_sources
-from .. import db
+from .. import db, model_files
 from ..queue import CACHE_DIR, job_dir, job_folder, read_status, scheduler, send_control
 from ..validation import LOSS_AND_EMA_DEFAULTS, check_evaluation, check_resolution, check_settings
 from .common import dataset_or_404, job_or_404, not_found, profile_or_404
@@ -214,6 +214,24 @@ def _sources(d: dict, ids: list[str], info, kept: dict[str, dict]) -> list[dict]
     return out
 
 
+def _check_profile(cfg: dict):
+    """400 if the job's model files are there but wrong (e.g. FLUX.2 Klein's 4B with the 9B's text encoder, or a file
+    of another model), which would otherwise fail only once the job had waited its turn and loaded them. A file
+    that isn't there yet (a ready job's download, a drive to mount) is left for the job to find."""
+    F = get_family(cfg["family"])
+    data = cfg.get("profile") or {}
+    paths = {f.key: f.label.replace(" (CLIP)", "") for f in F.info.profile_fields if f.kind == "path"}
+
+    def there(k: str) -> bool:
+        return k not in paths or os.path.exists(os.path.expanduser(str(data.get(k) or "").strip()))
+
+    bad = [c for c in model_files.note_downloads(F.validate_profile(data), data)
+           if c["level"] == "error" and str(data.get(c["field"]) or "").strip() and there(c["field"])]
+    if bad:
+        raise HTTPException(400, f"The {cfg.get('profile_name')} profile needs fixing (Profiles): "
+                                 + "; ".join(f"{paths.get(c['field'], c['field'])}: {c['message']}" for c in bad))
+
+
 class JobNew(JobIn):
     start: bool = False  # Add and start: queued at once instead of ready
 
@@ -225,6 +243,7 @@ def create_job(body: JobNew):
     it's queued at once, behind the jobs already waiting."""
     jid = db.new_id()
     config = {"id": jid, **_job_config(body)}
+    _check_profile(config)
     status = "queued" if body.start else "ready"
     db.execute("INSERT INTO jobs (id, name, status, family, profile_name, gpu, position, created, config, folder) "
                "VALUES (?,?,?,?,?,?,?,?,?,?)", (jid, config["name"], status, config["family"], config["profile_name"],
@@ -374,6 +393,7 @@ def edit_job(jid: str, body: JobEdit):
             new["profile"] = old["profile"]  # the model as it trained with it, though the profile may have changed
             changed = _changes(old, new)
         config = {"id": jid, **new}
+        _check_profile(config)
         db.execute("UPDATE jobs SET name=?, family=?, profile_name=?, gpu=?, config=? WHERE id=?",
                    (config["name"], config["family"], config["profile_name"], body.gpu, json.dumps(config), jid))
         # a RefMod is quick to make, so one that's been made (or failed) is made again with any change
@@ -533,6 +553,7 @@ def job_action(jid: str, body: ActionIn):
     if a == "start":  # a ready job joins the queue, behind the jobs already waiting
         if j["status"] != "ready":
             raise HTTPException(400, "Only a job that's ready to start can be started")
+        _check_profile(j["config"])  # its files may have arrived since it was added
         db.execute("UPDATE jobs SET status='queued', position=? WHERE id=? AND status='ready'", (db.now(), jid))
     elif a == "stop":
         scheduler.stop(jid)

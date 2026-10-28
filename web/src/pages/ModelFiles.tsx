@@ -5,16 +5,22 @@ import { ACTIVE, DownloadDialog, TaskRow } from "../components/ModelDownload";
 import { FileBrowser, usePoll, useToast } from "../components/ui";
 
 /** The files a profile of this family would use: the first usable one found per field, and the variant the
- *  diffusion model is for. */
+ *  diffusion model is for. Where files are for one of the family's models (FLUX.2 Klein's 4B or 9B), the others
+ *  are the diffusion model's model's: the first diffusion model whose model has a file for every field, else the
+ *  first. */
 export function profileFrom(fam: ModelFamily, info: Family | undefined): Partial<Profile> {
   const data: Record<string, unknown> = {};
   info?.profile_fields.forEach((x) => { if (x.default != null) data[x.key] = x.default; });
-  for (const f of fam.fields) {
-    if (f.profile === false) continue; // e.g. FLUX 3's prompt upsampler: for captions, not the profile
-    const pick = f.found.find((x) => !x.unsupported.length);
-    if (pick) data[f.key] = pick.path;
-  }
+  const fields = fam.fields.filter((f) => f.profile !== false); // not e.g. FLUX 3's prompt upsampler (for captions)
+  const pick = (f: ModelField, model: string | null | undefined) =>
+    usable(f).find((x) => !model || !x.model || x.model === model);
   const dm = fam.fields.find((f) => f.key === "diffusion_model");
+  const dms = dm ? usable(dm) : [];
+  const model = (dms.find((d) => fields.every((f) => !usable(f).length || pick(f, d.model))) || dms[0])?.model;
+  for (const f of fields) {
+    const x = pick(f, model);
+    if (x) data[f.key] = x.path;
+  }
   const opt = dm?.downloads.find((o) => o.have && o.have === data.diffusion_model);
   if (opt?.variant && info?.profile_fields.some((x) => x.key === "variant")) data.variant = opt.variant;
   return { name: fam.label.replace(/ \(.*\)$/, ""), family: fam.id, data };

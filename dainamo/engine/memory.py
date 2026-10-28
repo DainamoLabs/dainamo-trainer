@@ -279,9 +279,9 @@ def encode_bytes(driver_cls, profile: dict, pixels: int, loaded: bool = False) -
 def project(driver_cls, profile: dict, settings: dict, kind: str = "train") -> dict:
     """VRAM projection for a training job (``kind="train"``, ``settings`` as the job's) or a Sandbox
     generation (``kind="sample"``: width, height, frames, loras). Sizes are in GB."""
-    mem = driver_cls.memory
     finetune = kind == "train" and bool(settings.get("finetune_enabled"))
     resident, blocks, shapes = model_weights(driver_cls, profile["diffusion_model"], expand=finetune)
+    mem = driver_cls.memory_for(shapes)
     vae = vae_bytes(driver_cls, profile)
     te = file_gpu_bytes(profile.get("text_encoder", ""), skip=driver_cls.text_encoder_skip,
                         fp32=driver_cls.text_encoder_fp32)

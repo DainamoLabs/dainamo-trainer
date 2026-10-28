@@ -32,8 +32,9 @@ TEXT = 256  # caption tokens in the dummy conditions (MemoryProfile.text_tokens)
 SONG_TEXT = 64  # music: prompt tokens in the dummy conditions
 
 
-def dummy(family: str, w: int, h: int, frames: int):
-    """(payload, cond, settings) shaped like the family's cached training inputs (music: ``w`` seconds)."""
+def dummy(family: str, w: int, h: int, frames: int, model=None):
+    """(payload, cond, settings) shaped like the family's cached training inputs (music: ``w`` seconds), for
+    ``model`` where its size sets them (FLUX.2 Klein's 4B or 9B)."""
     bf = torch.bfloat16
     if family == "yue2":
         from dainamo.engine.families.yue2 import model as M
@@ -46,8 +47,9 @@ def dummy(family: str, w: int, h: int, frames: int):
         return {"latent": torch.randn(128, h // 16, w // 16)}, {"text": torch.randn(TEXT, 4096, dtype=bf)}, {}
     if family == "flux3_klein":  # Qwen3-VL-4B's 8 layers side by side, padded to a multiple of 80 tokens
         return {"latent": torch.randn(128, h // 16, w // 16)}, {"text": torch.randn(320, 20480, dtype=bf)}, {}
-    if family == "flux2_klein":  # Qwen3's 3 layers side by side (the 4B's width), always 512 tokens
-        return {"latent": torch.randn(128, h // 16, w // 16)}, {"text": torch.randn(512, 7680, dtype=bf)}, {}
+    if family == "flux2_klein":  # Qwen3's 3 layers side by side (the 4B's 7680, the 9B's 12288), always 512 tokens
+        width = model.config.context_in_dim if model is not None else 7680
+        return {"latent": torch.randn(128, h // 16, w // 16)}, {"text": torch.randn(512, width, dtype=bf)}, {}
     if family == "qwen_image_2":
         cond = {"embeds": torch.randn(TEXT, 4096, dtype=bf), "slots": torch.zeros(TEXT, dtype=torch.bool)}
         return {"latent": torch.randn(64, h // 16, w // 16), "refs": []}, {"text": cond}, {}
@@ -114,7 +116,7 @@ def measure_depth(driver, args, depth: int, sizes: list[int], rng) -> dict:
         else:
             model.gradient_checkpointing = ckpt
         for s in sizes:
-            payload, cond, settings = dummy(args.family, s, s, args.frames)
+            payload, cond, settings = dummy(args.family, s, s, args.frames, model)
 
             def step():
                 loss = driver.training_loss(model, [payload], [cond], settings, rng=rng)
@@ -124,7 +126,7 @@ def measure_depth(driver, args, depth: int, sizes: list[int], rng) -> dict:
                 p.grad = None
     model.eval()
     for s in sizes:
-        payload, cond, settings = dummy(args.family, s, s, args.frames)
+        payload, cond, settings = dummy(args.family, s, s, args.frames, model)
 
         @torch.no_grad()
         def forward():

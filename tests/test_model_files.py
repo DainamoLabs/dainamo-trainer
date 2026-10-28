@@ -90,10 +90,9 @@ def test_every_catalog_file_fits_its_family():
             assert d.id not in ids
             ids.add(d.id)
             assert not re.search(r"w4a8|w6a8|gptq|mxfp8", d.name), f"{d.id}: a format Dainamo can't read"
-        for field in {d.field for d in F.downloads}:
-            for v in {d.variant for d in F.downloads if d.field == field}:
-                picks = [d for d in F.downloads if d.field == field and d.variant == v and d.recommended]
-                assert len(picks) == 1, (F.info.id, field, v)
+        for field, v, m in {(d.field, d.variant, d.model) for d in F.downloads}:
+            picks = [d for d in F.downloads if (d.field, d.variant, d.model) == (field, v, m) and d.recommended]
+            assert len(picks) == 1, (F.info.id, field, v, m)
         required = {f.key for f in F.info.profile_fields if f.kind == "path" and f.required}
         assert required <= {d.field for d in F.downloads}, f"{F.info.id}: nothing to download for a required file"
 
@@ -291,6 +290,57 @@ def test_a_cache_of_many_repos_lists_quickly_once_scanned(client, hf_cache, monk
     os.utime(folder, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))  # a second later, as a real download would be
     names = [f["name"] for f in model_files.scan()]
     assert "owner/repo-3/vae/ae2.safetensors" in names and read == [str(folder / "ae2.safetensors")]
+
+
+def test_flux2_klein_files_say_which_model_they_are_for_and_a_job_refuses_a_mismatch(client, tmp_path):
+    models = tmp_path / "models"
+    (models / "diffusion_models").mkdir(parents=True)
+    (models / "text_encoders").mkdir()
+
+    def dit(name, hidden, ctx):
+        return header_only_safetensors(models / "diffusion_models" / name, {
+            "double_stream_modulation_img.lin.weight": ("BF16", (6 * hidden, hidden)),
+            "single_stream_modulation.lin.weight": ("BF16", (3 * hidden, hidden)),
+            "txt_in.weight": ("BF16", (hidden, ctx))})
+
+    def qwen(name, hidden, inter):
+        return header_only_safetensors(models / "text_encoders" / name, {
+            "model.embed_tokens.weight": ("BF16", (151936, hidden)),
+            "model.layers.0.self_attn.q_norm.weight": ("BF16", (128,)),
+            "model.layers.35.mlp.down_proj.weight": ("BF16", (hidden, inter))})
+
+    d9, d4 = dit("flux-2-klein-9b.safetensors", 4096, 12288), dit("flux-2-klein-base-4b.safetensors", 3072, 7680)
+    q4, q8 = qwen("qwen_3_4b.safetensors", 2560, 9728), qwen("qwen_3_8b.safetensors", 4096, 12288)
+    client.put("/api/settings", json={"models": {"folder": str(models)}})
+    try:
+        flux = _fields(client.get("/api/models").json(), "flux2_klein")
+        assert {x["name"]: x["model"] for f in ("diffusion_model", "text_encoder") for x in flux[f]["found"]} == {
+            "flux-2-klein-9b.safetensors": "9B", "flux-2-klein-base-4b.safetensors": "4B",
+            "qwen_3_4b.safetensors": "4B", "qwen_3_8b.safetensors": "9B"}
+        krea = _fields(client.get("/api/models").json(), "krea2")
+        assert all(x["model"] is None for f in krea.values() for x in f["found"])
+    finally:
+        client.put("/api/settings", json={"models": {"folder": ""}, "queue": {"gpus": [99]}})  # nothing launches
+
+    did = client.post("/api/datasets", json={"name": "k", "path": str(tmp_path)}).json()["id"]
+
+    def job(**data):
+        pid = client.post("/api/profiles", json={"name": "klein", "family": "flux2_klein", "data": data}).json()["id"]
+        return client.post("/api/jobs", json={"name": "k", "profile_id": pid, "datasets": [{"id": did}], "settings": {}})
+
+    r = job(diffusion_model=d4, text_encoder=q8)  # the 4B with the 9B's text encoder: refused before it's queued
+    assert r.status_code == 400 and "Text encoder: This is Qwen3-8B; the 4B diffusion model takes Qwen3-4B" in r.json()["detail"]
+    ok = job(diffusion_model=d4, text_encoder=q4)
+    assert ok.status_code == 200
+    # a file that isn't there yet is left for the job (a ready job's download); it's checked again on start
+    later = str(models / "text_encoders" / "later.safetensors")
+    ready = job(diffusion_model=d4, text_encoder=later)
+    assert ready.status_code == 200 and ready.json()["status"] == "ready"
+    os.link(q8, later)
+    r = client.post(f"/api/jobs/{ready.json()['id']}/action", json={"action": "start"})
+    assert r.status_code == 400 and "takes Qwen3-4B" in r.json()["detail"]
+    for j in (ok, ready):
+        client.delete(f"/api/jobs/{j.json()['id']}")
 
 
 def test_a_turbo_model_without_its_adapter_is_flagged(client):

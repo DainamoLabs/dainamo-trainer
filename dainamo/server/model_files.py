@@ -113,22 +113,24 @@ _scan_lock = threading.Lock()
 
 
 def _identify(path: str) -> dict:
-    """{fields: [[family, field]...] whose signature the file has, quant: labels, unsupported: formats, error}."""
+    """{fields: [[family, field]...] whose signature the file has, models: {"family/field": the model it's for
+    (``model_of``)}, quant: labels, unsupported: formats, error}."""
     from ..engine.comfy_io import describe_quant
     from ..engine.memory import tensors
 
     try:
         t = tensors(path)
     except Exception as e:
-        return {"fields": [], "quant": [], "unsupported": [], "error": str(e)}
+        return {"fields": [], "models": {}, "quant": [], "unsupported": [], "error": str(e)}
     fields = [[F.info.id, f] for F in FAMILIES.values() for f in F.signature_keys if F.matches(f, t)]
+    models = {f"{fam}/{f}": m for fam, f in fields if (m := FAMILIES[fam].model_of(f, t))}
     quant, unsupported = set(), set()
     if fields:
         try:
             quant, unsupported = describe_quant(path)
         except Exception:
             pass
-    return {"fields": fields, "quant": sorted(quant), "unsupported": sorted(unsupported), "error": ""}
+    return {"fields": fields, "models": models, "quant": sorted(quant), "unsupported": sorted(unsupported), "error": ""}
 
 
 def _profile_files() -> list[str]:
@@ -320,10 +322,11 @@ def overview() -> dict:
             known = {o["have"]: o["id"] for o in options if o["have"]}
             found = [{"path": f["path"], "name": f["name"], "size": f["size"], "where": where(f["path"]),
                       "source": f["source"], "repo": f["repo"], "quant": f["quant"], "unsupported": f["unsupported"],
-                      "download": known.get(f["path"])}
+                      "download": known.get(f["path"]), "model": f["models"].get(f"{F.info.id}/{key}")}
                      for f in files
                      if f["path"] in known or ([F.info.id, key] in f["fields"] and f["path"] not in extra)]
-            # the first usable one is what Create profile picks: the models folder's before the cache's
+            # the first usable one is what Create profile picks (of the files for the diffusion model's model, where
+            # they're tagged so): the models folder's before the cache's
             found.sort(key=lambda f: (bool(f["unsupported"]), f["source"] != "models", f["download"] is None,
                                       f["name"].lower()))
             fields.append({"key": key, "label": label, "hint": hint, "required": required, "downloads": options,

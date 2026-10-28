@@ -9,16 +9,18 @@ const SPARE = 2 * 1024 ** 3; // what the server leaves free on a disk
 type Space = { free: number | null; exists: boolean; in_models: boolean };
 
 /** Pick one of the files a family's field can use and download it from Hugging Face, into the models folder's
- *  subfolder for its kind (set in Model files) or a folder chosen here. ``onUse`` offers the copy already on this machine. */
+ *  subfolder for its kind (set in Model files) or a folder chosen here. ``onUse`` offers the copy already on this machine.
+ *  ``variant`` and ``model`` (the profile's, e.g. FLUX.2 Klein's "9B") leave out the files for others. */
 export function DownloadDialog(props: {
-  family: string; field: string; variant?: string; onClose: () => void;
+  family: string; field: string; variant?: string; model?: string; onClose: () => void;
   onStarted?: (t: ModelTask) => void; onUse?: (path: string) => void;
 }) {
   const toast = useToast();
   const [ov] = usePoll<ModelsOverview>("/api/models", 0);
   const fam = props.family === ov?.upscalers?.id ? ov.upscalers : ov?.families.find((f) => f.id === props.family);
   const fld = fam?.fields.find((f) => f.key === props.field);
-  const opts = (fld?.downloads || []).filter((o) => !props.variant || !o.variant || o.variant === props.variant);
+  const opts = (fld?.downloads || []).filter((o) => (!props.variant || !o.variant || o.variant === props.variant)
+    && (!props.model || !o.model || o.model === props.model));
   const [sel, setSel] = useState("");
   const cur: ModelDownloadOption | undefined = opts.find((o) => o.id === sel) || opts.find((o) => o.recommended) || opts[0];
   const [dest, setDest] = useState<string | null>(null); // null: the chosen file's folder in the models folder

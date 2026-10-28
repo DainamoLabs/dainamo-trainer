@@ -79,6 +79,17 @@ class Frozen:
         return Frozen(self.scale * strength, mv(self.down), mv(self.up), mv(self.w1), mv(self.w2), mv(self.full),
                       mv(self.bias))
 
+    def shape(self) -> tuple[int, ...] | None:
+        """(out, in) of the Linear it's for (None: a bias, or a change to a tensor that isn't a Linear's)."""
+        if self.bias is not None:
+            return None
+        if self.full is not None:
+            return tuple(self.full.shape) if self.full.dim() == 2 else None
+        if self.w1 is None:
+            return (self.up.shape[0], self.down.shape[1]) if self.up.dim() == 2 and self.down.dim() == 2 else None
+        n = (self.w2[0].shape[0], self.w2[1].shape[1]) if isinstance(self.w2, tuple) else tuple(self.w2.shape)
+        return (self.w1.shape[0] * n[0], self.w1.shape[1] * n[1])
+
     def dense(self) -> torch.Tensor:
         """The change to the tensor it applies to, at full size and scaled, in fp32."""
         if self.bias is not None or self.full is not None:
@@ -474,6 +485,13 @@ class AdapterStack:
             matched = 0
             for name, adapter in layers:
                 wrapper = self.wrappers.get(name) or _wrap_existing(self.model, name, self.wrappers)
+                shape = adapter.shape()
+                if wrapper is not None and shape is not None and shape != (wrapper.out_features, wrapper.in_features):
+                    # the layer's name is this model's, its size another's: e.g. a FLUX.2 Klein 4B LoRA on the 9B
+                    self.clear()
+                    raise ValueError(f"LoRA {label} is for another size of this model: its {name} is "
+                                     f"{shape[1]} -> {shape[0]}, this model's {wrapper.in_features} -> "
+                                     f"{wrapper.out_features}")
                 if wrapper is not None and (adapter.full is None or adapter.full.dim() == 2):
                     wrapper.assistants.append(adapter.to(self.device, self.dtype, float(strength)))
                     matched += 1

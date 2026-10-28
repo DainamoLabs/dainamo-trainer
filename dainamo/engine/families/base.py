@@ -44,8 +44,9 @@ class Download:
     sha256: str = ""  # checked once it's downloaded; "" where the repo doesn't publish it (gated repos)
     folder: str = ""  # the ComfyUI models folder, for a file at the repo's top level
     gated: bool = False  # Hugging Face wants you signed in, having accepted the model's terms
-    recommended: bool = False  # the one to take when unsure (one per field and variant)
+    recommended: bool = False  # the one to take when unsure (one per field, variant and model)
     variant: str = ""  # the profile variant it's for ("": any)
+    model: str = ""  # which of the family's models it's for, where they take different files (``model_of``; "": any)
     note: str = ""
 
     @property
@@ -63,7 +64,7 @@ class Download:
     def to_json(self) -> dict:
         return {"id": self.id, "field": self.field, "repo": self.repo, "path": self.path, "name": self.name,
                 "size": self.size, "label": self.label, "folder": self.kind_folder, "gated": self.gated,
-                "recommended": self.recommended, "variant": self.variant, "note": self.note,
+                "recommended": self.recommended, "variant": self.variant, "model": self.model, "note": self.note,
                 "url": f"https://huggingface.co/{self.repo}"}
 
 
@@ -655,6 +656,17 @@ class FamilyDriver:
         return True
 
     @classmethod
+    def memory_for(cls, shapes: dict[str, tuple[str, tuple[int, ...]]]) -> MemoryProfile | None:
+        """``memory`` for the diffusion model with these tensors, where its family's models differ in it."""
+        return cls.memory
+
+    @classmethod
+    def model_of(cls, field: str, tensors: dict[str, tuple[str, tuple[int, ...]]]) -> str | None:
+        """Which of the family's models a file for ``field`` is for, where it has several that take different files
+        (e.g. FLUX.2 Klein's "4B" and "9B"): a profile's files must agree. None: any of them."""
+        return None
+
+    @classmethod
     def validate_profile(cls, profile: dict) -> list[dict]:
         """Returns [{field, level: error|warning|ok, message}] without loading weights."""
         import os
@@ -691,7 +703,8 @@ class FamilyDriver:
                             "message": f"Uses quantization Dainamo can't read yet: {', '.join(sorted(unsupported))}"})
                 continue
             msg = f"{len(keys)} tensors" + (f" · {', '.join(sorted(labels))} (ComfyUI)" if labels else "")
-            out.append({"field": f.key, "level": "ok", "message": msg})
+            out.append({"field": f.key, "level": "ok", "message": msg,
+                        **({"model": m} if (m := cls.model_of(f.key, keys)) else {})})
         # a Turbo (distilled) model trained without its adapter loses its few-step sampling
         dm = os.path.basename((profile.get("diffusion_model") or "").strip()).lower()
         if ("turbo" in dm and any(f.key == "training_adapter" for f in cls.info.profile_fields)

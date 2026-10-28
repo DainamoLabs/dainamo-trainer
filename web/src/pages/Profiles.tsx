@@ -7,7 +7,8 @@ import { ConfirmDialog, Empty, LoadError, Menu, Modal, PathInput, familyBadge, u
 import MergeExtract from "./MergeExtract";
 import ModelFiles from "./ModelFiles";
 
-type Validation = { field: string; level: string; message: string };
+// ``model``: which of the family's models a file is for (FLUX.2 Klein's "4B" or "9B")
+type Validation = { field: string; level: string; message: string; model?: string };
 
 // where ComfyUI keeps each kind of file
 const FOLDERS: Record<string, string> = {
@@ -61,7 +62,26 @@ function ProfileEditor(props: { families: Family[]; initial: Partial<Profile> | 
     return () => { clearTimeout(t); clearInterval(again); };
   }, [family, JSON.stringify(data), downloading]);
 
-  const set = (k: string, v: unknown) => setData((d) => ({ ...d, [k]: v }));
+  // which of the family's models a found file is for, and the profile's: its diffusion model's
+  const modelOf = (key: string, path: unknown) =>
+    fileFields.find((x) => x.key === key)?.found.find((x) => x.path === path)?.model || undefined;
+  const model = modelOf("diffusion_model", data.diffusion_model)
+    || checks.find((c) => c.field === "diffusion_model")?.model;
+  const set = (k: string, v: unknown) => {
+    const swap: Record<string, unknown> = {};
+    // another diffusion model: the files picked for another of its family's models (the 4B's text encoder, when
+    // it's now the 9B) give way to the first found for its own
+    const m = k === "diffusion_model" ? modelOf(k, v) : undefined;
+    for (const f of m ? fileFields : []) {
+      const was = modelOf(f.key, data[f.key]);
+      const own = f.key !== k && was && was !== m && f.found.find((x) => !x.unsupported.length && x.model === m);
+      if (own) {
+        swap[f.key] = own.path;
+        toast(`${f.label.replace(" (CLIP)", "")} switched to ${own.name.split("/").pop()!.replace(/\.safetensors$/, "")}, the ${m}'s`);
+      }
+    }
+    setData((d) => ({ ...d, [k]: v, ...swap }));
+  };
   const save = async () => {
     setBusy(true);
     try {
@@ -109,7 +129,8 @@ function ProfileEditor(props: { families: Family[]; initial: Partial<Profile> | 
           const mf = fileFields.find((x) => x.key === f.key);
           const value = String(data[f.key] ?? "");
           // files on this machine it could be, offered while the field is empty or its file is wrong
-          const found = (mf?.found || []).filter((x) => !x.unsupported.length && x.path !== value).slice(0, 4);
+          const found = (mf?.found || []).filter((x) => !x.unsupported.length && x.path !== value
+            && (f.key === "diffusion_model" || !model || !x.model || x.model === model)).slice(0, 4);
           return (
             <label className="field" key={f.key} onClick={(e) => f.kind === "path" && e.preventDefault()}>
               <span>{f.label}{!f.required && <span className="faint"> · optional</span>}{f.hint && <span className="field-hint">{f.hint}</span>}</span>
@@ -148,6 +169,7 @@ function ProfileEditor(props: { families: Family[]; initial: Partial<Profile> | 
       </div>
       {download && (
         <DownloadDialog family={family} field={download} variant={data.variant ? String(data.variant) : undefined}
+          model={download === "diffusion_model" ? undefined : model}
           onClose={() => setDownload(null)}
           onUse={(path) => set(download, path)}
           onStarted={(t) => { set(t.field, t.dest); reloadModels(); }} />

@@ -379,6 +379,7 @@ export type ModelDownloadOption = {
   id: string; field: string; repo: string; path: string; name: string; size: number; label: string;
   folder: string; // the models folder's subfolder it goes in: diffusion_models, text_encoders, vae, loras, checkpoints
   gated: boolean; recommended: boolean; variant: string; note: string; url: string;
+  model: string; // which of the family's models it's for (FLUX.2 Klein's "4B" or "9B"; "": any)
   have: string | null; // where it is on this machine (the file of that name and size)
   task: string | null; // its unfinished download
 };
@@ -386,6 +387,7 @@ export type ModelDownloadOption = {
 export type FoundModel = {
   path: string; name: string; size: number; where: string; quant: string[]; unsupported: string[];
   download: string | null; // the catalog file it is
+  model: string | null; // which of the family's models it's for, where they take different files (FLUX.2 Klein's "4B" or "9B")
   // where it was found: the models folder (or a profile's file), or the Hugging Face cache, named as on the hub
   // ("owner/repo", or "owner/repo/vae/ae.safetensors" for one file), with its "owner/repo"
   source: "models" | "hf_cache"; repo: string;

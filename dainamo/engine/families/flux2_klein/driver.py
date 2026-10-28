@@ -28,6 +28,7 @@ tokens, the release scheduler's base/max shift (0.5 at 256 tokens, 1.15 at 4096)
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import os
 
@@ -208,11 +209,14 @@ class Flux2KleinDriver(FamilyDriver):
                     "double_blocks.*.txt_attn.qkv", "double_blocks.*.txt_attn.proj",
                     "double_blocks.*.img_mlp.[02]", "double_blocks.*.txt_mlp.[02]",
                     "single_blocks.*.linear1", "single_blocks.*.linear2"]
-    # measured on Klein 9B (fp8), the larger: 4B's per-token costs are about 3/4 of these. The double blocks aren't
+    # measured on Klein 9B (fp8), the larger (the 4B's are ``memory_4b``). The double blocks aren't
     # in block_list, so without checkpointing their activations (192 KB a token each on 9B) are spread over the
     # single blocks in ``full`` (215 KB measured + 8/24 of 192 KB); with it they're part of ``work``.
     memory = MemoryProfile(saved=8_600, full=280_000, work=436_000, infer=326_000,
                            vae_encode=(0.1e9, 2_580), vae_decode=(0.1e9, 3_860), text_tokens=MAX_TEXT_TOKENS)
+    # measured on Klein Base 4B (fp8) the same way, 0.73-0.75 of the 9B's: 170-194 KB a token a single block without
+    # checkpointing, plus 5/20 of its double blocks' (3/4 of the 9B's 192 KB)
+    memory_4b = dataclasses.replace(memory, saved=6_400, full=210_000, work=329_000, infer=250_000)
     # the text encoder's layers past the last one read, its final norm and LM head are never loaded
     text_encoder_skip = ("lm_head.", "model.norm.", *(f"layers.{i}." for i in range(max(OUTPUT_LAYERS), 64)))
     lora_metadata = {"modelspec.architecture": "flux-2-klein/lora", "dainamo.family": "flux2_klein"}
@@ -225,45 +229,51 @@ class Flux2KleinDriver(FamilyDriver):
     signature_shapes = {
         "vae": {"bn.running_mean": (TOKEN_CHANNELS,)},  # FLUX.2's 32 channels packed 2x2
     }
+    # one recommended of each size (``model``): the 9B's fp8 files, half the size of its 16-18 GB bf16 ones
     downloads = [
         Download("diffusion_model", COMFY_4B, "split_files/diffusion_models/flux-2-klein-base-4b.safetensors",
-                 7_751_105_712, "Base 4B · bf16", COMFY_4B_REV, folder="diffusion_models", variant="base",
-                 recommended=True, sha256="9c5fed22b76baea749d88fc2abe3ad53245e7b21a0d353a762665eea00043b92"),
+                 7_751_105_712, "Base 4B · bf16", COMFY_4B_REV, model="4B", folder="diffusion_models",
+                 variant="base", recommended=True,
+                 sha256="9c5fed22b76baea749d88fc2abe3ad53245e7b21a0d353a762665eea00043b92"),
         Download("diffusion_model", "black-forest-labs/FLUX.2-klein-base-4b-fp8", "flux-2-klein-base-4b-fp8.safetensors",
                  4_089_498_488, "Base 4B · fp8", "103db268c10d4d3921101b46057671f9ac460da6",
-                 folder="diffusion_models", variant="base",
+                 model="4B", folder="diffusion_models", variant="base",
                  sha256="44bab3a86fe98b85d21dd2a4729ebdc3ae51fb8a39f76e457e18c724219e6840"),
         Download("diffusion_model", "black-forest-labs/FLUX.2-klein-base-9B", "flux-2-klein-base-9b.safetensors",
                  18_157_185_168, "Base 9B · bf16 · non-commercial", "32773329fbe7e81a90ef971740e8ba4b0364ecf3",
-                 folder="diffusion_models", variant="base", gated=True, note=NON_COMMERCIAL,
+                 model="9B", folder="diffusion_models", variant="base", gated=True, note=NON_COMMERCIAL,
                  sha256="4a54fad7f5f741b99eee217198daac20b8d8e515e2a1f5b064fd51cf074f95bd"),
         Download("diffusion_model", "black-forest-labs/FLUX.2-klein-base-9b-fp8", "flux-2-klein-base-9b-fp8.safetensors",
                  9_567_278_472, "Base 9B · fp8 · non-commercial", "9ecf2143d71542449960c5584340269c6d401449",
-                 folder="diffusion_models", variant="base", gated=True, note=NON_COMMERCIAL,
+                 model="9B", folder="diffusion_models", variant="base", gated=True, note=NON_COMMERCIAL,
+                 recommended=True,
                  sha256="a9f5028c24a7a96f4f45beb883aad287d9bccc246227a6803edc898ddda42cf4"),
         Download("diffusion_model", COMFY_4B, "split_files/diffusion_models/flux-2-klein-4b.safetensors",
-                 7_751_105_712, "Distilled 4B · bf16", COMFY_4B_REV, folder="diffusion_models", variant="distilled",
-                 recommended=True, sha256="ec3d4e733a771f61c052fb4856c48b336c55eaf2c65487c2a1faeb9bbda7a343"),
+                 7_751_105_712, "Distilled 4B · bf16", COMFY_4B_REV, model="4B", folder="diffusion_models",
+                 variant="distilled", recommended=True,
+                 sha256="ec3d4e733a771f61c052fb4856c48b336c55eaf2c65487c2a1faeb9bbda7a343"),
         Download("diffusion_model", "black-forest-labs/FLUX.2-klein-4b-fp8", "flux-2-klein-4b-fp8.safetensors",
                  4_070_624_520, "Distilled 4B · fp8", "5b4408e59397a4a37ccb46afe426d8ed86379441",
-                 folder="diffusion_models", variant="distilled",
+                 model="4B", folder="diffusion_models", variant="distilled",
                  sha256="97ed34fe0567e436200f2faee3939b88f2b5d99f8af2a4dc16532c4245c0ccb6"),
         Download("diffusion_model", "black-forest-labs/FLUX.2-klein-9B", "flux-2-klein-9b.safetensors",
                  18_157_185_168, "Distilled 9B · bf16 · non-commercial", "92196c8e11f7b6cf2b7493e037d8c5345c559216",
-                 folder="diffusion_models", variant="distilled", gated=True, note=NON_COMMERCIAL,
+                 model="9B", folder="diffusion_models", variant="distilled", gated=True, note=NON_COMMERCIAL,
                  sha256="0975d6b77b5f510b99547d6724a208e36527df654e8f6134f59ece3f9f30da58"),
         Download("diffusion_model", "black-forest-labs/FLUX.2-klein-9b-fp8", "flux-2-klein-9b-fp8.safetensors",
                  9_433_061_528, "Distilled 9B · fp8 · non-commercial", "902d9d510b51533e07729f19211414a3648b77d2",
-                 folder="diffusion_models", variant="distilled", gated=True, note=NON_COMMERCIAL,
+                 model="9B", folder="diffusion_models", variant="distilled", gated=True, note=NON_COMMERCIAL,
+                 recommended=True,
                  sha256="865ba09f5b4c3cbd3468a4bd3acb9fcb2f8740c54317482f0bcd4ed1d3655cee"),
         Download("text_encoder", COMFY_4B, "split_files/text_encoders/qwen_3_4b.safetensors", 8_044_982_048,
-                 "Qwen3-4B, for the 4B · bf16", COMFY_4B_REV, folder="text_encoders", recommended=True,
+                 "Qwen3-4B, for the 4B · bf16", COMFY_4B_REV, model="4B", folder="text_encoders", recommended=True,
                  sha256="6c671498573ac2f7a5501502ccce8d2b08ea6ca2f661c458e708f36b36edfc5a"),
         Download("text_encoder", COMFY_9B, "split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors", 8_664_848_742,
-                 "Qwen3-8B, for the 9B · fp8 mixed", COMFY_9B_REV, folder="text_encoders",
+                 "Qwen3-8B, for the 9B · fp8 mixed", COMFY_9B_REV, model="9B", folder="text_encoders",
+                 recommended=True,
                  sha256="abad16806e0cbabc54e0325d6565847443fe396d5f0be38bb3cd3fe75a1201d6"),
         Download("text_encoder", COMFY_9B, "split_files/text_encoders/qwen_3_8b.safetensors", 16_381_517_176,
-                 "Qwen3-8B, for the 9B · bf16", COMFY_9B_REV, folder="text_encoders",
+                 "Qwen3-8B, for the 9B · bf16", COMFY_9B_REV, model="9B", folder="text_encoders",
                  sha256="f0ff9239d56269ca1d05e5f86da6a79fac111af464955681f11c7ab0ec5ef6c1"),
         Download("vae", COMFY_4B, "split_files/vae/flux2-vae.safetensors", 336_211_292, "bf16", COMFY_4B_REV,
                  folder="vae", recommended=True,
@@ -299,6 +309,18 @@ class Flux2KleinDriver(FamilyDriver):
         if field == "diffusion_model":  # Klein's widths, not FLUX.2 [dev]'s
             return dit_size(tensors) is not None
         return True
+
+    @classmethod
+    def memory_for(cls, shapes) -> MemoryProfile:
+        return cls.memory_4b if dit_size(shapes) == "4B" else cls.memory
+
+    @classmethod
+    def model_of(cls, field: str, tensors) -> str | None:
+        if field == "diffusion_model":
+            return dit_size(tensors)
+        if field == "text_encoder":  # Qwen3-4B is the 4B's, Qwen3-8B the 9B's
+            return {enc: dit for dit, enc in TEXT_FOR_DIT.items()}.get(text_encoder_size(tensors))
+        return None
 
     @classmethod
     def validate_profile(cls, profile: dict) -> list[dict]:

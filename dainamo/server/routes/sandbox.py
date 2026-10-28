@@ -170,10 +170,16 @@ def check_model(F, profile: dict, raw: str) -> str | None:
         return None
     if not (os.path.isfile(path) and path.endswith(".safetensors")):
         raise HTTPException(400, f"Finetuned model not found (or not .safetensors): {path}")
-    check = next(r for r in F.validate_profile({**profile["data"], "diffusion_model": path})
-                 if r["field"] == "diffusion_model")
+    checks = F.validate_profile({**profile["data"], "diffusion_model": path})
+    check = next(r for r in checks if r["field"] == "diffusion_model")
     if check["level"] == "error":
         raise HTTPException(400, f"{os.path.basename(path)}: {check['message']}")
+    # what's wrong only with it in place: the profile's other files are another model's (FLUX.2 Klein's 4B or 9B)
+    before = {(r["field"], r["message"]) for r in F.validate_profile(profile["data"]) if r["level"] == "error"}
+    new = [r for r in checks if r["level"] == "error" and (r["field"], r["message"]) not in before]
+    if new:
+        raise HTTPException(400, f"{os.path.basename(path)} doesn't go with the {profile['name']} profile: "
+                                 + "; ".join(r["message"] for r in new))
     return path
 
 

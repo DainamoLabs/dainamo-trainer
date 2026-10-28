@@ -216,10 +216,13 @@ def test_downloads_are_pinned_with_checksums():
         assert re.fullmatch(r"[0-9a-f]{40}", dl.revision) and re.fullmatch(r"[0-9a-f]{64}", dl.sha256), dl.id
         assert dl.size > 0 and dl.kind_folder in ("diffusion_models", "text_encoders", "vae")
         assert dl.variant in ("", "base", "distilled")
-        seen.add((dl.field, dl.variant))
+        seen.add((dl.field, dl.variant, dl.model))
         assert ("non-commercial" in dl.label) == ("9B" in dl.label and dl.field == "diffusion_model"), dl.label
-    for key in seen:
-        assert sum(d.recommended for d in Flux2KleinDriver.downloads if (d.field, d.variant) == key) == 1, key
+        # the size it's for, as its label says (a text encoder by the diffusion model's size that takes it)
+        assert dl.model == ("" if dl.field == "vae" else "9B" if "9B" in dl.label else "4B"), dl.id
+    for key in seen:  # one of each size to take when unsure
+        assert sum(d.recommended for d in Flux2KleinDriver.downloads
+                   if (d.field, d.variant, d.model) == key) == 1, key
 
 
 # --- the text encoder -------------------------------------------------------------
@@ -305,6 +308,7 @@ def test_profile_checks_folders_sizes_and_variant(tmp_path):
 
     r = check(diffusion_model=d4, text_encoder=q4)
     assert r["text_encoder"]["level"] == "ok" and "1 file" in r["text_encoder"]["message"]
+    assert r["diffusion_model"]["model"] == "4B" and "model" not in r["vae"]  # the size, for Profiles to go by
     assert all(x["level"] == "ok" for x in r.values())
     assert check(diffusion_model=d9, text_encoder=os.path.join(q8, comfy_io.INDEX_NAME),
                  variant="distilled")["text_encoder"]["level"] == "ok"
@@ -315,6 +319,23 @@ def test_profile_checks_folders_sizes_and_variant(tmp_path):
     assert check(diffusion_model=dit("flux2-dev.safetensors", 6144, 15360), text_encoder=q4)[
         "diffusion_model"]["level"] == "error"
     assert check(diffusion_model=d9, text_encoder=q8)["variant"]["level"] == "warning"  # "base", by its name distilled
+    assert check(diffusion_model=d9, text_encoder=q8)["diffusion_model"]["model"] == "9B"
+    for keys, field, size in ((K.header(d4), "diffusion_model", "4B"), (K.header(d9), "diffusion_model", "9B"),
+                              (K.header(q4), "text_encoder", "4B"), (K.header(q8), "text_encoder", "9B"),
+                              (K.header(vae), "vae", None)):
+        assert Flux2KleinDriver.model_of(field, keys) == size, (field, size)
+    assert Flux2KleinDriver.memory_for(K.header(d4)) is Flux2KleinDriver.memory_4b
+    assert Flux2KleinDriver.memory_for(K.header(d9)) is Flux2KleinDriver.memory
+    assert Flux2KleinDriver.memory_4b.infer < Flux2KleinDriver.memory.infer
+
+    # the Sandbox's finetuned model in place of the profile's: one of the other size is refused for its text encoder
+    from fastapi import HTTPException
+
+    from dainamo.server.routes.sandbox import check_model
+    profile = {"name": "Klein 4B", "data": {"diffusion_model": d4, "text_encoder": q4, "vae": vae}}
+    assert check_model(Flux2KleinDriver, profile, d4) == d4
+    with pytest.raises(HTTPException, match="doesn't go with the Klein 4B profile: This is Qwen3-4B; the 9B"):
+        check_model(Flux2KleinDriver, profile, d9)
     assert "variant" not in check(diffusion_model=d4, text_encoder=q4, variant="base")
 
 

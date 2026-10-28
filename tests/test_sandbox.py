@@ -225,6 +225,11 @@ def test_adapter_stack_reads_kohya_and_rejects_wrong_files():
         stack.set([("model", {"blocks.0.0.weight": torch.zeros(8, 8)}, 1.0)])
     with pytest.raises(ValueError, match="matches no layers"):
         stack.set([("other", lora_sd(prefix="diffusion_model.other_model."), 1.0)])
+    # its layers' names, another size's widths (a FLUX.2 Klein 4B LoRA on the 9B): refused, not a matmul error later
+    wide = {k: torch.zeros(2, 12) if k.endswith("lora_A.weight") else v for k, v in lora_sd().items()}
+    with pytest.raises(ValueError, match=r"another size of this model: its blocks.0.0 is 12 -> 8, this model's 8 -> 8"):
+        stack.set([("wide", wide, 1.0)])
+    assert torch.allclose(model(x), _clone(model)(x))  # nothing left applied
 
 
 def test_a_failed_lora_set_leaves_nothing_applied(tmp_path, monkeypatch):
