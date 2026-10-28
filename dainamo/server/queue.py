@@ -115,6 +115,7 @@ class Scheduler:
     def __init__(self):
         self.procs: dict[str, subprocess.Popen] = {}
         self.stop_deadline: dict[str, float] = {}
+        self._unrecorded: set[str] = set()  # jobs whose process ended, its end not yet recorded (``_reap``)
         self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._loop, daemon=True)
 
@@ -161,8 +162,6 @@ class Scheduler:
             self._launch()
 
     def _reap(self):
-        from . import notify
-
         for job_id, proc in list(self.procs.items()):
             code = proc.poll()
             if code is None:
@@ -171,21 +170,40 @@ class Scheduler:
                 if deadline and time.time() > max(deadline, last_activity(job_id) + STOP_GRACE):
                     procs.kill_tree(proc.pid)
                 continue
-            del self.procs[job_id]
-            asked_to_stop = self.stop_deadline.pop(job_id, None) is not None
-            cfg = (db.query_one("SELECT config FROM jobs WHERE id=?", (job_id,)) or {}).get("config") or {}
-            if "evaluate" in cfg:
-                killed = asked_to_stop  # (stopped, or forced to; killed unasked, it failed)
-                notify.evaluation_ended(job_id, end_evaluation(job_id, cfg, "stopped" if killed else "failed"))
+            asked_to_stop = job_id in self.stop_deadline
+            # the process is let go of only once how it ended is recorded: on a full disk (which may be what ended
+            # it) the database can't take the write, and a job left "running" with no process to stop could only
+            # be cleared by restarting the server. It's tried again each tick until there's room.
+            try:
+                ended = self._record_end(job_id, code, asked_to_stop)
+            except Exception as e:
+                if job_id not in self._unrecorded:
+                    self._unrecorded.add(job_id)
+                    print(f"[queue] job {job_id} ended (exit code {code}), but that couldn't be recorded: {e}. "
+                          "Trying again until it can be.", file=sys.stderr)
                 continue
-            status = {0: "completed", 3: "stopped"}.get(code, "failed")
-            # killed because it was asked to stop (by the grace running out, or Force stop): stopped. Killed
-            # unasked (the out-of-memory killer) it failed, and the notification says so
-            if asked_to_stop and code != 0:
-                status = "stopped"
-            db.execute("UPDATE jobs SET status=?, exit_code=?, finished=?, pid=NULL WHERE id=?",
-                       (status, code, db.now(), job_id))
-            notify.job_ended(job_id, status, code)
+            self._unrecorded.discard(job_id)
+            del self.procs[job_id]
+            self.stop_deadline.pop(job_id, None)
+            ended()
+
+    def _record_end(self, job_id: str, code: int, asked_to_stop: bool):
+        """Record in the database how a job's process ended; returns the notification to send for it."""
+        from . import notify
+
+        cfg = (db.query_one("SELECT config FROM jobs WHERE id=?", (job_id,)) or {}).get("config") or {}
+        if "evaluate" in cfg:
+            killed = asked_to_stop  # (stopped, or forced to; killed unasked, it failed)
+            state = end_evaluation(job_id, cfg, "stopped" if killed else "failed")
+            return lambda: notify.evaluation_ended(job_id, state)
+        status = {0: "completed", 3: "stopped"}.get(code, "failed")
+        # killed because it was asked to stop (by the grace running out, or Force stop): stopped. Killed
+        # unasked (the out-of-memory killer) it failed, and the notification says so
+        if asked_to_stop and code != 0:
+            status = "stopped"
+        db.execute("UPDATE jobs SET status=?, exit_code=?, finished=?, pid=NULL WHERE id=?",
+                   (status, code, db.now(), job_id))
+        return lambda: notify.job_ended(job_id, status, code)
 
     def _launch(self):
         from . import sandbox as sbx
@@ -261,21 +279,42 @@ class Scheduler:
 
     # --- actions -----------------------------------------------------------
     def stop(self, job_id: str):
+        """Stop a job: one waiting is cancelled; one running is asked to (it saves its state and exits), and killed
+        if it hasn't within ``STOP_GRACE``; one stopping is killed at once (Force stop). A job whose process has
+        gone without its end being recorded (``_reap`` retrying) is stopped there and then."""
         with self._lock:
-            job = db.query_one("SELECT status, config FROM jobs WHERE id=?", (job_id,))
+            job = db.query_one("SELECT status, config, pid FROM jobs WHERE id=?", (job_id,))
             if not job:
                 return
+            proc = self.procs.get(job_id)
             if job["status"] == "queued" and "evaluate" in (job["config"] or {}):
                 end_evaluation(job_id, job["config"])  # cancelled before it started
             elif job["status"] in ("queued", "ready"):  # cancelled before it ran
                 db.execute("UPDATE jobs SET status='stopped' WHERE id=?", (job_id,))
+            elif job["status"] in ("running", "stopping") and (proc is None or proc.poll() is not None):
+                self._settle(job_id, job, proc)
             elif job["status"] == "running":
-                send_control(job_id, "stop")
                 # give it time to save state, then force
                 self.stop_deadline[job_id] = time.time() + STOP_GRACE
+                try:
+                    send_control(job_id, "stop")
+                except OSError:  # e.g. a full disk: SIGTERM asks it the same (``engine.run``)
+                    procs.terminate(proc.pid)
                 db.execute("UPDATE jobs SET status='stopping' WHERE id=?", (job_id,))
-            elif job["status"] == "stopping" and job_id in self.procs:
-                procs.kill_tree(self.procs[job_id].pid)
+            elif job["status"] == "stopping":
+                procs.kill_tree(proc.pid)
+
+    def _settle(self, job_id: str, job: dict, proc):
+        """Stop a job whose process has ended (or that has none: a server that lost it) as ``_reap`` would, its end
+        recorded now. A process of its still about (not this server's) is killed first."""
+        if proc is None and job["pid"] and procs.is_trainer(job["pid"], job_id):
+            procs.kill_tree(job["pid"])
+        code = proc.poll() if proc is not None else None
+        ended = self._record_end(job_id, 1 if code is None else code, asked_to_stop=True)
+        self._unrecorded.discard(job_id)
+        self.procs.pop(job_id, None)
+        self.stop_deadline.pop(job_id, None)
+        ended()
 
     def paused(self) -> threading.Lock:
         """``with scheduler.paused():`` keeps the queue from starting or reaping jobs meanwhile."""

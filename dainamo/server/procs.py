@@ -51,6 +51,17 @@ def pid_alive(pid: int) -> bool:
         return True
 
 
+def terminate(pid: int) -> None:
+    """Ask a worker to stop (SIGTERM: it saves its state and exits, ``engine.run``). Windows has no such signal to
+    send it: there it's left to the stop's grace to run out, and then killed."""
+    if WINDOWS:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+
+
 def kill_tree(pid: int) -> None:
     """Kill a worker and anything it started (e.g. ffmpeg)."""
     if not WINDOWS:

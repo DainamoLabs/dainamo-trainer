@@ -986,6 +986,67 @@ def test_a_job_killed_unasked_failed_and_one_still_saving_isnt_forced(client, mo
         db.execute("DELETE FROM jobs WHERE id=?", (j,))
 
 
+def test_a_job_that_ends_on_a_full_disk_is_still_stopped(client, monkeypatch):
+    """Stopped on a full disk, the trainer fails to save and exits, and the database can't take its end: the queue
+    keeps hold of it, retrying, so Force stop still stops it (it used to stay "stopping" until a restart, then show
+    as interrupted). With control.json unwritable, Stop asks with SIGTERM instead, and the API says the disk's full."""
+    import errno
+    import sqlite3
+
+    from dainamo.server import db, procs, queue
+    from dainamo.server.queue import scheduler
+
+    class Proc:
+        def __init__(self):
+            self.code, self.pid = None, 4242
+
+        def poll(self):
+            return self.code
+
+    jid = db.new_id()
+    db.execute("INSERT INTO jobs (id, name, status, family, gpu, position, created, pid, config) VALUES "
+               "(?,?,?,?,?,?,?,?,?)", (jid, "fk9", "running", "flux2_klein", "99", 0.0, db.now(), 4242, "{}"))
+    termed, killed = [], []
+    monkeypatch.setattr(procs, "terminate", termed.append)
+    monkeypatch.setattr(procs, "kill_tree", killed.append)
+    proc = Proc()
+    with scheduler._lock:
+        scheduler.procs[jid] = proc
+
+    def full(*a, **k):
+        raise OSError(errno.ENOSPC, "No space left on device")
+    with monkeypatch.context() as m:  # control.json can't be written: SIGTERM asks it to stop
+        m.setattr(queue, "send_control", full)
+        assert client.post(f"/api/jobs/{jid}/action", json={"action": "stop"}).json()["status"] == "stopping"
+    assert termed == [4242] and jid in scheduler.stop_deadline
+
+    real = db.execute
+
+    def no_room(sql, *a):
+        if sql.lstrip().upper().startswith("UPDATE"):
+            raise sqlite3.OperationalError("database or disk is full")
+        return real(sql, *a)
+    with monkeypatch.context() as m:
+        m.setattr(db, "execute", no_room)
+        proc.code = 1  # its save failed for want of space, and so it exited
+        with scheduler._lock:
+            scheduler._reap()
+            scheduler._reap()  # (said once)
+        assert scheduler.procs.get(jid) is proc  # not let go of: it's still to be recorded
+        r = client.post(f"/api/jobs/{jid}/action", json={"action": "stop"})  # Force stop, the disk still full
+        assert r.status_code == 507 and "disk is full" in r.json()["detail"]
+    r = client.post(f"/api/jobs/{jid}/action", json={"action": "stop"})  # with room again: stopped
+    assert r.json()["status"] == "stopped" and r.json()["exit_code"] == 1 and killed == []
+    assert jid not in scheduler.procs and jid not in scheduler.stop_deadline and jid not in scheduler._unrecorded
+
+    # one the server lost track of altogether (left "running", no process): Stop settles it, killing what's left
+    db.execute("UPDATE jobs SET status='running', pid=4242 WHERE id=?", (jid,))
+    monkeypatch.setattr(procs, "is_trainer", lambda pid, job_id: job_id == jid)
+    assert client.post(f"/api/jobs/{jid}/action", json={"action": "stop"}).json()["status"] == "stopped"
+    assert killed == [4242]
+    db.execute("DELETE FROM jobs WHERE id=?", (jid,))
+
+
 def test_a_missing_file_or_a_folder_in_a_dataset(client):
     d = client.post("/api/datasets", json={"name": "uploads"}).json()  # uploaded files: deleted from disk
     folder = os.path.join(d["path"], "sub")

@@ -49,9 +49,12 @@ def main():
         from ..fsutil import replace
 
         path = os.path.join(job_dir, "status.json")
-        with open(path + ".tmp", "w") as f:
-            json.dump(status, f)
-        replace(path + ".tmp", path)
+        try:
+            with open(path + ".tmp", "w") as f:
+                json.dump(status, f)
+            replace(path + ".tmp", path)
+        except OSError as err:  # a full disk, likely what it failed of: the server still sees it exit
+            print(f"Couldn't record the failure in status.json: {err}", file=sys.stderr, flush=True)
         sys.exit(1)
 
 

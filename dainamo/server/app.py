@@ -4,13 +4,15 @@ The API routes are in ``routes/``, one module per area of the UI."""
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
+import sqlite3
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import auth, db, media_download
@@ -49,6 +51,21 @@ if "*" not in _hosts:
 
 for module in (auth, system, profiles, models, datasets, clips, jobs, sandbox, refmods, upscale, similarity, llm, tools):
     app.include_router(module.router)
+
+
+def _disk_full(e: Exception) -> bool:
+    """A write that failed for want of space: the OS's ENOSPC, or SQLite's "database or disk is full"."""
+    return (isinstance(e, OSError) and e.errno == errno.ENOSPC) or (
+        isinstance(e, sqlite3.OperationalError) and "full" in str(e))
+
+
+@app.exception_handler(OSError)
+@app.exception_handler(sqlite3.OperationalError)
+async def disk_full(request, e: Exception):
+    """A full disk said as much (the data folder's, where the database, jobs and cache are), not as a bare 500."""
+    if not _disk_full(e):
+        raise e
+    return JSONResponse({"detail": f"The disk is full ({db.DATA_DIR}): free some space and try again"}, status_code=507)
 
 
 # ---------------------------------------------------------------- static ---
