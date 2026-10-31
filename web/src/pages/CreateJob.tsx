@@ -156,6 +156,18 @@ function load<T>(k: string): T | null {
   try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch { return null; }
 }
 
+// settings about the last job's subject rather than how to train: a new job starts without them (a duplicated or
+// edited job keeps its own)
+const ITS_OWN = ["sample_prompts", "slider_target", "slider_positive", "slider_negative", "slider_preserve", "refmod_description",
+  "val_dataset"];
+
+/** The last job added (``STORE``), as a new job's form starts from it: without ``ITS_OWN``. */
+function lastJob(): any {
+  const last = load<any>(STORE);
+  if (last?.settings) for (const k of ITS_OWN) delete last.settings[k];
+  return last;
+}
+
 /** The profile a job trained with: by its id, or by name for a job from before configs kept the id. */
 export function jobProfile(cfg: any, profiles: Profile[]): Profile | undefined {
   return cfg?.profile_id ? profiles.find((p) => p.id === cfg.profile_id) : profiles.find((p) => p.name === cfg?.profile_name);
@@ -278,7 +290,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
   // a duplicated job is read here and cleared once mounted (StrictMode runs this twice, so it can't clear it)
   const [clone] = useState<any>(() => (edit ? edit.job : load<any>(CLONE_KEY)));
   useEffect(() => { if (!edit) localStorage.removeItem(CLONE_KEY); }, []);
-  const last = clone || load<any>(STORE);
+  const last = clone || lastJob();
 
   const [name, setName] = useState(edit ? clone.name : clone ? clone.name + " v2" : "");
   const [outName, setOutName] = useState(edit ? clone.output_name : "");
