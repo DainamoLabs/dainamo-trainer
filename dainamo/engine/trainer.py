@@ -1330,7 +1330,8 @@ class Trainer:
 
         with self.ema_applied():
             self.evaluate(model, network, step, self.save_lora(network, step, final=True))
-            if s.get("sample_at_end", True):
+            # (the last step is on the "every" schedule too when it falls on it: 2000 steps, every 500)
+            if s.get("sample_at_end", True) or (sample_every and step % sample_every == 0):
                 self.make_samples(model, network, step)
             self.strength_sweep(model, network)
         self.save_state(network, opt, sched, step, batches)

@@ -381,3 +381,21 @@ def test_a_job_resumed_after_a_crash_keeps_its_checkpoints_samples_and_its_time(
     assert [s["step"] for s in status["samples"]] == [3, 3, 6, 6]
     assert all(os.path.exists(job_dir / "samples" / s["file"]) for s in status["samples"])
     assert "Done in 1h 00m (" in capsys.readouterr().out and status["run_seconds"] >= 3600
+
+
+@pytest.mark.parametrize("steps, at_end, sampled", [(6, False, [3, 6]), (6, True, [3, 6]), (5, False, [3]), (5, True, [3, 5])])
+def test_the_last_step_is_sampled_when_its_on_the_schedule_or_sample_at_end_is_on(tmp_path, monkeypatch, steps, at_end, sampled):
+    """Sampling every 3 steps samples step 6 of 6 without Sample at the end (once with it); step 5 of 5 only with it."""
+    monkeypatch.setattr(trainer_mod, "get_family", lambda name: SamplingFamily)
+    _images(str(tmp_path / "train"), [(200, 30, 30), (190, 40, 20)])
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    (job_dir / "job.json").write_text(json.dumps({
+        "name": "t", "family": "tiny", "profile": {},
+        "datasets": [{"path": str(tmp_path / "train"), "trigger": "", "repeats": 1, "resolution": 64}],
+        "settings": {"steps": steps, "rank": 2, "alpha": 2, "resolution": 64, "seed": 1, "optimizer": "adamw",
+                     "learning_rate": 0.01, "save_every": 0, "sample_every": 3, "sample_at_start": False,
+                     "sample_at_end": at_end, "sample_steps": 2, "sample_width": 64, "sample_height": 64,
+                     "likeness_enabled": False, "sample_prompts": [{"prompt": "a photo"}]}}))
+    assert trainer_mod.Trainer(str(job_dir)).run() == "completed"
+    assert [s["step"] for s in json.loads((job_dir / "status.json").read_text())["samples"]] == sampled

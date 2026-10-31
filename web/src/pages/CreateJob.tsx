@@ -101,6 +101,7 @@ const INFO = {
   autoFrames: "Trains each clip at its own full length, up to 241 frames (10 s), instead of cutting longer ones to one clip length; none is ever sped up or slowed down. VRAM is set by the longest clip, so long clips need more of it.",
   checkpointing: "Recomputes parts of the model during the backward pass instead of keeping them in VRAM: much less VRAM for somewhat slower steps. Leave it on unless the VRAM projection shows room to spare.",
   keepAlpha: "Images with an alpha channel train as RGBA, so the LoRA keeps their transparency. Off, they're composited over white.",
+  sampleAtEnd: "Renders the sample prompts after the last step. When the last step falls on the Sample every schedule (2000 steps, every 500), it's sampled either way.",
   sampleAtStart: "Renders the sample prompts before the first update, so they show the base model: a baseline to compare the later samples with.",
   maskedLoss: "Trains on part of each image: a greyscale mask at _masks/<name>.png beside each image, white where the loss counts and black where it doesn't. Images without one train as usual.",
   maskWeight: "How much the loss counts where a mask is black. 0 ignores those parts entirely; a little (0.1) keeps the LoRA from drifting there.",
@@ -1052,7 +1053,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
             </div>
             <div className="row wrap" style={{ gap: 22, marginTop: 12 }}>
               <label className="check"><input type="checkbox" checked={s.sample_at_start} onChange={(e) => set("sample_at_start")(e.target.checked)} /> Sample before training (step 0)<Info text={INFO.sampleAtStart} /></label>
-              <label className="check"><input type="checkbox" checked={s.sample_at_end} onChange={(e) => set("sample_at_end")(e.target.checked)} /> Sample at the end</label>
+              <label className="check"><input type="checkbox" checked={s.sample_at_end} onChange={(e) => set("sample_at_end")(e.target.checked)} /> Sample at the end<Info text={INFO.sampleAtEnd} /></label>
               {!isAudio && !slider && !refmod && (
                 <label className="check"><input type="checkbox" checked={s.likeness_enabled !== false} onChange={(e) => set("likeness_enabled")(e.target.checked)} /> Likeness score<Info text={LIKENESS_INFO} /></label>
               )}
