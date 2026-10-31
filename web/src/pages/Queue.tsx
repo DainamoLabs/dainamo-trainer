@@ -7,9 +7,10 @@ import {
 import { EvalPanel } from "../components/EvalPanel";
 import { EvaluateDialog } from "../components/EvalSettings";
 import { ExtractLora } from "../components/ExtractLora";
+import { ExportJobDialog, ImportJobDialog } from "../components/JobTransfer";
 import { LikenessChart } from "../components/Likeness";
 import { LossChart, Spark, useMetrics } from "../components/LossChart";
-import { IconCamera, IconCheck, IconCopy, IconDatabase, IconDown, IconDownload, IconDrive, IconEdit, IconFile, IconFolder, IconImages, IconLayers, IconPlay, IconPlus, IconRefresh, IconRight, IconSave, IconServer, IconStop, IconTarget, IconTrash, IconUp } from "../components/icons";
+import { IconCamera, IconCheck, IconCopy, IconDatabase, IconDown, IconDownload, IconDrive, IconEdit, IconFile, IconFolder, IconImages, IconLayers, IconPlay, IconPlus, IconRefresh, IconRight, IconSave, IconServer, IconStop, IconTarget, IconTrash, IconUp, IconUpload } from "../components/icons";
 import { AudioCard, ConfirmDialog, Empty, Lightbox, LoadError, Modal, SelectBar, StatusPill, fmtSize, someNames, usePoll, useSelection, useToast, type Selection } from "../components/ui";
 import { SamplesPanel } from "../components/Samples";
 import { Terminal } from "../components/Terminal";
@@ -131,6 +132,7 @@ function JobRow({ j, reload, queuedIndex, queuedCount, size, sel }: { j: Job; re
   const active = j.status === "running" || j.status === "stopping";
   const once = j.refmod || j.extract || j.merge; // makes one file: made again from the start, not resumed
   const [confirmDel, setConfirmDel] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const remove = async (files: boolean) => {
     try { await api.del(`/api/jobs/${j.id}?delete_files=${files}`); reload(); } catch (e: any) { toast(e.message, true); }
   };
@@ -202,6 +204,7 @@ function JobRow({ j, reload, queuedIndex, queuedCount, size, sel }: { j: Job; re
           : j.resumable ? <button className="btn primary" onClick={() => act(j, "resume", reload)}><IconPlay /> Resume</button>
           : <button className="btn primary" title="It saved no training state to resume from" onClick={() => act(j, "restart", reload)}><IconRefresh /> Restart</button>)}
         {!active && j.status !== "queued" && j.status !== "ready" && !j.extract && !j.merge && <button className="btn icon" title="Duplicate settings into a new job" onClick={() => cloneJob(j.id)}><IconCopy /></button>}
+        {!active && j.status !== "queued" && <button className="btn icon" title="Export: copy the job to a folder, to import on another machine" aria-label="Export job" onClick={() => setExporting(true)}><IconDownload /></button>}
         {!active && <button className="btn icon danger" title="Delete" onClick={() => setConfirmDel(true)}><IconTrash /></button>}
       </div>}
       {confirmDel && (
@@ -212,6 +215,7 @@ function JobRow({ j, reload, queuedIndex, queuedCount, size, sel }: { j: Job; re
             : "Also delete its LoRA checkpoints and samples from disk"} />
       )}
       {confirmRestart}
+      {exporting && <ExportJobDialog job={j} onClose={() => setExporting(false)} />}
     </div>
   );
 }
@@ -462,6 +466,7 @@ function JobDetailView({ id, view, families }: { id: string; view?: string; fami
   const [light, setLight] = useState<string | null>(null);
   const [evaluate, setEvaluate] = useState(false);
   const [extend, setExtend] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [extractFrom, setExtractFrom] = useState<Checkpoint | null>(null);
   // the profile the job trained with, for Extract LoRA's other files (gone: only its checkpoints)
   const [profiles, , profilesErr] = usePoll<Profile[]>(extractFrom ? "/api/profiles" : null, 0);
@@ -545,6 +550,9 @@ function JobDetailView({ id, view, families }: { id: string; view?: string; fami
             <button className="btn" title="Change this job's settings" onClick={() => go("edit", job.id)}><IconEdit /> Edit</button>
           )}
           {!running && !extract && !merge && <button className="btn" onClick={() => cloneJob(job.id)}><IconCopy /> Duplicate</button>}
+          {!running && !["queued", "stopping"].includes(job.status) && (
+            <button className="btn" title="Copy the job to a folder, to import on another machine" onClick={() => setExporting(true)}><IconDownload /> Export</button>
+          )}
           {!active && <button className="btn icon danger" title="Delete" aria-label="Delete job" onClick={() => setDeleting(true)}><IconTrash /></button>}
         </div>
       </div>
@@ -688,6 +696,7 @@ function JobDetailView({ id, view, families }: { id: string; view?: string; fami
           checkbox={refmod ? "Also delete its RefMod and preview from disk" : extract || merge ? "Also delete its LoRA from disk"
             : finetune ? "Also delete its finetuned models and samples from disk" : "Also delete its LoRA checkpoints and samples from disk"} />
       )}
+      {exporting && <ExportJobDialog job={job} onClose={() => setExporting(false)} />}
       {confirmRestart}
     </div>
   );
@@ -756,6 +765,7 @@ function QueueList({ jobs, reload, error }: { jobs: Job[] | null; reload: () => 
   const toast = useToast();
   const [disk, reloadDisk] = usePoll<QueueDisk>("/api/disk", 0, [jobs?.length]);
   const [manage, setManage] = useState(false);
+  const [importing, setImporting] = useState(false);
   const shared = disk?.shared_cache || { total: 0, in_use: 0 };
   const running = jobs?.filter((j) => j.status === "running" || j.status === "stopping") || [];
   const queued = jobs?.filter((j) => j.status === "queued") || [];
@@ -812,6 +822,7 @@ function QueueList({ jobs, reload, error }: { jobs: Job[] | null; reload: () => 
           <p>Training, RefMods, merges and extracted LoRAs, run one at a time per GPU in this order.</p>
         </div>
         <div className="row">
+          {!sel.on && <button className="btn lg" title="Add a job that Export copied to a folder" onClick={() => setImporting(true)}><IconUpload /> Import job</button>}
           {!!jobs?.length && !sel.on && <button className="btn lg" onClick={sel.start}><IconCheck /> Select</button>}
         </div>
       </div>
@@ -867,6 +878,7 @@ function QueueList({ jobs, reload, error }: { jobs: Job[] | null; reload: () => 
         </div>
       )}
       {manage && disk && <CacheDialog disk={disk} jobs={jobs || []} onClose={() => setManage(false)} onCleared={reloadDisk} />}
+      {importing && <ImportJobDialog onClose={() => setImporting(false)} onImported={() => { reload(); reloadDisk(); }} />}
     </div>
   );
 }

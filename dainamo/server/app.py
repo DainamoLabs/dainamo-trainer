@@ -20,7 +20,7 @@ from ..engine import families
 from . import auth, db, media_download
 from .llama_server import llama
 from .queue import scheduler
-from .routes import clips, datasets, jobs, llm, models, profiles, refmods, sandbox, similarity, system, tools, upscale
+from .routes import clips, datasets, jobs, llm, models, profiles, refmods, sandbox, similarity, system, tools, transfer, upscale
 from .routes.common import not_found
 
 WEB_DIST = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "web", "dist"))
@@ -54,7 +54,8 @@ _hosts = [h.strip() for h in os.environ.get("DAINAMO_ALLOWED_HOSTS", "127.0.0.1,
 if "*" not in _hosts:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=_hosts)
 
-for module in (auth, system, profiles, models, datasets, clips, jobs, sandbox, refmods, upscale, similarity, llm, tools):
+for module in (auth, system, profiles, models, datasets, clips, jobs, transfer, sandbox, refmods, upscale, similarity, llm,
+               tools):
     app.include_router(module.router)
 
 

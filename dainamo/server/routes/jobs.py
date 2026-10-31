@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from ...engine.dataset import resolutions
 from ...engine.families import get_family
 from ...engine.families.base import takes_sources
-from .. import db, model_files, outputs
+from .. import db, job_transfer, model_files, outputs
 from ..queue import CACHE_DIR, follow_datasets, job_dir, job_folder, read_status, scheduler, send_control
 from ..validation import LOSS_AND_EMA_DEFAULTS, check_evaluation, check_resolution, check_settings
 from .common import dataset_or_404, job_or_404, not_found, profile_or_404
@@ -582,6 +582,8 @@ class ActionIn(BaseModel):
 def job_action(jid: str, body: ActionIn):
     j = job_or_404(jid)
     a = body.action
+    if job_transfer.exporting(jid) and a not in ("up", "down"):
+        raise HTTPException(409, "It's being exported: wait for that to finish, or cancel it")
     if a == "start":  # a ready job joins the queue, behind the jobs already waiting
         if j["status"] != "ready":
             raise HTTPException(400, "Only a job that's ready to start can be started")
@@ -951,6 +953,8 @@ def delete_job(jid: str, delete_files: bool = False):
         j = job_or_404(jid)
         if j["status"] in ("running", "stopping"):
             raise HTTPException(400, "Stop the job first")
+        if job_transfer.exporting(jid):
+            raise HTTPException(409, "It's being exported: wait for that to finish, or cancel it")
         folder = job_dir(jid)  # named from the row, so before it goes
         db.execute("DELETE FROM jobs WHERE id=?", (jid,))
     if delete_files:  # after the lock, so a big folder doesn't hold the queue
