@@ -8,6 +8,7 @@ import errno
 import os
 import shutil
 import sqlite3
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -15,6 +16,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+from ..engine import families
 from . import auth, db, media_download
 from .llama_server import llama
 from .queue import scheduler
@@ -34,6 +36,9 @@ async def lifespan(_app: FastAPI):
     from .sandbox import sandbox as sandbox_manager
     sandbox_manager.startup()
     llama.startup()
+    # the model families' code (about 2 s of imports) loads now, in the background, rather than on the first
+    # request that needs it
+    threading.Thread(target=families.load, daemon=True).start()
     yield
     sandbox_manager.release()
     llama.stop(wait=True)

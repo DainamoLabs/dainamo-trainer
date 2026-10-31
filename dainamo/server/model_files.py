@@ -22,7 +22,7 @@ from urllib.parse import quote
 import httpx
 
 from ..engine import upscale
-from ..engine.families import FAMILIES
+from ..engine.families import load as load_families
 from ..engine.families.base import Download
 from . import db
 
@@ -97,7 +97,7 @@ UPSCALER_DOWNLOADS = [
 def find_download(download_id: str) -> tuple[str, str, Download]:
     """(family id, its label, ``Download``) for a catalog id ("<repo>/<path>"); KeyError for one no family (nor
     the upscalers) lists."""
-    for F in FAMILIES.values():
+    for F in load_families().values():
         for d in F.downloads:
             if d.id == download_id:
                 return F.info.id, F.info.label, d
@@ -122,8 +122,9 @@ def _identify(path: str) -> dict:
         t = tensors(path)
     except Exception as e:
         return {"fields": [], "models": {}, "quant": [], "unsupported": [], "error": str(e)}
-    fields = [[F.info.id, f] for F in FAMILIES.values() for f in F.signature_keys if F.matches(f, t)]
-    models = {f"{fam}/{f}": m for fam, f in fields if (m := FAMILIES[fam].model_of(f, t))}
+    families = load_families()
+    fields = [[F.info.id, f] for F in families.values() for f in F.signature_keys if F.matches(f, t)]
+    models = {f"{fam}/{f}": m for fam, f in fields if (m := families[fam].model_of(f, t))}
     quant, unsupported = set(), set()
     if fields:
         try:
@@ -310,9 +311,10 @@ def overview() -> dict:
 
     # the catalog files of rows that are no profile's field (FLUX 3's prompt upsampler, a Qwen3.5-9B with MOSS
     # Image's encoder's tensors): a profile shouldn't pick one up for a field of its own
-    extra = {have.get((d.name, d.size)) for F in FAMILIES.values() for d in F.downloads if d.field in F.extra_fields}
+    drivers = load_families().values()
+    extra = {have.get((d.name, d.size)) for F in drivers for d in F.downloads if d.field in F.extra_fields}
     families = []
-    for F in FAMILIES.values():
+    for F in drivers:
         fields = []
         rows = [(pf.key, pf.label, pf.hint, pf.required) for pf in F.info.profile_fields if pf.kind == "path"]
         rows += [(key, label, hint, False) for key, (label, hint) in F.extra_fields.items()]

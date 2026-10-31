@@ -1,11 +1,13 @@
 """``python -m dainamo [--host 127.0.0.1] [--port 7865] [--browser] [--password PW | --no-auth] [--new-key]``
 
-Starts the server and prints the link to open. ``--browser`` opens it in the default browser too; ``--no-browser``
+Opens the port first, so the link answers (the browser waits) while the app loads, then starts the server and
+prints the link to open. ``--browser`` opens it in the default browser too; ``--no-browser``
 (the old default's switch) is still accepted and does nothing."""
 
 import argparse
 import os
 import socket
+import sys
 import threading
 import webbrowser
 
@@ -36,6 +38,12 @@ def main():
     ap.add_argument("--new-key", action="store_true", help="replace the generated access key (signs every device out)")
     args = ap.parse_args()
 
+    # listening before the app is imported: a browser that opens the link meanwhile waits for the page instead of
+    # finding nothing there ("unreachable"). The app loads when the server starts (``Server.run``).
+    config = uvicorn.Config("dainamo.server.app:app", host=args.host, port=args.port, log_level="warning")
+    sock = config.bind_socket()  # exits with uvicorn's message when the port is taken
+    sock.listen(config.backlog)
+
     from .server import auth
 
     if args.new_key:
@@ -63,10 +71,27 @@ def main():
     if not loopback:
         print("Warning: Add from URL (experimental) works from other machines too: anyone who can use Dainamo can "
               "make this machine download from any web address, including ones on your local network.", flush=True)
-    print(f"Dainamo Trainer is running. Open {open_url} in your browser (Ctrl+C stops it).", flush=True)
+    print(f"Dainamo Trainer is starting. Open {open_url} in your browser (Ctrl+C stops it).", flush=True)
     if args.browser:
-        threading.Timer(1.5, lambda: webbrowser.open(open_url)).start()
-    uvicorn.run("dainamo.server.app:app", host=args.host, port=args.port, log_level="warning")
+        webbrowser.open(open_url)
+    server = uvicorn.Server(config)
+    stopped = threading.Event()
+
+    def announce():
+        while not server.started and not stopped.wait(0.1):
+            pass
+        if server.started:
+            print("Ready.", flush=True)
+
+    threading.Thread(target=announce, daemon=True).start()
+    try:
+        server.run(sockets=[sock])
+    except KeyboardInterrupt:  # Ctrl+C, as ``uvicorn.run`` takes it
+        pass
+    finally:
+        stopped.set()
+    if not server.started:
+        sys.exit(3)  # uvicorn's STARTUP_FAILURE
 
 
 if __name__ == "__main__":

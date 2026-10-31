@@ -220,7 +220,12 @@ def test_listening_on_the_network_warns_about_downloads(monkeypatch, capsys):
     import dainamo.__main__ as main
 
     monkeypatch.setenv("DAINAMO_LISTEN", "127.0.0.1")
-    monkeypatch.setattr(main.uvicorn, "run", lambda *a, **k: None)
+    class Sock:  # the port isn't opened
+        def listen(self, backlog):
+            pass
+
+    monkeypatch.setattr(main.uvicorn.Config, "bind_socket", lambda self: Sock())
+    monkeypatch.setattr(main.uvicorn.Server, "run", lambda self, sockets=None: setattr(self, "started", True))
     for host, warned in (("127.0.0.1", False), ("0.0.0.0", True)):
         monkeypatch.setattr(sys, "argv", ["dainamo", "--host", host, "--no-browser", "--no-auth"])
         main.main()

@@ -9,10 +9,13 @@ import os
 import random
 import subprocess
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
-import torch
 from PIL import Image, ImageOps
+
+if TYPE_CHECKING:
+    import torch  # imported where it's used: the server reads this module at startup and needn't load torch
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 VIDEO_EXTS = {".mp4", ".webm", ".mov", ".mkv", ".avi"}
@@ -170,6 +173,8 @@ def to_rgb(img: Image.Image) -> Image.Image:
 
 
 def load_and_crop(path: str, size: tuple[int, int], flip: bool = False) -> torch.Tensor:
+    import torch
+
     img = to_rgb(ImageOps.exif_transpose(Image.open(path)))
     img = ImageOps.fit(img, size, Image.Resampling.LANCZOS)
     if flip:
@@ -188,6 +193,8 @@ def load_mask(path: str, image_size: tuple[int, int], size: tuple[int, int], fli
     """An image's loss mask (``mask_path``) cropped like the image: read as greyscale, stretched to the image's own
     size (``image_size``, so a mask of another size or aspect still lines up with it), then fitted to ``size`` and
     mirrored exactly as ``load_and_crop`` does the image -> (1, H, W) in [0, 1], 1 where the loss counts."""
+    import torch
+
     with Image.open(path) as im:
         mask = ImageOps.exif_transpose(im).convert("L")
     if mask.size != tuple(image_size):
@@ -241,6 +248,8 @@ def _seconds(v) -> float:
 def read_video_frames(path: str, size: tuple[int, int], frames: int, fps: int, flip: bool = False,
                       start: float = 0.0) -> torch.Tensor:
     """``frames`` frames resampled to ``fps``, cover-cropped to ``size`` -> (1, 3, T, H, W) in [-1, 1]."""
+    import torch
+
     w, h = size
     vf = f"fps={fps},scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,crop={w}:{h}"
     if flip:
@@ -257,6 +266,8 @@ def read_video_frames(path: str, size: tuple[int, int], frames: int, fps: int, f
 
 def read_audio(path: str, seconds: float, sample_rate: int, channels: int = 2, start: float = 0.0) -> torch.Tensor:
     """(channels, samples) float32 waveform, zero-padded to ``seconds``."""
+    import torch
+
     out = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{start:.3f}", "-i", path, "-t", f"{seconds:.4f}",
                           "-vn", "-ac", str(channels), "-ar", str(sample_rate), "-f", "f32le", "-"],
                          capture_output=True, timeout=600)

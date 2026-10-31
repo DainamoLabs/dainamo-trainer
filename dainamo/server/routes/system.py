@@ -8,7 +8,7 @@ import string
 
 from fastapi import APIRouter, HTTPException
 
-from ...engine.families import FAMILIES
+from ...engine.families import load as load_families
 from ...engine.transcribe import MODELS as WHISPER_MODELS
 from .. import db, hardware, notify
 from .common import not_found
@@ -21,7 +21,7 @@ def system():
     from ...engine.families.base import WORKFLOWS
 
     return {"gpus": hardware.gpus(), "ram": hardware.ram(),
-            "families": [F.info.to_json() for F in FAMILIES.values()],
+            "families": [F.info.to_json() for F in load_families().values()],
             "workflows": [{"id": k, **v} for k, v in WORKFLOWS.items()],
             "whisper_models": [{"id": k, "size": size} for k, (_, size) in WHISPER_MODELS.items()]}
 
