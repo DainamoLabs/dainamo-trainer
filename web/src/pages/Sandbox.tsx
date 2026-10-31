@@ -4,14 +4,17 @@ import {
   type SandboxOutput, type SandboxParams, type SandboxProgress, type SandboxRun, type SandboxStatus, type SystemRam,
   type MediaKind, type Upscalers, type Workflow,
 } from "../api";
-import { IconPlayFill, IconPlus, IconRefresh, IconRight, IconSparkle, IconStop, IconTarget, IconTrash, IconUpscale, IconX } from "../components/icons";
+import { IconCheck, IconPlayFill, IconPlus, IconRefresh, IconRight, IconSparkle, IconStop, IconTarget, IconTrash, IconUpscale, IconX } from "../components/icons";
 import { CompareDialog, type CompareTarget } from "../components/Likeness";
 import { MakeRefModDialog, NEW_REFMOD, type RefModDraft } from "../components/MakeRefMod";
 import {
   UpscaleDialog, UpscaleFileCard, UpscaleRunView, UpscalerSelect, pickUpscaler, upscaleMeta, upscaleParams, usableUpscaler,
   type UpscaleTarget,
 } from "../components/Upscale";
-import { AudioPlayer, ConfirmDialog, Empty, ImagesInput, Info, Lightbox, Num, PathInput, ProfileOptions, StatusPill, usePoll, useToast, useToastErrors } from "../components/ui";
+import {
+  AudioPlayer, ConfirmDialog, Empty, ImagesInput, Info, Lightbox, Num, PathInput, ProfileOptions, SelectBar, StatusPill, usePoll, useSelection, useToast,
+  useToastErrors,
+} from "../components/ui";
 import { OffloadControl, gpuTarget, offloadFit, useVramProjection } from "../components/Vram";
 
 type LoraRow = { path: string; strength: number; custom: boolean };
@@ -188,6 +191,23 @@ type Open = (src: string, video: boolean, audio?: { poster?: string; score?: str
 const audioOf = (run: SandboxRun, o: SandboxOutput) => o.kind === "audio"
   ? { poster: o.poster ? fileUrl(run, o.poster) : undefined, score: o.score ? fileUrl(run, o.score) : undefined } : undefined;
 
+// where a render goes in its seed's row: a hi-res fix's first pass before its result, the render with LoRAs before
+// the one without (``RunView``)
+type Slot = "pass1" | "lora" | "pass1_base" | "base";
+const SLOTS: Slot[] = ["pass1", "lora", "pass1_base", "base"];
+const slotOf = (o: SandboxOutput): Slot => o.variant === "pass1" ? (o.of === "base" ? "pass1_base" : "pass1") : o.variant === "base" ? "base" : "lora";
+
+/** A run's outputs in the order its view shows them, for the lightbox's arrows: per seed, a checkpoint grid's render
+ * without LoRAs and then its rows, other runs' renders by ``SLOTS``; an upscale's as made. */
+function viewOrder(run: SandboxRun): SandboxOutput[] {
+  const outs = run.outputs || [];
+  if (upscaleParams(run)) return outs;
+  const g = run.params.grid;
+  const rank = g ? (o: SandboxOutput) => o.variant === "base" ? -1 : (o.strength ?? 0) * g.checkpoints.length + (o.checkpoint ?? 0)
+    : (o: SandboxOutput) => SLOTS.indexOf(slotOf(o));
+  return [...new Set(outs.map((o) => o.seed))].flatMap((seed) => outs.filter((o) => o.seed === seed).sort((a, b) => rank(a) - rank(b)));
+}
+
 function GridView({ run, onOpen }: { run: SandboxRun; onOpen: Open }) {
   const g = run.params.grid!;
   const seeds = Array.from({ length: run.params.count }, (_, i) => run.params.seed + i);
@@ -232,13 +252,9 @@ function GridView({ run, onOpen }: { run: SandboxRun; onOpen: Open }) {
 function RunView({ run, meta, onOpen, onUpscale, onCompare }: {
   run: SandboxRun; meta: string; onOpen: Open; onUpscale: (o: SandboxOutput) => void; onCompare: (o: SandboxOutput) => void;
 }) {
-  type Slot = "lora" | "base" | "pass1" | "pass1_base";
   const bySeed = useMemo(() => {
     const m = new Map<number, Partial<Record<Slot, SandboxOutput>>>();
-    for (const o of run.outputs || []) {
-      const slot: Slot = o.variant === "pass1" ? (o.of === "base" ? "pass1_base" : "pass1") : o.variant === "base" ? "base" : "lora";
-      m.set(o.seed, { ...(m.get(o.seed) || {}), [slot]: o });
-    }
+    for (const o of run.outputs || []) m.set(o.seed, { ...(m.get(o.seed) || {}), [slotOf(o)]: o });
     return [...m.entries()];
   }, [run.outputs]);
   if (run.params.grid) return <GridView run={run} onOpen={onOpen} />;
@@ -335,6 +351,9 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
   const [selected, setSelected] = useState<string | null>(null);
   const [light, setLight] = useState<{ src: string; video: boolean; audio?: { poster?: string; score?: string } } | null>(null);
   const [deleting, setDeleting] = useState<SandboxRun | null>(null); // a history run whose Delete is being confirmed
+  const sel = useSelection(); // history runs picked with Select, to delete together
+  const [deletingPicked, setDeletingPicked] = useState(false);
+  const lastPick = useRef<string | null>(null); // where a Shift+click's range starts
   const attempt = useToastErrors();
   const [upscaling, setUpscaling] = useState<UpscaleTarget | null>(null); // the Upscale dialog's file
   const [comparing, setComparing] = useState<CompareTarget | null>(null); // the Compare dialog's output
@@ -399,6 +418,44 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
   const runs = status?.runs || [];
   const current = runs.find((r) => r.id === selected) || runs[0];
   const active = runs.filter((r) => r.status === "queued" || r.status === "running");
+  const deletable = runs.filter((r) => r.status !== "queued" && r.status !== "running").map((r) => r.id);
+  const picked = deletable.filter((id) => sel.picked.has(id));
+  // every run's outputs, newest run first: what the lightbox's arrows go through
+  const viewed = useMemo(() => runs.flatMap((r) => viewOrder(r).map((o) => ({ run: r, o }))), [runs]);
+  const lightAt = light ? viewed.findIndex((v) => fileUrl(v.run, v.o.file) === light.src) : -1;
+  const lightNav = lightAt < 0 ? undefined : {
+    at: lightAt, count: viewed.length, go: (step: -1 | 1) => {
+      const { run, o } = viewed[lightAt + step];
+      setLight({ src: fileUrl(run, o.file), video: o.kind === "video", audio: audioOf(run, o) });
+      setSelected(run.id); // the run it's from is shown behind it, and when it closes
+    },
+  };
+  // a click on a run while picking: picks it or not, and with Shift the runs from the last one clicked to it too
+  const pick = (id: string, shift: boolean) => {
+    const from = shift && lastPick.current ? deletable.indexOf(lastPick.current) : -1;
+    const to = deletable.indexOf(id);
+    if (to < 0) return;
+    lastPick.current = id;
+    if (from < 0) return sel.toggle(id);
+    sel.set([...new Set([...sel.picked, ...deletable.slice(Math.min(from, to), Math.max(from, to) + 1)])]);
+  };
+  const deletePicked = async () => {
+    let removed = 0;
+    const failed: string[] = [];
+    for (const id of picked) {
+      try {
+        await api.del(`/api/sandbox/runs/${id}`);
+        removed++;
+      } catch (e: any) {
+        const r = runs.find((x) => x.id === id);
+        failed.push(`run ${r ? runNumber(r) : id}: ${e.message}`);
+      }
+    }
+    toast(failed.length ? `${removed ? `Deleted ${removed}; c` : "C"}ouldn't delete ${failed.join("; ")}`
+      : `Deleted ${removed} run${removed === 1 ? "" : "s"}`, failed.length > 0);
+    sel.stop();
+    reload();
+  };
   const progress = session?.progress;
   const making = makingId && session?.refmod?.id === makingId ? session.refmod : null;
   const makingNow = making?.state === "queued" || making?.state === "running";
@@ -1172,8 +1229,21 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
 
           {runs.length > 0 && (
             <div className="card card-pad">
-              <div className="card-head"><h3>History</h3><span className="count-pill">{runs.length}</span></div>
-              <div className="sbx-history">
+              <div className="card-head">
+                <h3>History</h3><span className="count-pill">{runs.length}</span>
+                <span className="spacer" />
+                {!sel.on && deletable.length > 0 && (
+                  <button className="btn" onClick={() => { lastPick.current = null; sel.start(); }} title="Pick runs to delete together"><IconCheck /> Select</button>
+                )}
+              </div>
+              {sel.on && (
+                <div className="sbx-history-bar">
+                  <SelectBar sel={sel} ids={deletable} noun={["run", "runs"]}>
+                    <button className="btn danger" onClick={() => setDeletingPicked(true)} disabled={!picked.length}><IconTrash /> Delete</button>
+                  </SelectBar>
+                </div>
+              )}
+              <div className={"sbx-history" + (sel.on ? " selecting" : "")}>
                 {runs.map((r) => {
                   const first = r.outputs?.find((o) => o.variant !== "pass1") || r.outputs?.[0]; // a hi-res fix's result
                   const thumb = first ? fileUrl(r, first.poster || first.file) : null;
@@ -1183,13 +1253,28 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
                     : up ? `${up.factor}× upscale`
                     : p.strength != null || p.hires ? [p.strength != null ? `i2i ${p.strength}` : "", p.hires ? `hi-res ${p.hires.factor}×` : ""].filter(Boolean).join(" · ")
                     : p.seconds != null ? fmtClock(p.seconds) : p.frames > 1 ? `${p.frames} frames` : `${p.width}×${p.height}`;
-                  return (
-                    <div key={r.id} className={"sbx-thumb" + (r.id === current?.id ? " on" : "")} role="button" tabIndex={0}
-                      aria-pressed={r.id === current?.id} onClick={() => setSelected(r.id)} onKeyDown={(e) => e.key === "Enter" && setSelected(r.id)}
-                      title={`${up ? `Upscale: ${upscaleMeta(up)}` : p.source_prompt || p.prompt}\n${fmtTime(r.created)}`}>
+                  const locked = r.status === "queued" || r.status === "running";
+                  const on = sel.picked.has(r.id);
+                  const title = `${up ? `Upscale: ${upscaleMeta(up)}` : p.source_prompt || p.prompt}\n${fmtTime(r.created)}`;
+                  return sel.on ? (
+                    <div key={r.id} className={"sbx-thumb" + (on ? " picked" : "") + (locked ? " locked" : "")} role="checkbox" tabIndex={locked ? -1 : 0}
+                      aria-checked={on} aria-disabled={locked} aria-label={`Run ${runNumber(r)}`}
+                      onClick={(e) => !locked && pick(r.id, e.shiftKey)} onKeyDown={(e) => !locked && (e.key === "Enter" || e.key === " ") && (e.preventDefault(), pick(r.id, e.shiftKey))}
+                      title={locked ? `${r.status === "running" ? "Running" : "Queued"}: cancel it to delete it` : title}>
                       <div className="sbx-thumb-img">
                         {thumb ? <img src={thumb} alt="" loading="lazy" className={first?.kind === "audio" ? "song" : undefined} /> : <div className="sbx-wait">…</div>}
-                        {r.status !== "queued" && r.status !== "running" && (
+                        {!locked && <input type="checkbox" className="file-pick" checked={on} readOnly tabIndex={-1} aria-hidden />}
+                      </div>
+                      <div className="sbx-thumb-name">Run {runNumber(r)}</div>
+                      <div className={"sbx-thumb-note" + (r.status === "failed" ? " err" : "")}>{note}</div>
+                    </div>
+                  ) : (
+                    <div key={r.id} className={"sbx-thumb" + (r.id === current?.id ? " on" : "")} role="button" tabIndex={0}
+                      aria-pressed={r.id === current?.id} onClick={() => setSelected(r.id)} onKeyDown={(e) => e.key === "Enter" && setSelected(r.id)}
+                      title={title}>
+                      <div className="sbx-thumb-img">
+                        {thumb ? <img src={thumb} alt="" loading="lazy" className={first?.kind === "audio" ? "song" : undefined} /> : <div className="sbx-wait">…</div>}
+                        {!locked && (
                           <button className="btn ghost icon danger" title="Delete" aria-label={`Delete run ${runNumber(r)}`}
                             onClick={(e) => { e.stopPropagation(); setDeleting(r); }} onKeyDown={(e) => e.stopPropagation()}><IconTrash /></button>
                         )}
@@ -1206,11 +1291,16 @@ export default function Sandbox({ families, workflows, gpus, ram }: {
           <UpscaleFileCard onUpscale={setUpscaling} />
         </div>
       </div>
-      {light && <Lightbox src={light.src} video={light.video} audio={light.audio} onClose={() => setLight(null)} />}
+      {light && <Lightbox src={light.src} video={light.video} audio={light.audio} nav={lightNav} onClose={() => setLight(null)} />}
       {deleting && (
         <ConfirmDialog title={`Delete run ${runNumber(deleting)}`} danger confirmLabel="Delete" onClose={() => setDeleting(null)}
           onConfirm={() => api.del(`/api/sandbox/runs/${deleting.id}`).then(reload, (er) => toast(er.message, true))}
           message="Its outputs are deleted from disk, and it leaves the history." />
+      )}
+      {deletingPicked && (
+        <ConfirmDialog title={`Delete ${picked.length} run${picked.length === 1 ? "" : "s"}`} danger confirmLabel="Delete"
+          onClose={() => setDeletingPicked(false)} onConfirm={deletePicked}
+          message={`${picked.length === 1 ? "Its outputs are" : "Their outputs are"} deleted from disk, and ${picked.length === 1 ? "it leaves" : "they leave"} the history.`} />
       )}
       {upscaling && (
         <UpscaleDialog target={upscaling} gpu={gpu} onClose={() => setUpscaling(null)}

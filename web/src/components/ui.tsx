@@ -497,14 +497,21 @@ export function Lightbox({ src, video, audio, info, nav, navY, onClose }: {
     : video ? <video src={src} controls autoPlay loop onClick={(e) => e.stopPropagation()}
         onLoadedMetadata={(e) => measure(e.currentTarget.videoWidth, e.currentTarget.videoHeight, e.currentTarget.duration)} />
     : <img src={src} alt="" onLoad={(e) => measure(e.currentTarget.naturalWidth, e.currentTarget.naturalHeight)} />;
-  if (!info) return <div className="lightbox" onClick={onClose}>{media}</div>;
-  const facts = [...(shape?.src === src ? shape.facts : []), ...(info.details || [])];
   const arrow = (s: -1 | 1) => nav && (
     <button className={"lightbox-nav " + (s < 0 ? "prev" : "next")} title={s < 0 ? "Previous (←)" : "Next (→)"}
       disabled={nav.at + s < 0 || nav.at + s >= nav.count} onClick={(e) => { e.stopPropagation(); step(s); }}>
       {s < 0 ? <IconLeft /> : <IconRight />}
     </button>
   );
+  if (!info) return (
+    <div className="lightbox" onClick={onClose}>
+      {nav ? <>
+        <div className="lightbox-media">{arrow(-1)}{media}{arrow(1)}</div>
+        <span className="lightbox-count">{nav.at + 1} / {nav.count}</span>
+      </> : media}
+    </div>
+  );
+  const facts = [...(shape?.src === src ? shape.facts : []), ...(info.details || [])];
   return (
     <div className="lightbox with-info" onClick={() => leave(onClose)}>
       <div className="lightbox-media">{arrow(-1)}{media}{arrow(1)}</div>
