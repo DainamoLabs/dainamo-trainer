@@ -18,6 +18,10 @@ Frozen adapters (the Sandbox's LoRAs, a training adapter) can also hold whole ch
 takes them and a LoRA extracted from a finetune has them (``engine.extract``): ``<module>.diff`` (a weight's, or
 any tensor's) and ``<module>.diff_b`` (a bias's). On a Linear they apply in its wrapper; on anything else (a
 norm's scale) the Sandbox adds them to the tensor in place (``AdapterStack``).
+
+A saved file leaves out the layers whose adapter, as saved, changes nothing (its B, or a LoKr's w2, still all zero):
+layers that never ran in training, such as FLUX.3 Klein's reference-image blocks in a text-to-image job. Loaders apply
+only the layers a file has, so it's the same LoRA, smaller; ``LoRANetwork.load`` takes a layer left out as zero.
 """
 
 from __future__ import annotations
@@ -161,9 +165,20 @@ class LoRALinear(nn.Module):
         return {"lora_A.weight": _saved(self.lora_A.weight, dtype), "lora_B.weight": _saved(self.lora_B.weight, dtype),
                 "alpha": torch.tensor(float(self.alpha))}
 
+    adapter_keys = ("lora_A.weight", "lora_B.weight")  # the suffixes a saved layer has (``alpha`` aside)
+
+    @staticmethod
+    def changes_nothing(state: dict[str, torch.Tensor]) -> bool:
+        """Whether a saved adapter (``adapter_state``) is zero: B or A all zero (a NaN counts as a change)."""
+        return not (state["lora_B.weight"].any() and state["lora_A.weight"].any())
+
     def load_adapter(self, sd: dict[str, torch.Tensor], key: str):
         self.lora_A.weight.data.copy_(sd[f"{key}.lora_A.weight"])
         self.lora_B.weight.data.copy_(sd[f"{key}.lora_B.weight"])
+
+    def zero_adapter(self):
+        """No change, as the adapter starts: B at zero (A is kept, so training could go on from here)."""
+        self.lora_B.weight.data.zero_()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.base(x)
@@ -209,9 +224,18 @@ class LoKrLinear(LoRALinear):
     def adapter_state(self, dtype) -> dict[str, torch.Tensor]:
         return {"lokr_w1": _saved(self.lokr_w1, dtype), "lokr_w2": _saved(self.lokr_w2, dtype)}
 
+    adapter_keys = ("lokr_w1", "lokr_w2")
+
+    @staticmethod
+    def changes_nothing(state: dict[str, torch.Tensor]) -> bool:
+        return not (state["lokr_w2"].any() and state["lokr_w1"].any())
+
     def load_adapter(self, sd: dict[str, torch.Tensor], key: str):
         self.lokr_w1.data.copy_(sd[f"{key}.lokr_w1"])
         self.lokr_w2.data.copy_(sd[f"{key}.lokr_w2"])
+
+    def zero_adapter(self):
+        self.lokr_w2.data.zero_()
 
 
 def _saved(t: torch.Tensor, dtype) -> torch.Tensor:
@@ -279,19 +303,24 @@ class LoRANetwork:
         for m in self.wrappers.values():
             m.assistants_enabled = enabled
 
-    def state_dict(self, dtype=torch.bfloat16) -> dict[str, torch.Tensor]:
-        sd = {}
+    def state_dict(self, dtype=torch.bfloat16, changed_only: bool = False) -> dict[str, torch.Tensor]:
+        """Every layer's adapter, by saved key; ``changed_only``: without the layers whose adapter, in ``dtype``, is
+        zero (all of them when every one is: a file with no layers wouldn't load as a LoRA)."""
+        sd, unchanged = {}, {}
         for name, m in self.modules.items():
             k = f"{self.save_prefix}{name}"
-            sd.update({f"{k}.{suffix}": t for suffix, t in m.adapter_state(dtype).items()})
-        return sd
+            state = m.adapter_state(dtype)
+            out = unchanged if changed_only and m.changes_nothing(state) else sd
+            out.update({f"{k}.{suffix}": t for suffix, t in state.items()})
+        return sd or unchanged
 
     def save(self, path: str, metadata: dict[str, str] | None = None, dtype=torch.bfloat16):
-        """Written beside ``path``, then put in its place: a full disk never leaves half a file under its name, and
-        the file it replaces is let go of rather than written over (its hardlink in the output folder keeps it)."""
+        """The layers whose adapter changes something (``state_dict(changed_only=True)``). Written beside ``path``,
+        then put in its place: a full disk never leaves half a file under its name, and the file it replaces is let
+        go of rather than written over (its hardlink in the output folder keeps it)."""
         tmp = f"{path}.{os.getpid()}.tmp"
         try:
-            save_file(self.state_dict(dtype), tmp, metadata=metadata or {})
+            save_file(self.state_dict(dtype, changed_only=True), tmp, metadata=metadata or {})
             replace(tmp, path)
         except BaseException:
             if os.path.exists(tmp):
@@ -302,9 +331,20 @@ class LoRANetwork:
         self.load_state_dict(load_file(path))
 
     def load_state_dict(self, sd: dict[str, torch.Tensor]):
-        """Copy the adapters' weights in (from a saved file or ``state_dict()``), keeping dtype/device."""
+        """Copy the adapters' weights in (from a saved file or ``state_dict()``), keeping dtype/device. A layer the
+        file leaves out is one whose adapter was zero (``save``): it's set to zero, not left as it was. A file with
+        none of this network's layers, or part of one, raises."""
+        missing = []
         for name, m in self.modules.items():
-            m.load_adapter(sd, f"{self.save_prefix}{name}")
+            key = f"{self.save_prefix}{name}"
+            if any(f"{key}.{suffix}" in sd for suffix in m.adapter_keys):
+                m.load_adapter(sd, key)
+            else:
+                missing.append(m)
+        if len(missing) == len(self.modules):
+            raise ValueError(f"The LoRA has none of this network's {len(self.modules)} layers")
+        for m in missing:
+            m.zero_adapter()
 
     def attach_assistant(self, path: str, device, dtype=torch.bfloat16, multiplier: float = 1.0) -> int:
         """Attach a frozen LoRA or LoKr (e.g. a turbo training adapter). Returns number of layers matched.
