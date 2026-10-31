@@ -23,7 +23,8 @@ def system():
     return {"gpus": hardware.gpus(), "ram": hardware.ram(),
             "families": [F.info.to_json() for F in load_families().values()],
             "workflows": [{"id": k, **v} for k, v in WORKFLOWS.items()],
-            "whisper_models": [{"id": k, "size": size} for k, (_, size) in WHISPER_MODELS.items()]}
+            "whisper_models": [{"id": k, "size": size} for k, (_, size) in WHISPER_MODELS.items()],
+            "output_dir": db.OUTPUT_DIR}
 
 
 @router.get("/hardware")
@@ -138,6 +139,19 @@ def _check_models(v: dict) -> dict:
     return {"folder": folder}
 
 
+def _check_output(v: dict) -> dict:
+    """The output folders: blank (``db.OUTPUT_DIR``), or a folder that's there."""
+    out = {}
+    for which, what in (("loras", "LoRAs"), ("models", "finetuned models")):
+        folder = str(v.get(which) or "").strip()
+        if folder:
+            folder = os.path.abspath(os.path.expanduser(folder))
+            if not os.path.isdir(folder):
+                raise HTTPException(400, f"The folder for {what} wasn't found: {folder}")
+        out[which] = folder
+    return out
+
+
 def _style_number(st: dict, key: str, what: str, kind, low: float, high: float):
     """A caption style's own temperature or max_tokens, checked; None (left out) when it's blank."""
     val = st.get(key)
@@ -207,6 +221,8 @@ def put_settings(body: dict):
             v = _check_caption_styles(v)
         if k == "models":
             v = _check_models(v)
+        if k == "output":
+            v = _check_output(v)
         if k == "llama":
             v = _check_llama(v)
         if k == "text_encoder":

@@ -376,6 +376,10 @@ class Item:
     group: str = ""          # items of which an epoch trains one, picked at random: a source's clips at one size
     refs: list[str] = field(default_factory=list)  # reference images it trains with (``item_references``)
     mask: str = ""           # an image's loss mask (``mask_path``), for masked loss
+    # its dataset (``placed``): its id, its folder, and the folders it was in before it moved, for ``key``
+    dataset: str = ""
+    root: str = ""
+    was: list[str] = field(default_factory=list)
 
     @property
     def is_video(self) -> bool:
@@ -385,28 +389,50 @@ class Item:
     def is_audio(self) -> bool:
         return self.seconds > 0
 
-    def key(self) -> str:
-        """Its encoding's name in the cache: the file (path, size, modified time) and how it's prepared, so an
-        edited or replaced file is encoded again."""
+    def key(self, was: str | None = None) -> str:
+        """Its encoding's name in the cache: the file (its dataset and where in it, its size and modified time) and
+        how it's prepared, so an edited or replaced file is encoded again while a dataset moved to another folder
+        keeps its encodings. ``was``: the name it had before names went by dataset (by the file's full path), with
+        the dataset in the folder ``was``: its folder now, or one it moved from."""
+
+        def where(p: str) -> str:
+            if not (self.root and inside(p, self.root)) or was == self.root:
+                return p
+            rel = os.path.relpath(p, self.root)
+            if was is not None:
+                return os.path.join(was, rel)  # (as ``list_media`` named it there)
+            return f"{self.dataset}:{rel.replace(os.sep, '/')}" if self.dataset else p
+
         st = os.stat(self.path)
-        raw = f"{self.path}|{st.st_size}|{st.st_mtime_ns}|{self.size}|{self.flip}|{self.resolution}"
+        raw = f"{where(self.path)}|{st.st_size}|{st.st_mtime_ns}|{self.size}|{self.flip}|{self.resolution}"
         if self.frames > 1:
             raw += f"|{self.frames}"
         if self.seconds:
             raw += f"|{self.start}|{self.seconds}"
         for ref in self.refs:  # editing or pairing another reference re-encodes the item
-            raw += f"|{ref}|{os.stat(ref).st_mtime_ns}"
+            raw += f"|{where(ref)}|{os.stat(ref).st_mtime_ns}"
         if self.mask:  # so does adding or editing its mask (an item without one keeps the key it had)
-            raw += f"|mask|{self.mask}|{os.stat(self.mask).st_mtime_ns}"
+            raw += f"|mask|{where(self.mask)}|{os.stat(self.mask).st_mtime_ns}"
         return hashlib.sha1(raw.encode()).hexdigest()
+
+    def keys(self) -> list[str]:
+        """``key``, then the names it may be under from before names went by dataset (``key(was)``)."""
+        return [self.key(), *dict.fromkeys(self.key(r) for r in [self.root, *self.was] if r)]
+
+
+def placed(items: list[Item], ds: dict) -> None:
+    """Tell ``items`` (all of dataset ``ds``) which dataset they're of, for their cache names (``Item.key``)."""
+    for it in items:
+        it.dataset, it.root, it.was = ds.get("id") or "", ds["path"], list(ds.get("moved_from") or [])
 
 
 def build_items(datasets: list[dict], resolution: int | list[int], div: int, flip: bool, log=print,
                 video_frames: int | None = None, snap_frames=None, fps: int = 24,
                 caption_dropout: float = 0.0, references: bool = False, masks: bool = True) -> list[Item]:
-    """``datasets``: [{path, trigger, repeats, resolution?, flip?, caption_dropout?, name?, sources?}] -> list of
-    Items (repeats expanded). A dataset's own ``resolution`` (one or several), ``flip`` and ``caption_dropout`` are
-    used instead of the arguments of those names.
+    """``datasets``: [{path, trigger, repeats, resolution?, flip?, caption_dropout?, name?, sources?, caption?}] ->
+    list of Items (repeats expanded). A dataset's own ``resolution`` (one or several), ``flip`` and
+    ``caption_dropout`` are used instead of the arguments of those names; its ``caption`` is that of its files
+    without one (the trigger word is added to it as to theirs).
     With ``references`` (the model trains with per-item references: an edit's source images), each item has the
     reference images it pairs with (``item_references``): from the dataset's ``sources`` ([{path, name?}], source
     datasets, whose files never train as items themselves; ``nested_sources``, ``source_index``), or else its _refs
@@ -461,7 +487,7 @@ def build_items(datasets: list[dict], resolution: int | list[int], div: int, fli
                 cut_from.add(source)
                 n_cut += 1
             small += len(sizes) < len(res_list)
-            cap = apply_trigger(read_caption(f), ds.get("trigger", ""))
+            cap = apply_trigger(read_caption(f) or ds.get("caption", ""), ds.get("trigger", ""))
             refs = item_references(f, ds["path"], indexes) if references else []
             paired += bool(refs)
             mask = (mask_path(f) or "") if masks and frames == 1 else ""
@@ -478,6 +504,7 @@ def build_items(datasets: list[dict], resolution: int | list[int], div: int, fli
         repeats = max(1, int(ds.get("repeats", 1)))
         counts = " and ".join(f"{n} {kind}{'' if n == 1 else 's'}" for kind, n in used.items() if n)
         mine = items[start:]
+        placed(mine, ds)
         if cut_from:
             n = len(cut_from)
             counts += (f" ({'' if n_cut == used['clip'] else f'{n_cut} of them '}cut from {n} video"
@@ -514,7 +541,8 @@ def build_audio_items(datasets: list[dict], clip_seconds: float, flip: bool, log
     is one shorter clip); 0 trains whole songs, up to ``max_seconds`` of each. A song's clips share a
     ``group`` per flip and repeat, so the song counts once per epoch however long it is (``epoch_items``).
     A caption's lyrics (``split_lyrics``) are only trained with whole songs, as where a clip's words fall
-    isn't known. ``flip`` adds each item again with its stereo channels swapped."""
+    isn't known. ``flip`` adds each item again with its stereo channels swapped. A dataset's ``caption`` is that
+    of its songs without one."""
     items = []
     for ds in datasets:
         files = [f for f in list_media(ds["path"]) if media_kind(f) == "audio"]
@@ -534,7 +562,7 @@ def build_audio_items(datasets: list[dict], clip_seconds: float, flip: bool, log
             if duration < min_seconds:
                 log(f"Warning: skipping {os.path.basename(f)}: too short ({duration} s)")
                 continue
-            style, lyrics = split_lyrics(read_caption(f))
+            style, lyrics = split_lyrics(read_caption(f) or ds.get("caption", ""))
             style = apply_trigger(style, ds.get("trigger", ""))
             if clip_seconds:
                 clips = song_clips(duration, clip_seconds)
@@ -549,6 +577,7 @@ def build_audio_items(datasets: list[dict], clip_seconds: float, flip: bool, log
                                           start=float(at), lyrics=lyrics,
                                           group=f"{f}|{fl}|{rep}" if clip_seconds else ""))
         mine = items[start:]
+        placed(mine, ds)
         per_epoch = sum(1 for it in mine if not it.group) + len({it.group for it in mine if it.group})
         log(f"{ds.get('name') or os.path.basename(os.path.normpath(ds['path']))}: {used} song"
             f"{'' if used == 1 else 's'}" + (f", {repeats} repeats" if repeats > 1 else "")

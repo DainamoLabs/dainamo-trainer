@@ -69,3 +69,44 @@ def test_jobs_share_what_the_same_files_encode(tmp_path):
     with open(os.path.join(base["latents"], "signature.json")) as f:
         sig = json.load(f)
     assert sig["family"] == "krea2" and sig["paths"] == [vae]  # says what made it
+
+
+def test_a_moved_dataset_keeps_its_cached_latents(tmp_path):
+    """An item's cache name goes by its dataset and where the file is in it, so a dataset moved to another folder
+    still finds its encodings, and another dataset of the same files has its own. One encoded before names went by
+    dataset (by the file's full path) is found by the folder the dataset moved from."""
+    from types import SimpleNamespace
+
+    from PIL import Image
+
+    from dainamo.engine import dataset as ds
+    from dainamo.engine.trainer import Trainer
+
+    old, new = tmp_path / "old", tmp_path / "new"
+    (old / "sub" / "_masks").mkdir(parents=True)
+    Image.new("RGB", (64, 64)).save(old / "a.png")
+    Image.new("RGB", (64, 64)).save(old / "sub" / "b.png")
+    Image.new("L", (64, 64), 255).save(old / "sub" / "_masks" / "b.png")
+
+    def build(**d):
+        return ds.build_items([d], 64, 16, False, log=lambda *_: None)
+    items = build(id="d1", path=str(old))
+    assert [bool(it.mask) for it in items] == [False, True]
+    before = [it.key() for it in items]
+    by_path = [it.key() for it in build(path=str(old))]  # (no id: by the full path, as all were before)
+    assert by_path != before
+    shutil.move(old, new)
+    after = build(id="d1", path=str(new), moved_from=[str(old)])
+    assert [it.key() for it in after] == before
+    assert [it.keys()[-1] for it in after] == by_path
+    assert not {it.key() for it in build(id="d2", path=str(new))} & {it.key() for it in after}
+
+    # the trainer takes the encoding under the name the item had (so its saved batch order still applies), else
+    # names it the new way
+    folder = tmp_path / "cache"
+    folder.mkdir()
+    (folder / f"{by_path[0]}.pt").write_bytes(b"")
+    (folder / f"{after[1].key()}.pt").write_bytes(b"")
+    me = SimpleNamespace(cache_dir=lambda driver, kind: str(folder), use_cache=lambda files: None)
+    files = Trainer.cache_items(me, None, after)
+    assert files == [str(folder / f"{by_path[0]}.pt"), str(folder / f"{after[1].key()}.pt")]

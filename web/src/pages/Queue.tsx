@@ -9,7 +9,7 @@ import { EvaluateDialog } from "../components/EvalSettings";
 import { ExtractLora } from "../components/ExtractLora";
 import { LikenessChart } from "../components/Likeness";
 import { LossChart, Spark, useMetrics } from "../components/LossChart";
-import { IconCamera, IconCheck, IconCopy, IconDatabase, IconDown, IconDownload, IconDrive, IconEdit, IconFile, IconImages, IconLayers, IconPlay, IconPlus, IconRefresh, IconRight, IconSave, IconServer, IconStop, IconTarget, IconTrash, IconUp } from "../components/icons";
+import { IconCamera, IconCheck, IconCopy, IconDatabase, IconDown, IconDownload, IconDrive, IconEdit, IconFile, IconFolder, IconImages, IconLayers, IconPlay, IconPlus, IconRefresh, IconRight, IconSave, IconServer, IconStop, IconTarget, IconTrash, IconUp } from "../components/icons";
 import { AudioCard, ConfirmDialog, Empty, Lightbox, LoadError, Modal, SelectBar, StatusPill, fmtSize, someNames, usePoll, useSelection, useToast, type Selection } from "../components/ui";
 import { SamplesPanel } from "../components/Samples";
 import { Terminal } from "../components/Terminal";
@@ -288,6 +288,7 @@ function RefModCard({ job, made, onOpen }: { job: JobDetail; made?: RefModMade; 
           <span className="mono ellipsis">{made.file}</span>
           <span className="row" style={{ gap: 8 }}>
             <span className="faint small">{fmtSize(made.bytes)}</span>
+            <OutputFile job={job} file={made.file} />
             <a className="btn sm" href={`/api/jobs/${job.id}/file/output/${made.file}`} download><IconDownload /></a>
           </span>
         </div>
@@ -337,6 +338,35 @@ const basename = (p: string) => String(p || "").split(/[\\/]/).pop() || "";
 
 /** What an extract job made: its LoRA, the finetune checkpoint and original model it's the difference of, and how
  * much of that change it keeps. */
+/** Where a job's ``file`` is in the output folder, or a button that puts it there. */
+function OutputFile({ job, file, reload }: { job: JobDetail; file: string; reload?: () => void }) {
+  const toast = useToast();
+  const [busy, setBusy] = useState(false);
+  const at = job.exports?.[file];
+  if (!job.output_folder) return null;
+  if (at) return <span className="faint small row" style={{ gap: 4 }} title={at}><IconCheck width={13} height={13} /> In output</span>;
+  const send = async () => {
+    setBusy(true);
+    try {
+      const r = await api.post<{ path: string }>(`/api/jobs/${job.id}/export`, { file });
+      toast(`Put in ${r.path}`);
+      reload?.();
+    } catch (e: any) {
+      toast(e.message, true);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return <button className="btn sm" disabled={busy} title={`Put it in ${job.output_folder}`} onClick={send}><IconFolder /> To output</button>;
+}
+
+/** Where a job's finished file goes (``output_folder``), for its help text. */
+function OutputNote({ job, what }: { job: JobDetail; what: string }) {
+  if (!job.output_folder) return null;
+  return <>{" "}{what} put in <span className="mono">{job.output_folder}</span> when the job completes (the folder is
+    set in <a href="#/settings">Settings</a>).</>;
+}
+
 function ExtractCard({ job, made }: { job: JobDetail; made?: ExtractMade }) {
   const s = job.config?.settings || {};
   const from = s.extract_from || {};
@@ -350,6 +380,7 @@ function ExtractCard({ job, made }: { job: JobDetail; made?: ExtractMade }) {
           <span className="mono ellipsis">{made.file}</span>
           <span className="row" style={{ gap: 8 }}>
             <span className="faint small">{fmtSize(made.bytes)}</span>
+            <OutputFile job={job} file={made.file} />
             <a className="btn sm" href={`/api/jobs/${job.id}/file/output/${made.file}`} download><IconDownload /></a>
           </span>
         </div>
@@ -365,7 +396,7 @@ function ExtractCard({ job, made }: { job: JobDetail; made?: ExtractMade }) {
         thin for this rank. To see whether that's enough, render the same prompt and seed with it on the original model and
         with the finetuned model in the Sandbox, and if it falls short, extract again at a higher rank. Saved in{" "}
         <span className="mono">{job.dir}/output/</span>; it's in the Sandbox's LoRAs, and ComfyUI loads it from{" "}
-        <span className="mono">models/loras</span> on the original model.
+        <span className="mono">models/loras</span> on the original model.<OutputNote job={job} what="It's" />
       </div>
     </div>
   );
@@ -385,6 +416,7 @@ function MergeCard({ job, made }: { job: JobDetail; made?: MergeMade }) {
           <span className="mono ellipsis">{made.file}</span>
           <span className="row" style={{ gap: 8 }}>
             <span className="faint small">{fmtSize(made.bytes)}</span>
+            <OutputFile job={job} file={made.file} />
             <a className="btn sm" href={`/api/jobs/${job.id}/file/output/${made.file}`} download><IconDownload /></a>
           </span>
         </div>
@@ -408,7 +440,7 @@ function MergeCard({ job, made }: { job: JobDetail; made?: MergeMade }) {
             falls short, merge again at a higher rank.</>
           : <>What the LoRAs do together, exactly: their ranks added up. In the Sandbox it gives what they give together at these strengths.</>}
         {" "}Saved in <span className="mono">{job.dir}/output/</span>; it's in the Sandbox's LoRAs, and ComfyUI loads it from{" "}
-        <span className="mono">models/loras</span>; use it at strength 1.
+        <span className="mono">models/loras</span>; use it at strength 1.<OutputNote job={job} what="It's" />
       </div>
     </div>
   );
@@ -620,18 +652,19 @@ function JobDetailView({ id, view, families }: { id: string; view?: string; fami
                 {job.recommended?.file === c.file && <span className="rec-star" title="Recommended by the checkpoint evaluation">★</span>}
                 {c.final && <span className="pill completed">final</span>}
                 {finetune && <button className="btn sm" title="Save what this checkpoint changed as a LoRA" onClick={() => setExtractFrom(c)}><IconLayers /> Extract LoRA</button>}
+                <OutputFile job={job} file={c.file} reload={reload} />
                 <a className="btn sm" href={`/api/jobs/${job.id}/file/output/${c.file}`} download><IconDownload /></a>
               </span>
             </div>
           ))}
           {finetune ? (
             <div className="help" style={{ marginTop: 10 }}>Saved in <span className="mono">{jobPath}</span>. Each is a whole
-              diffusion model in bf16, laid out like <span className="mono">{String(job.config?.profile?.diffusion_model || "").split(/[\\/]/).pop()}</span>: copy
-              it into ComfyUI's <span className="mono">models/diffusion_models</span> and load it in place of the original, or try
+              diffusion model in bf16, laid out like <span className="mono">{String(job.config?.profile?.diffusion_model || "").split(/[\\/]/).pop()}</span>: in
+              ComfyUI's <span className="mono">models/diffusion_models</span>, load it in place of the original, or try
               it in the Sandbox (Finetuned model). Extract LoRA saves what a checkpoint changed as a LoRA, a much smaller file
-              to use on the original model.</div>
+              to use on the original model.<OutputNote job={job} what="The final one is" /> To output puts another there.</div>
           ) : (
-            <div className="help" style={{ marginTop: 10 }}>Saved in <span className="mono">{jobPath}</span>, in ComfyUI's format: copy them into <span className="mono">models/loras</span>.</div>
+            <div className="help" style={{ marginTop: 10 }}>Saved in <span className="mono">{jobPath}</span>, in ComfyUI's format (it loads them from <span className="mono">models/loras</span>).<OutputNote job={job} what="The final one is" /> To output puts another there.</div>
           )}
         </div>
 
@@ -651,7 +684,7 @@ function JobDetailView({ id, view, families }: { id: string; view?: string; fami
       )}
       {deleting && (
         <ConfirmDialog title="Delete job" danger confirmLabel="Delete job" onClose={() => setDeleting(false)} onConfirm={remove}
-          message={<>Remove <strong style={{ color: "var(--text)" }}>{job.name}</strong> from the queue?</>}
+          message={<>Remove <strong style={{ color: "var(--text)" }}>{job.name}</strong> from the queue?{Object.keys(job.exports || {}).length > 0 && " What it put in the output folder stays."}</>}
           checkbox={refmod ? "Also delete its RefMod and preview from disk" : extract || merge ? "Also delete its LoRA from disk"
             : finetune ? "Also delete its finetuned models and samples from disk" : "Also delete its LoRA checkpoints and samples from disk"} />
       )}

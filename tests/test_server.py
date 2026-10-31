@@ -2007,3 +2007,150 @@ def test_jobs_carry_a_short_smoothed_loss_curve(client):
     client.delete(f"/api/jobs/{jid}")
     client.get("/api/jobs")
     assert jid not in routes._curves
+
+
+def test_a_completed_job_puts_its_final_lora_in_the_output_folder(client, monkeypatch, tmp_path):
+    """When a job completes its final LoRA is hardlinked into the output folder (copied across disks, if there's
+    room); finishing again replaces the file it put there, never someone else's of that name; a checkpoint can be
+    sent there too; and deleting the job, files and all, leaves it there."""
+    import json
+
+    import torch.nn as nn
+
+    from dainamo.engine.lora import LoRANetwork
+    from dainamo.server import db, outputs
+    from dainamo.server.queue import job_dir, scheduler
+
+    class Proc:
+        code, pid = 0, 4243
+
+        def poll(self):
+            return self.code
+
+    class Tiny(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = nn.Linear(4, 4)
+
+    monkeypatch.setattr(outputs, "export_final_later", outputs.export_final)  # (not in the background)
+    out = db.OUTPUT_DIR
+
+    def finished(name: str, config: str = "{}") -> str:
+        """A job that's just completed: its final LoRA (a real one) saved, and its process ended."""
+        jid = db.new_id()
+        db.execute("INSERT INTO jobs (id, name, status, family, gpu, position, created, pid, config, folder) VALUES "
+                   "(?,?,?,?,?,?,?,?,?,?)", (jid, name, "running", "flux2_klein", "99", 0.0, db.now(), 4243, config,
+                                             f"{name}_{jid}"))
+        finish(jid, name, steps=[500])
+        return jid
+
+    def finish(jid: str, name: str, steps=()):
+        os.makedirs(os.path.join(job_dir(jid), "output"), exist_ok=True)
+        ckpts = [{"step": s, "file": f"{name}_{s:06d}.safetensors", "final": False} for s in steps]
+        ckpts.append({"step": 1000, "file": f"{name}.safetensors", "final": True})
+        for c in ckpts:
+            LoRANetwork(Tiny(), ["a"], 2, 2).save(os.path.join(job_dir(jid), "output", c["file"]))
+        with open(os.path.join(job_dir(jid), "status.json"), "w") as f:
+            json.dump({"phase": "completed", "checkpoints": ckpts}, f)
+        with scheduler._lock:
+            scheduler.procs[jid] = Proc()
+            scheduler._reap()
+
+    first = finished("fk9")
+    exported = os.path.join(out, "fk9.safetensors")
+    final = os.path.join(job_dir(first), "output", "fk9.safetensors")
+    assert os.path.samefile(final, exported)  # a hardlink: no more space
+    with open(os.path.join(job_dir(first), "log.txt")) as f:
+        assert f"Put in the output folder: {exported}" in f.read()
+    j = client.get(f"/api/jobs/{first}").json()
+    assert j["status"] == "completed" and j["output_folder"] == out and j["exports"] == {"fk9.safetensors": exported}
+
+    # another job of that name doesn't take its place, nor does the job's own file replace one you put there
+    second = finished("fk9")
+    theirs = os.path.join(job_dir(second), "output", "fk9.safetensors")
+    assert os.path.samefile(os.path.join(out, "fk9 (2).safetensors"), theirs)
+    assert os.path.samefile(final, exported)
+
+    # trained on, it finishes again: the file it put there is replaced (a new save never writes over the old one,
+    # which its hardlink would change too)
+    os.replace(final, os.path.join(job_dir(first), "output", "fk9_001000.safetensors"))
+    before = os.stat(exported).st_ino
+    db.execute("UPDATE jobs SET status='running' WHERE id=?", (first,))
+    finish(first, "fk9")
+    assert os.path.samefile(final, exported) and os.stat(exported).st_ino != before
+    assert not os.path.exists(os.path.join(out, "fk9 (3).safetensors"))
+    assert os.stat(os.path.join(job_dir(first), "output", "fk9_001000.safetensors")).st_ino == before
+
+    # a checkpoint sent there; a file that isn't the job's is refused, and a RefMod's go where its job says
+    r = client.post(f"/api/jobs/{first}/export", json={"file": "fk9_001000.safetensors"})
+    assert r.status_code == 200 and r.json()["path"] == os.path.join(out, "fk9_001000.safetensors")
+    assert client.post(f"/api/jobs/{first}/export", json={"file": "../../dainamo.db"}).status_code == 404
+    refmod = finished("ref", json.dumps({"settings": {"refmod_enabled": True}}))
+    assert not os.path.exists(os.path.join(out, "ref.safetensors"))
+    assert client.get(f"/api/jobs/{refmod}").json()["output_folder"] is None
+    assert client.post(f"/api/jobs/{refmod}/export", json={"file": "ref.safetensors"}).status_code == 400
+
+    # the folders are a setting; one on another disk gets a copy, if there's room for it
+    assert client.put("/api/settings", json={"output": {"loras": str(tmp_path / "nope")}}).status_code == 400
+    assert client.put("/api/settings", json={"output": {"loras": str(tmp_path)}}).status_code == 200
+
+    def no_link(*a):
+        raise OSError(18, "Invalid cross-device link")
+    monkeypatch.setattr(os, "link", no_link)
+    with monkeypatch.context() as m:
+        m.setattr(outputs.shutil, "disk_usage", lambda p: SimpleNamespace(free=1000))
+        r = client.post(f"/api/jobs/{first}/export", json={"file": "fk9.safetensors"})
+        assert r.status_code == 400 and "there isn't room to copy it" in r.json()["detail"]
+        assert os.listdir(tmp_path) == []
+    finetune = finished("ft", json.dumps({"settings": {"finetune_enabled": True}}))
+    assert os.path.exists(os.path.join(out, "ft.safetensors"))  # (a finetune's go in the models folder)
+    copied = tmp_path / "fk9.safetensors"
+    assert client.post(f"/api/jobs/{first}/export", json={"file": "fk9.safetensors"}).json()["path"] == str(copied)
+    assert copied.read_bytes() == open(final, "rb").read() and not os.path.samefile(copied, final)
+    client.put("/api/settings", json={"output": {"loras": ""}})
+
+    # deleting a job and its files leaves what it put in the output folder
+    for jid in (first, second, refmod, finetune):
+        assert client.delete(f"/api/jobs/{jid}?delete_files=true").status_code == 200
+    assert os.path.isfile(exported) and os.path.isfile(os.path.join(out, "fk9 (2).safetensors"))
+
+
+def test_a_job_follows_its_dataset_to_another_folder(client, tmp_path, monkeypatch):
+    """A dataset's folder moved: resuming a job using it says where to set the new one, the dataset is pointed at it
+    in Datasets, and the job resumes from there, keeping the folder it had (its cached latents are by it)."""
+    from dainamo.server import db
+    from dainamo.server.queue import follow_datasets, scheduler
+
+    monkeypatch.setattr(scheduler, "_launch", lambda: None)  # its jobs stay queued
+    old, new = tmp_path / "old", tmp_path / "new"
+    old.mkdir()
+    pid = client.post("/api/profiles", json={"name": "mv", "family": "krea2", "data": {}}).json()["id"]
+    did = client.post("/api/datasets", json={"name": "cats", "path": str(old)}).json()["id"]
+    jid = client.post("/api/jobs", json={"name": "mv", "profile_id": pid, "settings": {},
+                                         "datasets": [{"id": did}]}).json()["id"]
+    db.execute("UPDATE jobs SET status='stopped' WHERE id=?", (jid,))
+    old.rename(new)
+    r = client.post(f"/api/jobs/{jid}/action", json={"action": "resume"})
+    assert r.status_code == 400 and f"cats's folder isn't there any more: {old}" in r.json()["detail"]
+    assert "Change folder" in r.json()["detail"]
+
+    # only a linked folder moves, and only to one that's there
+    put = {"name": "cats", "trigger": ""}
+    assert client.put(f"/api/datasets/{did}", json={**put, "path": str(tmp_path / "nope")}).status_code == 400
+    assert client.put(f"/api/datasets/{did}", json={**put, "path": str(new)}).json()["path"] == str(new)
+    assert client.put(f"/api/datasets/{did}", json=put).json()["path"] == str(new)  # (blank: kept)
+    up = client.post("/api/datasets", json={"name": "uploads"}).json()["id"]
+    assert client.put(f"/api/datasets/{up}", json={**put, "path": str(new)}).status_code == 400
+
+    assert client.post(f"/api/jobs/{jid}/action", json={"action": "resume"}).json()["status"] == "queued"
+    d = client.get(f"/api/jobs/{jid}").json()["config"]["datasets"][0]
+    assert d["path"] == str(new) and d["moved_from"] == [str(old)]
+    # moved again: it follows, and says from where (the queue writes that in its log when it starts it)
+    newer = tmp_path / "newer"
+    new.rename(newer)
+    client.put(f"/api/datasets/{did}", json={**put, "path": str(newer)})
+    cfg = client.get(f"/api/jobs/{jid}").json()["config"]
+    assert follow_datasets(jid, cfg) == [f"cats moved from {new} to {newer}"] and follow_datasets(jid, cfg) == []
+    d = client.get(f"/api/jobs/{jid}").json()["config"]["datasets"][0]
+    assert d["path"] == str(newer) and d["moved_from"] == [str(old), str(new)]
+    client.post(f"/api/jobs/{jid}/action", json={"action": "stop"})

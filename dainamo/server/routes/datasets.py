@@ -35,7 +35,7 @@ CAPTION_BACKUPS = os.path.join(db.DATA_DIR, "caption_backups")  # <dataset id>.j
 
 class DatasetIn(BaseModel):
     name: str
-    path: str = ""  # empty -> managed folder for uploads
+    path: str = ""  # empty -> managed folder for uploads; editing, empty keeps the folder it has
     trigger: str = ""
 
 
@@ -112,8 +112,16 @@ def create_dataset(d: DatasetIn):
 
 @router.put("/datasets/{did}")
 def update_dataset(did: str, d: DatasetIn):
-    dataset_or_404(did)
-    db.execute("UPDATE datasets SET name=?, trigger=? WHERE id=?", (d.name.strip(), d.trigger.strip(), did))
+    """Its name and trigger word, and for a linked folder that's moved, the folder it's in now (jobs using it follow
+    it there when they next run: ``queue.follow_datasets``)."""
+    old = dataset_or_404(did)
+    path = os.path.abspath(os.path.expanduser(d.path.strip())) if d.path.strip() else old["path"]
+    if path != old["path"]:
+        if old["managed"]:
+            raise HTTPException(400, "An uploaded dataset's folder is the app's own: it can't be moved")
+        if not os.path.isdir(path):
+            raise HTTPException(400, f"Folder not found: {path}")
+    db.execute("UPDATE datasets SET name=?, trigger=?, path=? WHERE id=?", (d.name.strip(), d.trigger.strip(), path, did))
     return dataset_or_404(did)
 
 

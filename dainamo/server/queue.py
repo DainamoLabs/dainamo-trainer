@@ -104,6 +104,25 @@ def end_evaluation(job_id: str, cfg: dict, unrecorded: str = "failed") -> str | 
     return record["state"]
 
 
+def follow_datasets(job_id: str, cfg: dict) -> list[str]:
+    """Bring a job's datasets (and their source and validation datasets) to where they are now: one whose folder was
+    changed in Datasets since the job saved it is followed there, the folder it had kept in its ``moved_from`` (the
+    cache's older names for its files are by that folder: ``Item.key``). Saved to the job; returns what moved."""
+    now = {d["id"]: d["path"] for d in db.query("SELECT id, path FROM datasets")}
+    datasets = cfg.get("datasets") or []
+    moved = []
+    for d in [*datasets, *(s for d in datasets for s in d.get("sources") or []), *(cfg.get("validation_datasets") or [])]:
+        path = now.get(d.get("id"))
+        if path and d.get("path") and os.path.abspath(d["path"]) != os.path.abspath(path):
+            if d["path"] not in d.setdefault("moved_from", []):
+                d["moved_from"].append(d["path"])
+            moved.append(f"{d.get('name') or d['id']} moved from {d['path']} to {path}")
+            d["path"] = path
+    if moved:
+        db.execute("UPDATE jobs SET config=? WHERE id=?", (json.dumps(cfg), job_id))
+    return moved
+
+
 def send_control(job_id: str, action: str) -> None:
     path = os.path.join(job_dir(job_id), "control.json")
     with open(path + ".tmp", "w") as f:
@@ -128,7 +147,7 @@ class Scheduler:
     def _reattach(self):
         """Reattach to training processes that outlived the previous server; a job that ended while the
         server was down gets the outcome it wrote to its status file."""
-        from . import notify
+        from . import notify, outputs
 
         for j in db.query("SELECT * FROM jobs WHERE status IN ('running','stopping')"):
             if j["pid"] and procs.is_trainer(j["pid"], j["id"]):
@@ -141,6 +160,8 @@ class Scheduler:
                 phase = read_status(j["id"]).get("phase")
                 status = phase if phase in ("completed", "stopped", "failed") else "interrupted"
                 db.execute("UPDATE jobs SET status=?, finished=?, pid=NULL WHERE id=?", (status, db.now(), j["id"]))
+                if status == "completed":
+                    outputs.export_final_later(j["id"])
                 notify.job_ended(j["id"], status)
 
     def _loop(self):
@@ -188,8 +209,9 @@ class Scheduler:
             ended()
 
     def _record_end(self, job_id: str, code: int, asked_to_stop: bool):
-        """Record in the database how a job's process ended; returns the notification to send for it."""
-        from . import notify
+        """Record in the database how a job's process ended; returns what to do then: the notification to send
+        for it, and a completed job's final file put in the output folder."""
+        from . import notify, outputs
 
         cfg = (db.query_one("SELECT config FROM jobs WHERE id=?", (job_id,)) or {}).get("config") or {}
         if "evaluate" in cfg:
@@ -203,7 +225,12 @@ class Scheduler:
             status = "stopped"
         db.execute("UPDATE jobs SET status=?, exit_code=?, finished=?, pid=NULL WHERE id=?",
                    (status, code, db.now(), job_id))
-        return lambda: notify.job_ended(job_id, status, code)
+
+        def ended():
+            if status == "completed":
+                outputs.export_final_later(job_id)
+            notify.job_ended(job_id, status, code)
+        return ended
 
     def _launch(self):
         from . import sandbox as sbx
@@ -256,6 +283,7 @@ class Scheduler:
         evaluating = "evaluate" in job["config"]
         d = job_dir(job["id"])
         os.makedirs(d, exist_ok=True)
+        moved = follow_datasets(job["id"], job["config"])
         with open(os.path.join(d, "job.json"), "w") as f:
             json.dump({**job["config"], "cache_dir": CACHE_DIR}, f, indent=2)
         try:
@@ -266,6 +294,7 @@ class Scheduler:
         with open(os.path.join(d, "log.txt"), "a", encoding="utf-8") as log:
             what = "checkpoint evaluation started" if evaluating else "started"
             log.write(f"\n===== {what} {time.strftime('%Y-%m-%d %H:%M:%S')} on GPU {gpu} =====\n")
+            log.writelines(f"Dataset {m}\n" for m in moved)
             log.flush()
             proc = subprocess.Popen([sys.executable, "-m", "dainamo.engine.run", d], cwd=root,
                                     env=procs.worker_env(gpu), stdout=log, stderr=subprocess.STDOUT,

@@ -329,6 +329,10 @@ export type MergeMade = {
 export type JobDetail = Job & {
   config: any;
   dir: string;
+  /** The output folder its files go in (Settings: a LoRA's, or a finetuned model's); null: a RefMod's don't. */
+  output_folder: string | null;
+  /** Its files that are in an output folder: {its file: where}. */
+  exports: Record<string, string>;
   status_detail: Progress & {
     samples?: Sample[]; checkpoints?: Checkpoint[];
     evals?: Eval[]; recommended?: Recommendation | null; sweep?: Sweep | null;
@@ -372,6 +376,8 @@ export type Settings = {
   speech: { model: string; device: "auto" | "cpu" };
   /** ComfyUI's models folder: the model manager finds files in it and downloads into its subfolders. */
   models: { folder: string };
+  /** Where a completed job's final LoRA, or finetuned model, is put (blank: the app's output folder). */
+  output: { loras: string; models: string };
 };
 
 /** A file the model manager can download for a profile field (a family driver's ``downloads``). */

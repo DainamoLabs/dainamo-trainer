@@ -62,8 +62,9 @@ from scripts that call the API directly.
 3. **New job**: pick the profile and datasets, set the steps and sample prompts,
    and press **Fit to GPU** if the projection says it won't fit. **Add and
    start** runs it; **Add to queue** keeps it ready until you press **Start**.
-4. **Queue**: open the job for its samples, loss and log. The LoRA is saved in
-   `data/jobs/<job name>_<id>/` and downloadable from the Checkpoints tab.
+4. **Queue**: open the job for its samples, loss and log. When it completes,
+   the LoRA is put in `output/` (or the folder set in Settings, such as
+   ComfyUI's `models/loras`); every checkpoint is in the job's Checkpoints tab.
 5. **Sandbox**: generate with the LoRA and compare it with the render without
    it.
 

@@ -250,7 +250,10 @@ class Trainer:
     def cache_items(self, driver, items: list[ds.Item]) -> list[str]:
         """VAE-encode items through the driver; returns one cache file per item."""
         cache_dir = self.cache_dir(driver, "latents")
-        files = [os.path.join(cache_dir, it.key() + ".pt") for it in items]
+        files = []
+        for it in items:  # under its name, else one it had before (there from before names went by dataset)
+            names = [os.path.join(cache_dir, k + ".pt") for k in it.keys()]
+            files.append(next((f for f in names if os.path.exists(f)), names[0]))
         # repeats share a cache file, so dedupe by file
         todo = [(it, f) for f, it in dict(zip(files, items)).items() if not os.path.exists(f)]
         self.use_cache(files)

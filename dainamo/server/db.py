@@ -12,6 +12,9 @@ import uuid
 DATA_DIR = os.environ.get("DAINAMO_DATA", os.path.join(os.path.dirname(__file__), "..", "..", "data"))
 DATA_DIR = os.path.abspath(DATA_DIR)
 DB_PATH = os.path.join(DATA_DIR, "dainamo.db")
+# where finished LoRAs and finetuned models are put (``outputs``) unless the settings say elsewhere: output/ beside
+# data/, or inside a data folder set with DAINAMO_DATA
+OUTPUT_DIR = os.path.join(DATA_DIR if "DAINAMO_DATA" in os.environ else os.path.dirname(DATA_DIR), "output")
 
 # Auto-Caption styles: the prompt sent with each image, and optionally a system prompt and the style's own
 # temperature and max_tokens (left out: the caption provider's). Datasets remember the style they were captioned
@@ -131,6 +134,8 @@ DEFAULT_SETTINGS = {
     "speech": {"model": "large-v3-turbo", "device": "auto"},  # Whisper, for clips with sound; device "auto" or "cpu"
     # ComfyUI's models folder: the model manager looks for files in it and downloads into its subfolders
     "models": {"folder": ""},
+    # where a finished job's LoRA, or finetuned model, is put (``outputs``); blank: OUTPUT_DIR
+    "output": {"loras": "", "models": ""},
     "caption_styles": {"default": "detailed", "styles": CAPTION_STYLES},
 }
 

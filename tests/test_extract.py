@@ -25,7 +25,7 @@ def test_the_factors_are_the_best_approximation_of_their_rank():
         best = U[:, :6] * S[:6] @ Vh[:6]
         assert torch.allclose(up @ down, best, atol=1e-4)
         assert kept == pytest.approx(float((S[:6] ** 2).sum() / (S ** 2).sum()), rel=1e-4)
-        assert up.norm() == pytest.approx(down.norm(), rel=1e-3)  # the singular values split between them
+        assert float(up.norm()) == pytest.approx(float(down.norm()), rel=1e-3)  # the singular values split between them
         # a change of lower rank than asked for is held exactly, with no factors for what isn't there
         low = torch.randn(shape[0], 3) @ torch.randn(3, shape[1])
         up, down, kept = extract.low_rank(low, 8)

@@ -449,6 +449,7 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
   };
 
   const [confirmRemove, setConfirmRemove] = useState(false);
+  const [moving, setMoving] = useState(false);
 
   const setLayout = (l: Layout) => {
     setLayoutState(l);
@@ -528,6 +529,7 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
             ...((items?.filter((i) => i.kind !== "audio").length ?? 0) >= 2 ? [{ label: "Find duplicates", icon: <IconCopy />, onClick: () => setDupOpen(true),
               title: "Images and clips that look alike (copies, re-encodes, crops), to delete the extras" }] : []),
             { label: "Export", icon: <IconDownload />, onClick: () => setExporting(true), disabled: !items?.length, title: "Download it as a .zip" },
+            ...(d && !d.managed ? [{ label: "Change folder", icon: <IconFolder />, onClick: () => setMoving(true), title: "Moved its folder? Say where it is now" }] : []),
             { label: "Delete dataset", icon: <IconTrash />, onClick: () => setConfirmRemove(true), danger: true, sep: true },
           ]} />
           <button className="btn primary lg" onClick={() => setCapOpen(true)} disabled={!items?.length || onlyAudio}
@@ -537,6 +539,13 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
             onChange={(e) => { if (e.target.files) upload(e.target.files); e.target.value = ""; /* so picking the same files again uploads them again */ }} />
         </div>
       </div>
+
+      {d && !d.exists && (
+        <div className="error-box row" style={{ marginBottom: 16 }}>
+          <span>Its folder isn't there any more: <span className="mono">{d.path}</span>.{!d.managed && " If you moved it, say where it is now."}</span>
+          {!d.managed && <><span className="spacer" /><button className="btn sm" onClick={() => setMoving(true)}><IconFolder /> Change folder</button></>}
+        </div>
+      )}
 
       <div className="card dd-stats">
         <div className="dd-stats-row">
@@ -716,6 +725,7 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
             and {deleting.length === 1 ? "its caption" : "their captions"} from disk? This can't be undone.</>} />
       )}
       {exporting && d && <ExportDialog datasets={[d]} onClose={() => setExporting(false)} />}
+      {moving && d && <ChangeFolder dataset={d} onClose={() => setMoving(false)} onMoved={() => { reloadDs(); loadItems(); }} />}
       {confirmRemove && d && <DeleteDatasets datasets={[d]} onClose={() => setConfirmRemove(false)} onDeleted={() => go("datasets")} />}
       {capOpen && d && <AutoCaptionModal dataset={d} missing={missing} hasVideo={!!items?.some((i) => i.kind === "video")}
         onClose={() => { setCapOpen(false); reloadDs(); }} />}
@@ -732,6 +742,39 @@ function DatasetDetail({ id, families }: { id: string; families: Family[] }) {
 /** Delete datasets (one, from its page or its card, or those picked with Select): from Dainamo, and with the box
  * ticked their uploaded files too. A queued or running job that uses one is named, since deleting its files makes it
  * fail. The one dialog for it. */
+/** Point a linked dataset at the folder it's in now, after it was moved; jobs using it follow it there (and keep
+ * its cached latents) when they next run. */
+function ChangeFolder({ dataset, onClose, onMoved }: { dataset: Dataset; onClose: () => void; onMoved: () => void }) {
+  const toast = useToast();
+  const [path, setPath] = useState(dataset.path);
+  const [busy, setBusy] = useState(false);
+  const save = async () => {
+    setBusy(true);
+    try {
+      await api.put(`/api/datasets/${dataset.id}`, { name: dataset.name, trigger: dataset.trigger, path });
+      toast(`${dataset.name} is now in ${path}`);
+      onMoved();
+      onClose();
+    } catch (e: any) {
+      toast(e.message, true);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Modal title="Change folder" onClose={onClose} footer={<>
+      <button className="btn ghost" onClick={onClose}>Cancel</button>
+      <button className="btn primary" disabled={busy || !path.trim() || path.trim() === dataset.path} onClick={save}><IconFolder /> Use this folder</button>
+    </>}>
+      <div className="stack">
+        <p className="muted" style={{ margin: 0 }}>Moved <strong style={{ color: "var(--text)" }}>{dataset.name}</strong>'s folder? Choose
+          where it is now. Jobs using it carry on from there, and the latents they cached for its files are still used.</p>
+        <PathInput mode="dir" value={path} onChange={setPath} />
+      </div>
+    </Modal>
+  );
+}
+
 function DeleteDatasets({ datasets, onClose, onDeleted }: { datasets: Dataset[]; onClose: () => void; onDeleted: () => void }) {
   const toast = useToast();
   const [jobs] = usePoll<Job[]>("/api/jobs", 0);
@@ -1402,7 +1445,7 @@ const tailPath = (p: string, max = 44) => {
 
 /** A dataset in the list: its cover, name, what it holds and where it came from, how much is captioned, its trigger
  * word and (linked) folder. A click opens it, or picks it while selecting; ⋯ exports or deletes it. */
-function DatasetCard({ d, sel, onExport, onDelete }: { d: Dataset; sel: Selection; onExport: () => void; onDelete: () => void }) {
+function DatasetCard({ d, sel, onExport, onMove, onDelete }: { d: Dataset; sel: Selection; onExport: () => void; onMove: () => void; onDelete: () => void }) {
   const picked = sel.picked.has(d.id);
   const badge = mediaBadge(d);
   const done = d.count > 0 && d.captioned === d.count;
@@ -1431,6 +1474,7 @@ function DatasetCard({ d, sel, onExport, onDelete }: { d: Dataset; sel: Selectio
           ? <input type="checkbox" className="pick" checked={picked} aria-label={`Select ${d.name}`} onClick={(e) => e.stopPropagation()} onChange={() => sel.toggle(d.id)} />
           : <Menu label={`More for ${d.name}`} items={[
             { label: "Export", icon: <IconDownload />, onClick: onExport, disabled: !d.exists, title: d.exists ? "Download it as a .zip" : "Its folder is missing" },
+            ...(d.managed ? [] : [{ label: "Change folder", icon: <IconFolder />, onClick: onMove, title: "Moved its folder? Say where it is now" }]),
             { label: "Delete", icon: <IconTrash />, onClick: onDelete, danger: true },
           ]} />}
       </div>
@@ -1473,7 +1517,7 @@ export default function Datasets({ datasetId, view, families }: { datasetId: str
   };
   // Select (or ⋯ on one): exported or deleted together
   const sel = useSelection();
-  const [dialog, setDialog] = useState<{ kind: "export" | "delete"; ids: string[] } | null>(null);
+  const [dialog, setDialog] = useState<{ kind: "export" | "move" | "delete"; ids: string[] } | null>(null);
   if (datasetId && view === "clips") return <ClipEditor key={datasetId} id={datasetId} />;
   if (datasetId) return <DatasetDetail key={datasetId} id={datasetId} families={families} />; // fresh state per dataset
   const words = search.toLowerCase().split(/\s+/).filter(Boolean);
@@ -1515,6 +1559,7 @@ export default function Datasets({ datasetId, view, families }: { datasetId: str
         </SelectBar>
       )}
       {dialog?.kind === "export" && <ExportDialog datasets={chosen} onClose={() => setDialog(null)} />}
+      {dialog?.kind === "move" && chosen[0] && <ChangeFolder dataset={chosen[0]} onClose={() => setDialog(null)} onMoved={reload} />}
       {dialog?.kind === "delete" && <DeleteDatasets datasets={chosen} onClose={() => setDialog(null)} onDeleted={() => { sel.stop(); reload(); }} />}
       {loadError && !datasets && <LoadError what="the datasets" error={loadError} onRetry={reload} />}
       {datasets && datasets.length === 0 && (
@@ -1530,7 +1575,8 @@ export default function Datasets({ datasetId, view, families }: { datasetId: str
       )}
       <div className="grid cols-2 ds-grid">
         {shown.map((d) => (
-          <DatasetCard key={d.id} d={d} sel={sel} onExport={() => setDialog({ kind: "export", ids: [d.id] })} onDelete={() => setDialog({ kind: "delete", ids: [d.id] })} />
+          <DatasetCard key={d.id} d={d} sel={sel} onExport={() => setDialog({ kind: "export", ids: [d.id] })}
+            onMove={() => setDialog({ kind: "move", ids: [d.id] })} onDelete={() => setDialog({ kind: "delete", ids: [d.id] })} />
         ))}
       </div>
       {!!datasets?.length && !filtered && (

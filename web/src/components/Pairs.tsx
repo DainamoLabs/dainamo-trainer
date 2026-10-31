@@ -20,8 +20,10 @@ function Thumb({ path, name }: { path: string; name: string }) {
 
 /** A dataset's files beside the reference images they train with (an edit's source images), as training pairs them:
  * from the ``sources`` datasets, or else its _refs folder. ``video``: its clips are files too. */
-export function PairsDialog({ id, name, sources, video, info, onClose }: {
-  id: string; name: string; sources: string[]; video: boolean; info: FamilySources; onClose: () => void;
+export function PairsDialog({ id, name, sources, video, info, caption = "", onClose }: {
+  id: string; name: string; sources: string[]; video: boolean; info: FamilySources;
+  caption?: string; // the job's caption of files without one
+  onClose: () => void;
 }) {
   const [data, setData] = useState<Pairs | null>(null);
   const [error, setError] = useState("");
@@ -84,7 +86,7 @@ export function PairsDialog({ id, name, sources, video, info, onClose }: {
                   <Thumb path={r.path} name={r.name} />
                   <div className="pair-text">
                     <div className="mono small ellipsis faint" title={r.name}>{r.name}</div>
-                    <div className={"pair-cap" + (r.caption ? "" : " faint")}>{r.caption || "No caption"}</div>
+                    <div className={"pair-cap" + (r.caption ? "" : " faint")}>{r.caption || caption || "No caption"}</div>
                   </div>
                 </div>
               ))}

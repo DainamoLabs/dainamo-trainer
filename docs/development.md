@@ -50,6 +50,7 @@ scripts/measure_memory.py measures a family's activation memory for the projecti
 web/                      React + Vite UI (built into web/dist)
 docs/                     these documents, and the screenshots in docs/screenshots/
 data/                     database, uploaded datasets, job outputs (data/jobs/<name>_<id>/)
+output/                   finished LoRAs and finetuned models (dainamo/server/outputs.py; Settings can move it)
 ```
 
 **Database.** To change the schema, add a step to the end of `MIGRATIONS` in
@@ -133,7 +134,7 @@ only the header matters.
 | `test_hf_assets.py` | Hugging Face files read from the cache offline, downloaded once at the pinned commit, and a clear error offline without them |
 | `test_model_files.py` | the families' download lists, the models folder setting, finding files by their contents, downloads pausing, resuming and checking their checksum, gated and impossible downloads, the Turbo-without-adapter warning, FLUX 3's prompt upsampler as an optional row (never MOSS-Image's encoder), the Upscalers card and its downloads into upscale_models |
 | `test_dataset_check.py` | each kind of health check problem (loss masks among them), upscaled images' _originals left out and noted, and that a file is read once |
-| `test_sources.py` | source datasets: files pairing by name across image types and subfolders, the _refs folder without them, which models take them, the health check's pairing findings, the pairs route, jobs keeping them, the VRAM projection counting them |
+| `test_sources.py` | source datasets: files pairing by name across image types and subfolders, the _refs folder without them, which models take them, the health check's pairing findings, the pairs route, jobs keeping them, the instruction of files without a caption, the VRAM projection counting them |
 | `test_clip_split.py` | Split into clips: planning inside shots, cutting at 24 fps with sound, captions and references, cancelling, each video once per epoch |
 | `test_clip_editor.py` | the clip editor: a reviewed split cut as planned, then again only where it changed (captions kept, removed clips gone, deleted ones not brought back), crops, splits from before the editor, replanning, checks on edits, and its frames being the clips' own |
 | `test_export.py` | exporting datasets: a folder each in one stored .zip, unsafe and repeated names, captions as they are or with the trigger word (a song's on its style tags), masks and references once each |

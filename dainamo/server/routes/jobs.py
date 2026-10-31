@@ -17,8 +17,8 @@ from pydantic import BaseModel
 from ...engine.dataset import resolutions
 from ...engine.families import get_family
 from ...engine.families.base import takes_sources
-from .. import db, model_files
-from ..queue import CACHE_DIR, job_dir, job_folder, read_status, scheduler, send_control
+from .. import db, model_files, outputs
+from ..queue import CACHE_DIR, follow_datasets, job_dir, job_folder, read_status, scheduler, send_control
 from ..validation import LOSS_AND_EMA_DEFAULTS, check_evaluation, check_resolution, check_settings
 from .common import dataset_or_404, job_or_404, not_found, profile_or_404
 
@@ -34,6 +34,8 @@ class JobDataset(BaseModel):
     # source datasets (ids, in order) whose images its files pair with by name, for a model that trains with them
     # (``FamilyInfo.sources``: an edit's source images); none: its _refs folder, if it has one
     sources: list[str] = []
+    # the caption of its files that have none: for an edit LoRA whose pairs all make one edit, its instruction
+    caption: str = ""
 
 
 class JobIn(BaseModel):
@@ -162,7 +164,8 @@ def _job_config(body: JobIn, old: dict | None = None) -> dict:
         dsets.append({"id": d["id"], "name": d["name"], "path": d["path"], "trigger": d["trigger"],
                       "repeats": max(1, jd.repeats), "resolution": res,
                       "flip": bool(settings.get("flip", False) if jd.flip is None else jd.flip), "caption_dropout": drop,
-                      **({"sources": sources} if sources else {})})
+                      **({"sources": sources} if sources else {}),
+                      **({"caption": jd.caption.strip()} if jd.caption.strip() else {})})
     # the job's resolution is then all of its datasets' together (validation uses the largest)
     if dsets and not audio:
         every = sorted({r for d in dsets for r in resolutions(d["resolution"])})
@@ -325,7 +328,7 @@ def _same_model(old: dict, new: dict) -> bool:
 def _dataset_choices(c: dict) -> list[tuple]:
     s = c.get("settings", {})  # a dataset from before per-dataset settings has the job's
     return [(d["id"], d.get("repeats"), *(d.get(k, s.get(k)) for k in ("resolution", "flip", "caption_dropout")),
-             tuple(src["id"] for src in d.get("sources") or []))
+             tuple(src["id"] for src in d.get("sources") or []), d.get("caption", ""))
             for d in c.get("datasets", [])]
 
 
@@ -446,6 +449,9 @@ def get_job(jid: str):
     j["config"] = config
     j["status_detail"] = read_status(jid)
     j["dir"] = job_dir(jid)
+    which = outputs.kind(config)
+    j["output_folder"] = which and outputs.folder(which)  # where its files go (None: a RefMod's don't)
+    j["exports"] = outputs.exports(jid)
     return j
 
 
@@ -541,6 +547,32 @@ def job_file(jid: str, kind: str, name: str):
     return FileResponse(path, filename=name if kind == "output" else None)
 
 
+def _check_datasets(jid: str, cfg: dict) -> None:
+    """A job about to run again: its datasets followed to where they are now, and 400 if one's folder isn't there."""
+    follow_datasets(jid, cfg)
+    for d in cfg.get("datasets") or []:
+        if not os.path.isdir(d.get("path") or ""):
+            raise HTTPException(400, f"Dataset {d.get('name') or d.get('id')}'s folder isn't there any more: "
+                                     f"{d.get('path')}. If you moved it, open it in Datasets and set the folder it's in "
+                                     "now (Change folder), then try again")
+
+
+class ExportIn(BaseModel):
+    file: str
+
+
+@router.post("/jobs/{jid}/export")
+def export_file(jid: str, body: ExportIn):
+    """Put one of the job's files (a checkpoint) in the output folder, as a finished job's final one is."""
+    job_or_404(jid)
+    try:
+        return {"path": outputs.export(jid, body.file)}
+    except FileNotFoundError:
+        not_found()
+    except (ValueError, OSError) as e:
+        raise HTTPException(400, str(e.strerror if isinstance(e, OSError) else e))
+
+
 class ActionIn(BaseModel):
     action: str
     steps: int | None = None  # extend: the new total step count
@@ -554,6 +586,7 @@ def job_action(jid: str, body: ActionIn):
         if j["status"] != "ready":
             raise HTTPException(400, "Only a job that's ready to start can be started")
         _check_profile(j["config"])  # its files may have arrived since it was added
+        _check_datasets(jid, j["config"])
         db.execute("UPDATE jobs SET status='queued', position=? WHERE id=? AND status='ready'", (db.now(), jid))
     elif a == "stop":
         scheduler.stop(jid)
@@ -562,6 +595,7 @@ def job_action(jid: str, body: ActionIn):
             raise HTTPException(400, "Job is not running")
         send_control(jid, a)
     elif a == "resume":
+        _check_datasets(jid, j["config"])
         scheduler.requeue(jid)
     elif a == "extend":  # train a finished (or stopped) job on to a new total, from where it got to
         if any(j["config"]["settings"].get(k) for k in ("refmod_enabled", "extract_enabled", "merge_enabled")):
@@ -576,6 +610,7 @@ def job_action(jid: str, body: ActionIn):
         if body.steps is None or not done < body.steps <= 1_000_000:
             raise HTTPException(400, f"Train to more than step {done}")
         cfg = j["config"]
+        _check_datasets(jid, cfg)
         cfg["settings"]["steps"] = int(body.steps)
         db.execute("UPDATE jobs SET config=? WHERE id=?", (json.dumps(cfg), jid))
         scheduler.requeue(jid)
@@ -584,6 +619,7 @@ def job_action(jid: str, body: ActionIn):
             raise HTTPException(400, "Stop the job first")
         if "evaluate" in j["config"]:
             raise HTTPException(400, "Cancel its checkpoint evaluation first")
+        _check_datasets(jid, j["config"])
         _clear_progress(jid)
         scheduler.requeue(jid)
     elif a in ("up", "down"):

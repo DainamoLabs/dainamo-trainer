@@ -79,6 +79,8 @@ const INFO = {
   keepLast: "How many of the step saves are kept on disk; older ones are deleted as new ones are saved. The final save is always kept. 0 keeps them all.",
   repeats: "How many times each of this dataset's files is used per epoch. Raise it to give a small dataset as much weight as a bigger one.",
   resolution: "The size files train at: each is scaled to about this many pixels squared, keeping its shape, and never enlarged. Select several to train every file at each size, so the LoRA works across sizes. Smaller sizes train faster; the largest sets the VRAM.",
+  editCaption: "The edit instruction of this dataset's files that have no caption of their own, for when every pair makes the same edit: \"Make it night\". A file's own caption is used instead where it has one, and the trigger word is added to either. Blank: files without a caption train on the trigger word only.",
+  fillCaption: "The caption of this dataset's files that have none of their own. A file's own caption is used instead where it has one, and the trigger word is added to either. Blank: files without a caption train on the trigger word only.",
   captionDropout: "The chance a step trains on a file from this dataset with an empty caption, which keeps the LoRA working without its trigger words. 0 turns it off.",
   flip: "Also trains on a mirrored copy of each file, doubling the items. Leave it off for text, logos or subjects that aren't symmetrical.",
   swap: "Also trains on each song with its left and right channels swapped, doubling the items.",
@@ -169,7 +171,7 @@ export function formOf(cfg: any, profiles: Profile[]) {
     datasets: cfg.datasets.map((d: any) => ({
       id: d.id, repeats: d.repeats, resolution: d.resolution ?? cfg.settings.resolution,
       flip: d.flip ?? cfg.settings.flip, caption_dropout: d.caption_dropout ?? cfg.settings.caption_dropout,
-      sources: (d.sources || []).map((x: any) => x.id),
+      sources: (d.sources || []).map((x: any) => x.id), caption: d.caption || "",
     })),
   };
 }
@@ -219,8 +221,9 @@ function Resolutions(props: { v: unknown; on: (v: number | number[]) => void; vi
 }
 
 // A dataset in the job: which one, how much it repeats against the others, the sizes it trains at, its own flip
-// and caption dropout, and the source datasets its files pair with (models that train with them; "" not chosen yet)
-type DsCard = { id: string; repeats: number; resolution: number | number[]; flip: boolean; caption_dropout: number; sources: string[] };
+// and caption dropout, the source datasets its files pair with (models that train with them; "" not chosen yet),
+// and the caption of its files without one
+type DsCard = { id: string; repeats: number; resolution: number | number[]; flip: boolean; caption_dropout: number; sources: string[]; caption: string };
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 const LOSS_WEIGHTINGS: [string, string][] = [["none", "None"], ["min_snr", "Min-SNR"], ["cosmap", "Cosine map"]];
@@ -294,12 +297,12 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
   });
   // s.resolution, s.flip and s.caption_dropout are what a newly added dataset starts with (the model's
   // defaults, or the first dataset of the last job)
-  const newCard = (): DsCard => ({ id: "", repeats: 1, resolution: s.resolution, flip: !!s.flip, caption_dropout: Number(s.caption_dropout) || 0, sources: [] });
+  const newCard = (): DsCard => ({ id: "", repeats: 1, resolution: s.resolution, flip: !!s.flip, caption_dropout: Number(s.caption_dropout) || 0, sources: [], caption: "" });
   const [dsCards, setDsCards] = useState<DsCard[]>(() => {
     const list: DsCard[] = (Array.isArray(clone?.datasets) ? clone.datasets : []).map((d: any) => ({
       ...newCard(), id: String(d.id), repeats: Math.max(1, Number(d.repeats) || 1), resolution: d.resolution ?? s.resolution,
       ...(d.flip != null ? { flip: !!d.flip } : {}), ...(d.caption_dropout != null ? { caption_dropout: Number(d.caption_dropout) } : {}),
-      sources: Array.isArray(d.sources) ? d.sources.map(String) : [],
+      sources: Array.isArray(d.sources) ? d.sources.map(String) : [], caption: typeof d.caption === "string" ? d.caption : "",
     }));
     return list.length ? list : [newCard()];
   });
@@ -315,7 +318,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
   // how each card's dataset pairs with its source images, as its health check found (null: nothing pairs)
   const [paired, setPaired] = useState<Record<string, CheckPairs | null>>({});
   const notePaired = (id: string, p: CheckPairs | null) => setPaired((m) => (JSON.stringify(m[id]) === JSON.stringify(p) ? m : { ...m, [id]: p }));
-  const [pairsOf, setPairsOf] = useState<{ id: string; name: string; sources: string[]; video: boolean } | null>(null);
+  const [pairsOf, setPairsOf] = useState<{ id: string; name: string; sources: string[]; video: boolean; caption: string } | null>(null);
   const [cards, setCards] = useState<Card[]>(() => {
     const c = toCards(last?.settings?.sample_prompts);
     return c.length ? c : [blankCard()];
@@ -434,7 +437,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
   // turning Auto off keeps the length it showed
   const setAutoFrames = (on: boolean) => setS((x) => ({ ...x, auto_frames: on,
     ...(!on && longestKnown && longestClip ? { num_frames: Math.max(5, longestClip) } : {}) }));
-  const missingCaps = chosen.reduce((n, c) => n + c.d.count - c.d.captioned, 0);
+  const missingCaps = chosen.reduce((n, c) => n + (c.caption.trim() ? 0 : c.d.count - c.d.captioned), 0);
   const chosenImages = chosen.reduce((n, c) => n + c.d.images, 0);
   const maskedImages = chosen.reduce((n, c) => n + (c.d.masks || 0), 0);
   // a RefMod's references: every image and clip of its datasets (one reference when merged), and at most the
@@ -490,7 +493,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
       profile_id: profileId,
       gpu,
       datasets: chosen.map((c) => ({ id: c.id, repeats: c.repeats, resolution: c.resolution, flip: c.flip, caption_dropout: c.caption_dropout,
-        ...(pairing ? { sources: c.sources.filter(Boolean) } : {}) })),
+        ...(pairing ? { sources: c.sources.filter(Boolean) } : {}), ...(c.caption.trim() ? { caption: c.caption.trim() } : {}) })),
       settings,
     };
     setBusy(true);
@@ -740,6 +743,7 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
                   const d = datasets?.find((x) => x.id === c.id);
                   const usable = d ? usableFiles(d) : 0;
                   const items = usable * c.repeats * (isAudio ? 1 : resList(c.resolution).length) * (c.flip ? 2 : 1);
+                  const uncaptioned = d ? d.count - d.captioned : 0;
                   return (
                     <div className="ds-block" key={i}>
                       <div className={"ds-row" + (refmod ? " refmod" : "")}>
@@ -838,10 +842,18 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
                           )}
                         </div>
                       )}
+                      {d && !refmod && !slider && (uncaptioned > 0 || c.caption) && (  // no use where every file has one
+                        <label className="field">
+                          <span>{pairing ? "Instruction" : "Caption"} for {uncaptioned === 1 ? "the file" : uncaptioned ? `the ${uncaptioned} files` : "files"} without one
+                            <Info text={pairing ? INFO.editCaption : INFO.fillCaption} /></span>
+                          <input value={c.caption} onChange={(e) => setDsCard(i, { caption: e.target.value })}
+                            placeholder={pairing ? "e.g. Make it night" : "Blank: they train on the trigger word only"} />
+                        </label>
+                      )}
                       {d && !refmod && <CardCheck id={d.id} resolution={c.resolution} family={family?.id} frames={isVideo ? s.num_frames : 0}
                         seconds={isAudio ? Number(s.clip_seconds) || 0 : undefined} auto={isVideo && autoFrames} onLongest={noteLongest}
                         pairing={pairing} sources={c.sources.filter(Boolean)} onPaired={notePaired}
-                        onPairs={() => setPairsOf({ id: d.id, name: d.name, sources: c.sources.filter(Boolean), video: isVideo })} />}
+                        onPairs={() => setPairsOf({ id: d.id, name: d.name, sources: c.sources.filter(Boolean), video: isVideo, caption: c.caption.trim() })} />}
                     </div>
                   );
                 })}

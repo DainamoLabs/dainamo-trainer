@@ -29,7 +29,9 @@ files without one. On an uploaded dataset, **Select** (or a card's checkbox)
 picks files to delete together. A file's caption and loss mask are deleted with
 it, unless another file of the same name (a.png beside a.jpg) still uses them.
 A linked folder's files are only deleted in the folder itself. **Tools**, beside Auto-Caption, holds Split into clips (Edit
-clips on a split's copy), Upscale small images, Export and Delete dataset.
+clips on a split's copy), Upscale small images, Export, Change folder and
+Delete dataset. Change folder is for a linked folder you've moved: it points the
+dataset at the folder's new place, and jobs using it follow it there.
 
 Captioning, a split, a download or an upscale shows its progress on the page,
 and in the top bar while it runs, so it stays in view on other pages; the top
@@ -72,6 +74,10 @@ image after, and an instruction. Keep them as two datasets:
 - **the sources**: the images before the edit, with the same file names
   (`photo.jpg` pairs with `photo.png`; the type doesn't matter). They need no
   captions.
+
+When every pair makes the same edit, the results need no captions either: type
+the instruction once in New job, under the source dataset (**Instruction for the
+files without one**). A result with its own caption keeps it.
 
 In New job, choose the results as the dataset and the sources as its
 **Source dataset**. A second or third source dataset adds more images to each

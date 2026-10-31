@@ -24,10 +24,13 @@ from __future__ import annotations
 
 import fnmatch
 import math
+import os
 
 import torch
 import torch.nn as nn
 from safetensors.torch import load_file, save_file
+
+from ..fsutil import replace
 
 KINDS = ("lora", "lokr")
 
@@ -284,7 +287,16 @@ class LoRANetwork:
         return sd
 
     def save(self, path: str, metadata: dict[str, str] | None = None, dtype=torch.bfloat16):
-        save_file(self.state_dict(dtype), path, metadata=metadata or {})
+        """Written beside ``path``, then put in its place: a full disk never leaves half a file under its name, and
+        the file it replaces is let go of rather than written over (its hardlink in the output folder keeps it)."""
+        tmp = f"{path}.{os.getpid()}.tmp"
+        try:
+            save_file(self.state_dict(dtype), tmp, metadata=metadata or {})
+            replace(tmp, path)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            raise
 
     def load(self, path: str):
         self.load_state_dict(load_file(path))

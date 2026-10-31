@@ -176,6 +176,7 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
   const [delivery, setDelivery] = useState<Delivery>({});
   const [browser, setBrowser] = useState(browserAlertsOn());
   const [whisper, setWhisper] = useState<WhisperModel[]>([]);
+  const [outputDir, setOutputDir] = useState("");
   // a Dainamo server started before this page was built has no caption provider settings: it needs a restart
   const stale = !!s && (!s.llama || !s.text_encoder);
   const provider = (!stale && s?.captioner.provider) || "server";
@@ -187,7 +188,10 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
   useEffect(() => {
     load();
     api.get<Delivery>("/api/notifications").then(setDelivery, () => {});
-    api.get<{ whisper_models: WhisperModel[] }>("/api/system").then((sys) => setWhisper(sys.whisper_models), () => {});
+    api.get<{ whisper_models: WhisperModel[]; output_dir: string }>("/api/system").then((sys) => {
+      setWhisper(sys.whisper_models);
+      setOutputDir(sys.output_dir);
+    }, () => {});
   }, []);
   // the sections edited and not saved yet
   const changed = s && saved ? (Object.keys(s) as (keyof Settings)[]).filter((k) => !same(s[k], saved[k])) : [];
@@ -219,6 +223,9 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
   const setL = (patch: Partial<Settings["llama"]>) => setS({ ...s, llama: { ...s.llama, ...patch } });
   const setT = (patch: Partial<Settings["text_encoder"]>) => setS({ ...s, text_encoder: { ...s.text_encoder, ...patch } });
   const setE = (patch: Partial<Settings["enhancer"]>) => setS({ ...s, enhancer: { ...s.enhancer, ...patch } });
+  const setO = (patch: Partial<Settings["output"]>) => setS({ ...s, output: { ...s.output, ...patch } });
+  // a subfolder of ComfyUI's models folder, for the output folders' shortcuts
+  const comfy = (sub: string) => s.models.folder && `${s.models.folder.replace(/[\\/]+$/, "")}${s.models.folder.includes("\\") ? "\\" : "/"}${sub}`;
   const toggleGpu = (i: number) => {
     const has = s.queue.gpus.includes(i);
     const next = has ? s.queue.gpus.filter((g) => g !== i) : [...s.queue.gpus, i].sort((a, b) => a - b);
@@ -317,6 +324,22 @@ export default function SettingsPage({ gpus, auth, onSignOut }: { gpus: Gpu[]; a
         <p className="help" style={{ margin: 0 }}>The ComfyUI models folder, where Dainamo finds model files and downloads them to, is set in{" "}
           <a href="#/profiles/files">Models › Model files</a>.</p>
       </div>
+
+      {s.output && <div className="card card-pad" style={{ marginBottom: 16 }}>
+        <h2>Output folders</h2>
+        <p className="help" style={{ marginTop: -6 }}>When a job completes, its final LoRA (or finetuned model) is put here under its
+          name: hardlinked when it's on the same disk as the job, so it takes no more space, else copied. A job's other checkpoints
+          go there with To output. Deleting the job leaves them.</p>
+        <div className="grid cols-2">
+          {([["loras", "LoRAs", "loras"], ["models", "Finetuned models", "diffusion_models"]] as const).map(([key, label, sub]) => (
+            <div className="field" key={key}><span>{label} <span className="faint">· blank: {outputDir || "output/"}</span></span>
+              <PathInput mode="dir" value={s.output[key]} placeholder={outputDir} onChange={(v) => setO({ [key]: v })}
+                extra={comfy(sub) && s.output[key] !== comfy(sub) && (
+                  <button type="button" className="btn" title={comfy(sub)} onClick={() => setO({ [key]: comfy(sub) })}>ComfyUI's {sub}</button>)} />
+            </div>
+          ))}
+        </div>
+      </div>}
 
       <div className="card card-pad" style={{ marginBottom: 16 }}>
         <h2>Notifications</h2>

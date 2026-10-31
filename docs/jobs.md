@@ -25,7 +25,11 @@ Each dataset (**Add dataset** for more) has its own:
 - **source datasets**, for an edit model (Qwen-Image 2.1) or MiniMax H3's
   ref2va: the images its files pair with by name, the sources of an edit
   ([Edit datasets](datasets.md#edit-datasets-sources-and-results)). Leave it
-  empty to train text-to-image.
+  empty to train text-to-image;
+- **a caption for the files without one** (shown when some have none): for an
+  edit model, the instruction ("Make it night") when every pair makes the same
+  edit. A file's own caption is used where it has one, and the trigger word is
+  added to either. Blank, those files train on the trigger word only.
 
 Each runs the dataset's [health check](datasets.md#health-check) for this job.
 
@@ -107,6 +111,18 @@ A job's files are in `data/jobs/<name>_<id>/`, named when the job is added;
 renaming the job later doesn't move them. Jobs added before folders had names
 keep `data/jobs/<id>/`.
 
+When a job completes, its final LoRA is also put in the output folder, `output/`
+beside `data/`, as `<name>.safetensors`. Settings › Output folders can point it
+somewhere else: ComfyUI's `models/loras`, say, so ComfyUI finds it straight away.
+A finetune's model goes in the folder for finetuned models (ComfyUI's
+`models/diffusion_models`, if you choose). It's a hardlink when the folder is on
+the same disk as the job, so it takes no more space, and a copy otherwise. **To
+output** on the Checkpoints tab puts any other checkpoint there too. When a job
+completes again (trained on, or made again), the file it put there is replaced.
+A file of that name that came from somewhere else is never replaced: the job's
+file is called `<name> (2).safetensors` instead. Deleting a job, even with its
+files, leaves what it put in the output folder.
+
 On its page you can stop a job (it saves its state), start it when it's ready, cancel it while it waits,
 force a stopping one to stop now, resume it from its last save or restart it
 from step 0 (after asking), take samples or a checkpoint now, duplicate its
@@ -149,6 +165,12 @@ jobs. A job reuses what another encoded with the same VAE or text encoder file
 and settings, and encodes only new or changed files and captions. A copy of a
 model file elsewhere counts as the same file; another precision or a fine-tune
 doesn't.
+
+A file's latents are known by its dataset and where the file is inside it, so
+they survive the dataset's folder moving. If you move a dataset's folder, use
+**Change folder** in Datasets to say where it is now. A job using it follows it
+there when it next runs, resuming with the latents it already cached. Until then,
+Resume says which dataset's folder is missing.
 
 Each job's card on the Queue page shows its disk use. Below the jobs, the
 Queue shows the total: everything the jobs keep, the cache, and the outputs

@@ -4,6 +4,8 @@ training dataset's files by name; the _refs folder when there are none.
     .venv/bin/python -m pytest tests/test_sources.py -v
 """
 
+import os
+
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -13,6 +15,7 @@ from dainamo.engine.families import get_family
 from dainamo.engine.families.base import takes_sources
 from dainamo.server import dataset_check
 from dainamo.server.app import app
+from dainamo.server.routes.jobs import _changes
 
 
 def _images(folder, *names):
@@ -48,6 +51,19 @@ def test_files_pair_with_the_image_of_their_name_in_each_source_dataset(edit):
     assert all(it.refs == [] for it in plain)
     cat = next(it for it in items if it.path.endswith("cat.png"))
     assert cat.key() != next(it for it in plain if it.path.endswith("cat.png")).key()
+
+
+def test_files_without_a_caption_take_their_datasets_instruction(edit):
+    results, before, _ = edit
+    sources = [{"path": str(before)}]
+    caps = {os.path.basename(it.path): it.caption for it in ds.build_items(
+        [{"path": str(results), "sources": sources, "trigger": "nite", "caption": "make it rain"}], 64, 16, False,
+        log=lambda *_: None, references=True)}
+    # a file's own caption wins; the trigger word is added to either
+    assert caps == {"cat.png": "nite, make it night", "dog.png": "nite, make it rain", "owl.png": "nite, make it rain",
+                    "fish.png": "nite, make it rain"}
+    plain = ds.build_items([{"path": str(results), "trigger": "nite"}], 64, 16, False, log=lambda *_: None)
+    assert {it.caption for it in plain if not it.path.endswith("cat.png")} == {"nite"}
 
 
 def test_without_source_datasets_the_refs_folder_is_used(tmp_path):
@@ -159,17 +175,21 @@ def test_jobs_keep_their_source_datasets(client, edit):
     did, bid, sid = (client.post("/api/datasets", json={"name": n, "path": str(p)}).json()["id"]
                      for n, p in (("Results", results), ("Before", before), ("Second", second)))
 
-    def job(profile, sources):
+    def job(profile, sources, caption=""):
         return client.post("/api/jobs", json={"name": "se", "profile_id": profile, "settings": {},
-                                              "datasets": [{"id": did, "sources": sources}]})
+                                              "datasets": [{"id": did, "sources": sources, "caption": caption}]})
 
-    r = job(qwen, [bid, sid])
+    r = job(qwen, [bid, sid], "  make it rain ")
     assert r.status_code == 200
+    first = r.json()["config"]
+    assert first["datasets"][0]["caption"] == "make it rain"  # the instruction of its files without a caption
+    assert _changes(first, {**first, "datasets": [{**first["datasets"][0], "caption": "make it snow"}]}) == ["datasets"]
     assert r.json()["config"]["datasets"][0]["sources"] == [
         {"id": bid, "name": "Before", "path": str(before)}, {"id": sid, "name": "Second", "path": str(second)}]
     client.post(f"/api/jobs/{r.json()['id']}/action", json={"action": "stop"})
     r = job(krea, [bid])  # Krea doesn't train with them
     assert r.status_code == 200 and "sources" not in r.json()["config"]["datasets"][0]
+    assert "caption" not in r.json()["config"]["datasets"][0]  # none given
     client.post(f"/api/jobs/{r.json()['id']}/action", json={"action": "stop"})
     for bad in ([did], [bid, bid], [bid, sid, bid, sid]):
         assert job(qwen, bad).status_code == 400
