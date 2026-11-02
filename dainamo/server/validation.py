@@ -68,6 +68,10 @@ def check_settings(s: dict, div: int, audio: bool = False) -> dict:
     return s
 
 
+# how often a job saves and samples, and how many saves it keeps: as New job starts them, for a job that leaves them
+# out (the trainer's own default, 0, is off, as a job from before the server filled these in trained)
+SAVE_AND_SAMPLE_DEFAULTS = {"save_every": 250, "keep_last": 4, "sample_every": 250}
+
 LOSS_WEIGHTINGS = ("none", "min_snr", "cosmap")
 # masked loss, EMA weights, the noise range and loss weighting: off, or the whole range, unless a job says otherwise
 # (and what a job from before they existed trained with)
@@ -79,31 +83,48 @@ def check_loss_and_ema(s: dict) -> None:
     """Masked loss (``mask_min_weight``: how much the loss outside a mask counts), EMA weights (``ema_decay`` a step),
     the noise range training draws from (``timestep_min`` to ``timestep_max``; 0 is clean, 1 pure noise) and how a
     step's loss is weighted by its noise level (``min_snr_gamma`` for Min-SNR). Left out, each is off or the whole
-    range. EMA keeps an average of the adapter's weights, so not of a finetune's: those are the whole model."""
+    range. EMA keeps an average of the adapter's weights, so not of a finetune's: those are the whole model. A slider's
+    loss is its own (``engine.slider``), so it has no masks or weighting. A value is checked while it's in use; one that
+    isn't (EMA's decay with EMA off, the gamma without Min-SNR, the mask weight without masked loss, the noise range
+    of a RefMod, which trains nothing), and New job hides, goes back to its default if it's out of range, rather than
+    refusing the job over a field that isn't shown."""
     for k, v in LOSS_AND_EMA_DEFAULTS.items():
         if s.get(k) in (None, ""):
             s[k] = v
     s["masked_loss"], s["ema_enabled"] = bool(s["masked_loss"]), bool(s["ema_enabled"])
-    for key, lo, hi in (("mask_min_weight", 0, 1), ("ema_decay", 0.9, 0.9999), ("timestep_min", 0, 1),
-                        ("timestep_max", 0, 1)):
+    if s.get("slider_enabled"):
+        s.update(masked_loss=False, loss_weighting="none")
+    if s["loss_weighting"] not in LOSS_WEIGHTINGS:
+        raise HTTPException(400, f"Unknown loss weighting {s['loss_weighting']!r} (none, min_snr or cosmap)")
+    ranged = not s.get("refmod_enabled")
+    used = {"mask_min_weight": s["masked_loss"], "ema_decay": s["ema_enabled"], "timestep_min": ranged,
+            "timestep_max": ranged, "min_snr_gamma": s["loss_weighting"] == "min_snr"}
+    inf = float("inf")
+    for key, lo, hi, kind in (("mask_min_weight", 0, 1, "range"), ("ema_decay", 0.9, 0.9999, "range"),
+                              ("timestep_min", 0, 1, "range"), ("timestep_max", 0, 1, "range"),
+                              ("min_snr_gamma", 0, inf, "above")):
         try:
             v = float(s[key])
         except (TypeError, ValueError):
+            if not used[key]:
+                s[key] = LOSS_AND_EMA_DEFAULTS[key]
+                continue
             raise HTTPException(400, f"Setting {key!r} must be a number")
-        if not lo <= v <= hi:  # NaN too
+        ok = (lo < v < hi) if kind == "above" else (lo <= v <= hi)  # NaN fails both
+        if not ok:
+            if not used[key]:
+                s[key] = LOSS_AND_EMA_DEFAULTS[key]
+                continue
+            if kind == "above":
+                raise HTTPException(400, f"Setting {key!r}={v:g} must be above 0")
             raise HTTPException(400, f"Setting {key!r}={v:g} is out of range ({lo:g}–{hi:g})")
         s[key] = v
     if s["timestep_min"] >= s["timestep_max"]:
-        raise HTTPException(400, f"The noise range's minimum ({s['timestep_min']:g}) must be below its maximum "
-                                 f"({s['timestep_max']:g})")
-    if s["loss_weighting"] not in LOSS_WEIGHTINGS:
-        raise HTTPException(400, f"Unknown loss weighting {s['loss_weighting']!r} (none, min_snr or cosmap)")
-    try:
-        s["min_snr_gamma"] = float(s["min_snr_gamma"])
-    except (TypeError, ValueError):
-        raise HTTPException(400, "Setting 'min_snr_gamma' must be a number")
-    if not 0 < s["min_snr_gamma"] < float("inf"):
-        raise HTTPException(400, f"Setting 'min_snr_gamma'={s['min_snr_gamma']:g} must be above 0")
+        if not ranged:
+            s["timestep_min"], s["timestep_max"] = LOSS_AND_EMA_DEFAULTS["timestep_min"], LOSS_AND_EMA_DEFAULTS["timestep_max"]
+        else:
+            raise HTTPException(400, f"The noise range's minimum ({s['timestep_min']:g}) must be below its maximum "
+                                     f"({s['timestep_max']:g})")
     if s["ema_enabled"] and s.get("finetune_enabled"):
         raise HTTPException(400, "EMA weights are for LoRAs and LoKrs: a finetune's weights are the whole model, too "
                                  "big to keep an average of beside it. Turn EMA off to finetune.")
@@ -221,9 +242,10 @@ def strength_list(raw, what: str, most: int) -> list[float]:
 
 def check_slider(s: dict) -> None:
     """A concept slider (``engine.slider``): its three prompts, strength, sample strengths, how many images
-    to render when the job has no datasets, preserved attributes and whether it keeps the layout. The
-    checkpoint picker doesn't apply: a slider isn't trained to reproduce its images, so their validation
-    loss says nothing about it."""
+    to render when the job has no datasets, preserved attributes and whether it keeps the layout (left out:
+    yes, unless attributes are listed). The checkpoint picker doesn't apply: a slider isn't trained to
+    reproduce its images, so their validation loss says nothing about it. (Masked loss and loss weighting
+    don't apply either: ``check_loss_and_ema`` turns them off.)"""
     s["slider_enabled"] = bool(s.get("slider_enabled", False))
     if not s["slider_enabled"]:
         return
@@ -256,7 +278,9 @@ def check_slider(s: dict) -> None:
     if len(preserve) > MAX_SLIDER_PRESERVE or any(len(p) > 200 for p in preserve):
         raise HTTPException(400, f"A slider preserves up to {MAX_SLIDER_PRESERVE} attributes, each a short phrase")
     s["slider_preserve"] = preserve
-    s["slider_keep_layout"] = bool(s.get("slider_keep_layout", False))
+    # New job's default: keep the layout, unless the job lists attributes to keep (it offers one or the other)
+    keep = s.get("slider_keep_layout")
+    s["slider_keep_layout"] = not preserve if keep in (None, "") else bool(keep)
     if s.get("picker_enabled"):
         raise HTTPException(400, "The checkpoint picker doesn't apply to sliders; concept bleed does")
 

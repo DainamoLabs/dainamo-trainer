@@ -358,13 +358,20 @@ def test_slider_jobs_need_their_prompts_and_no_dataset(client):
     assert (s["slider_target"], s["slider_strength"], s["slider_images"], s["slider_sample_strengths"], s["resolution"]) == \
         ("a photo of a person", 3.0, 16, [-1.5, 0.0, 1.5], 768)
     assert next(j for j in client.get("/api/jobs").json() if j["id"] == r.json()["id"])["slider"] is True
-    assert (s["slider_preserve"], s["slider_keep_layout"], s["slider_layout_sigma"]) == ([], False, 0.9)
+    assert (s["slider_preserve"], s["slider_keep_layout"], s["slider_layout_sigma"]) == ([], True, 0.9)
     client.post(f"/api/jobs/{r.json()['id']}/action", json={"action": "stop"})
     r = client.post("/api/jobs", json={"name": "sl", "profile_id": pid, "datasets": [], "settings": {
         **prompts, "slider_preserve": [" in a park,", "", "indoors", "in a park"], "slider_keep_layout": 1,
         "slider_layout_sigma": "0.8"}})
     s = r.json()["config"]["settings"]
     assert (s["slider_preserve"], s["slider_keep_layout"], s["slider_layout_sigma"]) == (["in a park", "indoors"], True, 0.8)
+    client.post(f"/api/jobs/{r.json()['id']}/action", json={"action": "stop"})
+    # listed attributes without a word on the layout keep the attributes, as New job offers one or the other; and a
+    # slider's loss is its own, so masked loss and loss weighting go off
+    r = client.post("/api/jobs", json={"name": "sl", "profile_id": pid, "datasets": [], "settings": {
+        **prompts, "slider_preserve": ["indoors"], "masked_loss": True, "loss_weighting": "min_snr"}})
+    s = r.json()["config"]["settings"]
+    assert (s["slider_keep_layout"], s["masked_loss"], s["loss_weighting"]) == (False, False, "none")
     client.post(f"/api/jobs/{r.json()['id']}/action", json={"action": "stop"})
 
     def bad(settings, profile=pid):
@@ -821,20 +828,36 @@ def test_masked_loss_ema_noise_range_and_loss_weighting_are_checked(client, tmp_
               "timestep_min": 0.3, "timestep_max": "1", "loss_weighting": "min_snr", "min_snr_gamma": "2.5"})
     s = r.json()["config"]["settings"]
     assert [s[k] for k in LOSS_AND_EMA_DEFAULTS] == [True, 0.0, True, 0.9999, 0.3, 1.0, "min_snr", 2.5]
-    for bad, why in (({"mask_min_weight": 1.5}, "Setting 'mask_min_weight'=1.5 is out of range (0–1)"),
-                     ({"ema_decay": 0.5}, "Setting 'ema_decay'=0.5 is out of range (0.9–0.9999)"),
-                     ({"ema_decay": 1}, "'ema_decay'=1 is out of range"), ({"ema_decay": "nan"}, "out of range"),
+    masked, ema, snr = {"masked_loss": True}, {"ema_enabled": True}, {"loss_weighting": "min_snr"}
+    for bad, why in (({**masked, "mask_min_weight": 1.5}, "Setting 'mask_min_weight'=1.5 is out of range (0–1)"),
+                     ({**ema, "ema_decay": 0.5}, "Setting 'ema_decay'=0.5 is out of range (0.9–0.9999)"),
+                     ({**ema, "ema_decay": 1}, "'ema_decay'=1 is out of range"),
+                     ({**ema, "ema_decay": "nan"}, "out of range"),
                      ({"timestep_min": -0.1}, "'timestep_min'=-0.1 is out of range (0–1)"),
                      ({"timestep_max": 2}, "'timestep_max'=2 is out of range"),
                      ({"timestep_min": 0.6, "timestep_max": 0.4},
                       "The noise range's minimum (0.6) must be below its maximum (0.4)"),
                      ({"timestep_min": 0.5, "timestep_max": 0.5}, "must be below its maximum"),
                      ({"loss_weighting": "snr"}, "Unknown loss weighting 'snr' (none, min_snr or cosmap)"),
-                     ({"min_snr_gamma": 0}, "Setting 'min_snr_gamma'=0 must be above 0"),
-                     ({"min_snr_gamma": "a lot"}, "Setting 'min_snr_gamma' must be a number"),
-                     ({"mask_min_weight": "some"}, "Setting 'mask_min_weight' must be a number")):
+                     ({**snr, "min_snr_gamma": 0}, "Setting 'min_snr_gamma'=0 must be above 0"),
+                     ({**snr, "min_snr_gamma": "a lot"}, "Setting 'min_snr_gamma' must be a number"),
+                     ({**masked, "mask_min_weight": "some"}, "Setting 'mask_min_weight' must be a number")):
         r = post(bad)
         assert r.status_code == 400 and why in r.json()["detail"], bad
+    # a value that isn't in use, which New job hides, goes back to its default rather than refusing the job: EMA's
+    # decay with EMA off, the gamma without Min-SNR (a slider has no weighting), the mask weight without masked loss
+    for hidden in ({"ema_decay": 0.5}, {"min_snr_gamma": 0}, {"min_snr_gamma": "a lot"}, {"mask_min_weight": 1.5},
+                   {"loss_weighting": "min_snr", "min_snr_gamma": 0, "slider_enabled": True, "slider_target": "a cat",
+                    "slider_positive": "a fat cat", "slider_negative": "a thin cat"}):
+        r = post(hidden)
+        assert r.status_code == 200, hidden
+        s = r.json()["config"]["settings"]
+        assert {k: s[k] for k in LOSS_AND_EMA_DEFAULTS} == LOSS_AND_EMA_DEFAULTS, hidden
+    # nor does a RefMod's noise range, since it trains nothing (RefMods are MiniMax H3's: checked here directly)
+    from dainamo.server.validation import check_loss_and_ema
+    s = {"refmod_enabled": True, "timestep_min": 0.6, "timestep_max": 0.4}
+    check_loss_and_ema(s)
+    assert (s["timestep_min"], s["timestep_max"]) == (0.0, 1.0)
     # a finetune's weights are the whole model, so it keeps no average of them: refused rather than dropped
     finetune = {"finetune_enabled": True, "optimizer": "adafactor"}
     assert post(finetune).status_code == 200
@@ -2154,3 +2177,63 @@ def test_a_job_follows_its_dataset_to_another_folder(client, tmp_path, monkeypat
     d = client.get(f"/api/jobs/{jid}").json()["config"]["datasets"][0]
     assert d["path"] == str(newer) and d["moved_from"] == [str(old), str(new)]
     client.post(f"/api/jobs/{jid}/action", json={"action": "stop"})
+
+
+def test_a_job_through_the_api_saves_samples_and_finetunes_as_new_job_starts_them(client, tmp_path, monkeypatch):
+    import json
+
+    from dainamo.engine.families import get_family
+    from dainamo.server import db
+    from dainamo.server.queue import scheduler
+    from dainamo.server.validation import SAVE_AND_SAMPLE_DEFAULTS
+
+    monkeypatch.setattr(scheduler, "_launch", lambda: None)  # its jobs stay queued
+    pid = client.post("/api/profiles", json={"name": "ad", "family": "krea2", "data": {}}).json()["id"]
+    did = client.post("/api/datasets", json={"name": "ad", "path": str(tmp_path)}).json()["id"]
+
+    def post(settings):
+        r = client.post("/api/jobs", json={"name": "ad", "profile_id": pid, "datasets": [{"id": did}],
+                                           "settings": settings})
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    s = post({})["config"]["settings"]
+    assert {k: s[k] for k in SAVE_AND_SAMPLE_DEFAULTS} == SAVE_AND_SAMPLE_DEFAULTS == \
+        {"save_every": 250, "keep_last": 4, "sample_every": 250}
+    # a finetune gets its own learning rate, optimizer and saves kept, as New job gives it; what's given wins
+    finetune = get_family("krea2").info.finetune
+    s = post({"finetune_enabled": True})["config"]["settings"]
+    assert {k: s[k] for k in finetune} == finetune
+    s = post({"finetune_enabled": True, "learning_rate": 3e-6, "keep_last": 3})["config"]["settings"]
+    assert (s["learning_rate"], s["optimizer"], s["keep_last"]) == (3e-6, finetune["optimizer"], 3)
+
+    # a job from before the server filled these in trained without them, and an edit that leaves them out keeps that
+    j = post({"steps": 3000})
+    cfg = j["config"]
+    for k in SAVE_AND_SAMPLE_DEFAULTS:
+        del cfg["settings"][k]
+    db.execute("UPDATE jobs SET config=? WHERE id=?", (json.dumps({"id": j["id"], **cfg}), j["id"]))
+    datasets = [{k: d[k] for k in ("id", "repeats", "resolution", "flip", "caption_dropout")} for d in cfg["datasets"]]
+    r = client.put(f"/api/jobs/{j['id']}", json={"name": cfg["name"], "profile_id": pid, "gpu": "auto",
+                                                 "datasets": datasets, "settings": {"steps": 3500}})
+    assert r.status_code == 200, r.text
+    s = r.json()["config"]["settings"]
+    assert {k: s[k] for k in SAVE_AND_SAMPLE_DEFAULTS} == {"save_every": 0, "keep_last": 0, "sample_every": 0}
+    for job in client.get("/api/jobs").json():
+        if job["name"] == "ad":
+            client.delete(f"/api/jobs/{job['id']}")
+
+
+def test_work_beside_the_sandbox_takes_the_last_free_gpu(monkeypatch):
+    from dainamo.server import sandbox as sbx
+
+    monkeypatch.setattr(sbx.sandbox, "alive", lambda: False)
+    monkeypatch.setattr(sbx, "gpu_count", lambda: 3)
+    monkeypatch.setattr(sbx, "training_gpus", lambda: {2})
+    assert sbx.pick_gpu(None) == 1  # not GPU 2, which is training
+    assert sbx.pick_gpu(0) == 0
+    monkeypatch.setattr(sbx, "training_gpus", lambda: {0, 1, 2})
+    assert sbx.pick_gpu(None) == 2  # all training: the last, which check_gpu then refuses
+    assert "is training" in sbx.sandbox.check_gpu(2)
+    with pytest.raises(ValueError):
+        sbx.pick_gpu(5)

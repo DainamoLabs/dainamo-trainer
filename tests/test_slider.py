@@ -178,3 +178,24 @@ def test_slider_settings_round_trip():
         {"target": "a cat", "positive": "a fat cat", "negative": "a thin cat"},
         {"target": "a cat, indoors", "positive": "a fat cat, indoors", "negative": "a thin cat, indoors"},
         {"target": "a cat, black", "positive": "a fat cat, black", "negative": "a thin cat, black"}]
+
+
+def test_the_log_says_how_many_steps_keep_the_layout(tmp_path):
+    class Uniform:  # noise levels drawn uniformly, at the size of the image it's given
+        def timesteps(self, batch, latent_hw, settings):
+            assert latent_hw == (8, 8)
+            return torch.rand(batch)
+
+    path = str(tmp_path / "p.pt")
+    torch.save({"latent": torch.zeros(3, 8, 8)}, path)
+    t = trainer_mod.Trainer.__new__(trainer_mod.Trainer)
+    t.s, logs = {}, []
+    t.log = logs.append
+    torch.manual_seed(0)
+    assert t.log_layout_share(Uniform(), path, 0.9) == pytest.approx(0.1, abs=0.03)
+    assert "10% of steps" in logs[-1] and "slowly" not in logs[-1]
+    after = torch.rand(1)
+    torch.manual_seed(0)
+    assert torch.rand(1) == after  # drawn aside from training's random state
+    assert t.log_layout_share(Uniform(), path, 0.2) == pytest.approx(0.8, abs=0.03)
+    assert "learns slowly" in logs[-1]

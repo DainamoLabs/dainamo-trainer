@@ -738,6 +738,20 @@ class Trainer:
             return driver.load_transformer(trainable=True)
         return driver.load_transformer()
 
+    def log_layout_share(self, driver, payload_file: str, layout_sigma: float) -> float:
+        """How many of a slider's steps land above ``layout_sigma``, where Keep the layout trains it to change nothing,
+        at the job's noise distribution and the size of one training image (the shift can depend on it). Logged, with
+        a warning when it's most of them: the slider then learns slowly. Drawn aside from training's random state."""
+        p = torch.load(payload_file)
+        lat = p["latent"] if isinstance(p, dict) else p
+        with torch.random.fork_rng(devices=[]):
+            t = driver.timesteps(4096, tuple(lat.shape[-2:]), self.s)
+        share = float((t > layout_sigma).float().mean())
+        self.log(f"  {share:.0%} of steps are drawn above noise {layout_sigma:g}, where the slider learns to change nothing"
+                 + ("; with this many it learns slowly: raise that noise level, or pick another timestep sampling"
+                    if share > 0.5 else ""))
+        return share
+
     def render_slider_images(self, driver, model, network) -> tuple[list[ds.Item], list[str]]:
         """A slider job without datasets trains on images of its target prompt, rendered here by the base model
         with the profile's sampler, square at the largest training resolution. They're kept in
@@ -1204,6 +1218,8 @@ class Trainer:
             self.log(f"Slider: \"{sl.target}\" toward \"{sl.positive}\" (+) or \"{sl.negative}\" (-), "
                      f"strength {sl.strength:g}" + (f"; preserving {', '.join(sl.preserve)}" if sl.preserve else "")
                      + (f"; layout kept above noise {sl.layout_sigma:g}" if sl.layout_sigma is not None else ""))
+            if sl.layout_sigma is not None:
+                self.log_layout_share(driver, payload_files[0], sl.layout_sigma)
 
         total = int(s["steps"])
         bs = int(s.get("batch_size", 1))

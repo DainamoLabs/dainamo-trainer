@@ -298,7 +298,10 @@ export default function CreateJob({ families, edit }: { families: Family[]; edit
   const [profileId, setProfileId] = useState<string>(last?.profile_id || "");
   const [gpu, setGpu] = useState<string>(last?.gpu || "auto");
   const [s, setS] = useState<S>(() => {
-    const merged = { ...BASE_SETTINGS, ...(last?.settings || {}) };
+    // an edited job made through the API before the server filled these in trained without saves or samples
+    // along the way: it keeps that rather than taking New job's 250s
+    const trainedWith = edit ? { save_every: 0, keep_last: 0, sample_every: 0 } : {};
+    const merged = { ...BASE_SETTINGS, ...trainedWith, ...(last?.settings || {}) };
     if (Array.isArray(merged.sweep_strengths)) merged.sweep_strengths = merged.sweep_strengths.join(", ");
     if (Array.isArray(merged.slider_sample_strengths)) merged.slider_sample_strengths = merged.slider_sample_strengths.join(", ");
     // a duplicated job's resolution is all its datasets' together; new datasets start at the first one's

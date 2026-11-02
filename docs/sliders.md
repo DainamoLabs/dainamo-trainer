@@ -2,8 +2,9 @@
 
 A slider is a LoRA whose strength moves one attribute either way: a smile slider
 at +1 makes people smile, at -1 frown, and at 0.5 smile a little. Choose
-**Slider** under Training method in New job (Krea 2, MOSS-Image and Qwen-Image 2.1; not
-the video models yet) and give it three prompts:
+**Slider** under Training method in New job (Krea 2, MOSS-Image, Qwen-Image 2.1,
+FLUX.2 Klein and FLUX 3 Image Klein; not the video models yet) and give it three
+prompts:
 
 - **Target**: what the slider changes, e.g. "a photo of a person". It works best
   on prompts like this one.
@@ -24,6 +25,12 @@ a normal one.
 - Switching to Slider sets 500 steps and rank 16.
 - The checkpoint picker is off: a slider isn't trained to reproduce its images.
   Concept bleed works as for a LoRA.
+- Masked loss and loss weighting are off too: a slider's loss is its own. The
+  noise range and timestep sampling still apply.
+- Unlike the paper, which noises images the slider renders as it trains, each
+  step noises one of the training images (as ai-toolkit does). That's why
+  they only need to show the target, and it keeps a step to four model passes
+  instead of a render.
 - The file's metadata records the prompts and settings (`dainamo.slider.*`).
 
 ## Preservation
@@ -34,7 +41,10 @@ trains. **Preservation** limits that:
 - **Keep the layout** (the default), for sliders that change a detail such as
   expression, lighting or style. Above the chosen noise level (0.9 by default;
   1 is pure noise), where the layout, clothes and background are decided, the
-  slider is trained to change nothing. Those steps are also faster.
+  slider is trained to change nothing. Those steps are also faster. The log
+  says at the start how many steps that is; when it's most of them (a strong
+  timestep shift puts many steps at high noise), the slider learns slowly, so
+  raise the noise level or pick another timestep sampling.
 - **Keep listed attributes**, for sliders that change shape, such as age or
   weight. List things the slider shouldn't change ("outdoors", "wearing a dark
   jacket"); each step adds one, or none, to all three prompts, so the slider

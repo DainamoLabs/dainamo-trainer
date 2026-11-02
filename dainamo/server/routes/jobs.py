@@ -19,7 +19,8 @@ from ...engine.families import get_family
 from ...engine.families.base import takes_sources
 from .. import db, job_transfer, model_files, outputs
 from ..queue import CACHE_DIR, follow_datasets, job_dir, job_folder, read_status, scheduler, send_control
-from ..validation import LOSS_AND_EMA_DEFAULTS, check_evaluation, check_resolution, check_settings
+from ..validation import (LOSS_AND_EMA_DEFAULTS, SAVE_AND_SAMPLE_DEFAULTS, check_evaluation, check_resolution,
+                          check_settings)
 from .common import dataset_or_404, job_or_404, not_found, profile_or_404
 
 router = APIRouter(prefix="/api")
@@ -131,6 +132,22 @@ def list_jobs():
     return jobs
 
 
+def _defaults(info, given: dict, old: dict | None) -> dict:
+    """What a job's settings start from before its own (``given``), as New job starts them: the family's training
+    defaults, how often it saves and samples (``SAVE_AND_SAMPLE_DEFAULTS``), and a finetune's own learning rate,
+    optimizer and saves kept (``FamilyInfo.finetune``), which New job applies when Finetune is picked. An edit (``old``)
+    keeps the saving and sampling it trained with (from before the server filled those in: none), so leaving one
+    out doesn't change it mid-run; so does a finetune that was one already. A job that becomes a finetune trains
+    again from step 0, with a finetune's defaults."""
+    was = (old or {}).get("settings", {})
+    out = {**info.training_defaults, **SAVE_AND_SAMPLE_DEFAULTS}
+    if old:
+        out.update({k: was.get(k, 0) for k in SAVE_AND_SAMPLE_DEFAULTS})
+    if given.get("finetune_enabled") and info.finetune and not was.get("finetune_enabled"):
+        out.update(info.finetune)
+    return out
+
+
 def _job_config(body: JobIn, old: dict | None = None) -> dict:
     """A job's config (all but its id) from the Create Job form, checked and filled in. ``old``: the config of the
     job being edited, whose datasets (and source and validation datasets) it keeps as they were if they've been
@@ -139,7 +156,8 @@ def _job_config(body: JobIn, old: dict | None = None) -> dict:
     prof = profile_or_404(body.profile_id)
     Family = get_family(prof["family"])
     audio = "audio" in Family.info.media
-    settings = check_settings({**Family.info.training_defaults, **body.settings}, Family.bucket_divisibility, audio)
+    settings = check_settings({**_defaults(Family.info, body.settings, old), **body.settings},
+                              Family.bucket_divisibility, audio)
     if settings["slider_enabled"] and not Family.info.sliders:
         raise HTTPException(400, f"{Family.info.label} can't train sliders yet")
     if settings["refmod_enabled"] and not Family.info.refmods:

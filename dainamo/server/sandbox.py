@@ -61,14 +61,16 @@ def free_gpu() -> int | None:
 
 def pick_gpu(asked: int | None) -> int:
     """The GPU for work that runs beside the Sandbox's models (making a RefMod, upscaling): the Sandbox's own while
-    it's running, so nothing reloads; else, with two or more GPUs, the one asked for (the last by default), as a
-    generation picks it; else GPU 0. ValueError for a GPU that isn't there."""
+    it's running, so nothing reloads; else, with two or more GPUs, the one asked for, by default the last free one
+    (``free_gpu``; the last when all are training, which ``check_gpu`` then refuses); else GPU 0. ValueError for a GPU
+    that isn't there."""
     if sandbox.alive():
         return sandbox.gpu
     if mode() != "reserve":
         return 0
     n = gpu_count()
-    gpu = asked if asked is not None else n - 1
+    free = free_gpu() if asked is None else None
+    gpu = asked if asked is not None else free if free is not None else n - 1
     if not 0 <= gpu < n:
         raise ValueError(f"No GPU {gpu}")
     return gpu
